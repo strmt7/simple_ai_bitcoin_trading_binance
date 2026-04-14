@@ -41,8 +41,12 @@ class StrategyConfig:
     model_lookback: int = 250
     cooldown_minutes: int = 5
     max_trades_per_day: int = 24
+    max_drawdown_limit: float = 0.25
     training_epochs: int = 250
     confidence_beta: float = 0.85
+    taker_fee_bps: float = 1.0
+    slippage_bps: float = 5.0
+    label_threshold: float = 0.001
 
     def asdict(self) -> Dict[str, Any]:
         payload = asdict(self)

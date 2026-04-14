@@ -77,6 +77,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--stop", type=float, default=None)
     parser_strategy.add_argument("--take", type=float, default=None)
     parser_strategy.add_argument("--cooldown", type=int, default=None)
+    parser_strategy.add_argument("--signal-threshold", type=float, default=None)
+    parser_strategy.add_argument("--max-drawdown", type=float, default=None)
+    parser_strategy.add_argument("--taker-fee-bps", type=float, default=None)
+    parser_strategy.add_argument("--slippage-bps", type=float, default=None)
+    parser_strategy.add_argument("--label-threshold", type=float, default=None)
     parser_strategy.set_defaults(func=command_strategy)
 
     return parser.parse_args(argv)
@@ -97,6 +102,14 @@ def _load_json_candles(path: str) -> list[dict[str, object]]:
     if not isinstance(payload, list):
         raise ValueError(f"Expected candle list in JSON file: {path}")
     return payload
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
 
 
 def _rows_from_json(path: str):
@@ -122,7 +135,13 @@ def _rows_from_json(path: str):
 
 
 def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
-    return make_rows(candles, strategy.feature_windows[0], strategy.feature_windows[1])
+    return make_rows(
+        candles,
+        strategy.feature_windows[0],
+        strategy.feature_windows[1],
+        lookahead=1,
+        label_threshold=strategy.label_threshold,
+    )
 
 
 def _effective_leverage(cfg: StrategyConfig, market_type: str) -> float:
@@ -136,14 +155,19 @@ def _target_notional(cash: float, strategy: StrategyConfig, market_type: str) ->
         return 0.0
     leverage = _effective_leverage(strategy, market_type)
     risk_exposure = strategy.risk_per_trade * leverage
-    risk_exposure = min(risk_exposure, strategy.max_position_pct * leverage, 1.0)
-    return cash * risk_exposure
+    risk_exposure = min(risk_exposure, strategy.max_position_pct * leverage)
+    risk_exposure = min(risk_exposure, 1.0)
+    return max(0.0, cash * risk_exposure)
 
 
-def _direction_from_signal(signal: int, market_type: str) -> int:
+def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> int:
     if market_type == "futures":
-        return 1 if signal == 1 else -1
-    return 1 if signal == 1 else 0
+        if score >= cfg.signal_threshold:
+            return 1
+        if score <= (1.0 - cfg.signal_threshold):
+            return -1
+        return 0
+    return 1 if score >= cfg.signal_threshold else 0
 
 
 def _paper_or_live_order(client: BinanceClient, runtime, strategy: StrategyConfig, *, side: str, size: float, dry_run: bool) -> None:
@@ -232,6 +256,16 @@ def command_strategy(args: argparse.Namespace) -> int:
         updates["take_profit_pct"] = max(0.0, min(0.99, args.take))
     if args.cooldown is not None:
         updates["cooldown_minutes"] = max(0, args.cooldown)
+    if args.signal_threshold is not None:
+        updates["signal_threshold"] = _clamp(args.signal_threshold, 0.01, 0.99)
+    if args.max_drawdown is not None:
+        updates["max_drawdown_limit"] = max(0.0, args.max_drawdown)
+    if args.taker_fee_bps is not None:
+        updates["taker_fee_bps"] = max(0.0, args.taker_fee_bps)
+    if args.slippage_bps is not None:
+        updates["slippage_bps"] = max(0.0, args.slippage_bps)
+    if args.label_threshold is not None:
+        updates["label_threshold"] = max(0.0001, args.label_threshold)
 
     cfg = StrategyConfig(**{**cfg.asdict(), **updates})
     save_strategy(cfg)
@@ -363,6 +397,7 @@ def command_live(args: argparse.Namespace) -> int:
     runtime = load_runtime()
     cfg = load_strategy()
     client = _build_client(runtime)
+    model_path = Path("data/model.json")
 
     effective_dry_run = runtime.dry_run or args.paper
     if not runtime.testnet:
@@ -384,13 +419,27 @@ def command_live(args: argparse.Namespace) -> int:
     position_notional = 0.0
     position_side = 0
     entry_price = 0.0
+    margin_used = 0.0
+    qty = 0.0
     wait_ticks = cfg.cooldown_minutes
     cooldown_left = 0
+    leverage = _effective_leverage(cfg, runtime.market_type)
+
+    if model_path.exists():
+        try:
+            model = load_model(model_path)
+        except Exception:
+            model = None
+    else:
+        model = None
 
     mode_label = "paper" if effective_dry_run else "live"
     print(f"Starting {mode_label} loop for {args.steps} steps on {runtime.symbol} {runtime.interval} [{runtime.market_type}]")
     if runtime.market_type == "futures":
         print(f"effective leverage: {leverage:.1f}x")
+
+    fee_rate = max(0.0, cfg.taker_fee_bps) / 10_000.0
+    slippage = max(0.0, cfg.slippage_bps) / 10_000.0
 
     for i in range(args.steps):
         try:
@@ -405,66 +454,100 @@ def command_live(args: argparse.Namespace) -> int:
             time.sleep(args.sleep)
             continue
 
-        model = train(rows, epochs=40)
+        if model is None:
+            model = train(rows, epochs=40)
         latest = rows[-1]
-        signal = model.predict(latest.features, cfg.signal_threshold)
-        direction = _direction_from_signal(signal, runtime.market_type)
+        score = model.predict_proba(latest.features)
+        direction = _score_to_direction(score, cfg, runtime.market_type)
 
         # cooldown reduces immediate flip-flopping in choppy conditions
         if cooldown_left > 0:
-            direction = 0 if runtime.market_type == "spot" else direction
+            if runtime.market_type == "spot":
+                direction = 0
             cooldown_left -= 1
 
         price = latest.close
         if position_side == 0 and direction != 0:
-            direction_to_open = direction
             notional = _target_notional(cash, cfg, runtime.market_type)
             if notional <= 0:
                 time.sleep(args.sleep)
                 continue
-            size = abs(notional / price)
-            position_notional = direction_to_open * notional
-            position_side = direction_to_open
-            entry_price = price
-            side = "BUY" if direction_to_open > 0 else "SELL"
+
+            if runtime.market_type == "spot":
+                margin = min(cash, notional)
+            else:
+                margin = min(cash, notional / leverage)
+
+            fee = abs(notional) * fee_rate
+            total = margin + fee
+            if total > cash:
+                print(f"step {i + 1:>2}: insufficient cash for leverage-adjusted entry")
+                time.sleep(max(1, args.sleep))
+                continue
+
+            side_sign = 1 if direction > 0 else -1
+            fill = price * (1.0 + side_sign * slippage)
+            if fill <= 0:
+                time.sleep(max(1, args.sleep))
+                continue
+
+            cash -= total
+            position_side = direction
+            position_notional = direction * notional
+            qty = abs(notional / fill)
+            entry_price = fill
+            margin_used = margin
+
+            side = "BUY" if side_sign > 0 else "SELL"
             _paper_or_live_order(
                 client,
                 runtime,
                 cfg,
                 side=side,
-                size=size,
+                size=qty,
                 dry_run=effective_dry_run,
             )
-            print(f"step {i + 1:>2}: enter {'long' if position_side > 0 else 'short'} at {price:.2f} qty={size:.6f}")
+            print(f"step {i + 1:>2}: enter {'long' if position_side > 0 else 'short'} at {fill:.2f} qty={qty:.6f}")
             cooldown_left = 0
 
         elif position_side != 0:
-            pnl_pct = (price - entry_price) / entry_price * (1 if position_side > 0 else -1)
+            pnl = position_side * (price - entry_price) * qty
+            pnl_pct = ((price - entry_price) / entry_price) if position_side > 0 else ((entry_price - price) / entry_price)
 
             opposite_signal = direction != 0 and direction != position_side if runtime.market_type == "futures" else direction == 0
             should_close = opposite_signal or pnl_pct >= cfg.take_profit_pct or pnl_pct <= -cfg.stop_loss_pct
 
             if should_close:
-                cash += abs(position_notional) * pnl_pct
+                fill = price * (1.0 - position_side * slippage)
+                realized = position_side * (fill - entry_price) * qty
+                exit_fee = abs(position_notional) * fee_rate
+                cash += margin_used + realized - exit_fee
+
                 side_to_close = "SELL" if position_side > 0 else "BUY"
                 _paper_or_live_order(
                     client,
                     runtime,
                     cfg,
                     side=side_to_close,
-                    size=abs(position_notional / entry_price),
+                    size=abs(qty),
                     dry_run=effective_dry_run,
                 )
                 print(
                     f"step {i + 1:>2}: close {'long' if position_side > 0 else 'short'} "
-                    f"pnl={pnl_pct:.2%} cash={cash:.2f}"
+                    f"pnl={pnl:.2f} cash={cash:.2f}"
                 )
+                if realized > 0:
+                    print("result: win")
                 position_notional = 0.0
                 position_side = 0
+                qty = 0.0
+                margin_used = 0.0
                 entry_price = 0.0
                 cooldown_left = max(0, wait_ticks)
             else:
+                unrealized = margin_used + pnl
                 print(f"step {i + 1:>2}: hold {'long' if position_side > 0 else 'short'} pnl={pnl_pct:.2%} cash={cash:.2f}")
+                print(f"         unrealized equity={cash + unrealized:.2f}")
 
                 if direction == 0:
                     cooldown_left = max(0, wait_ticks)
