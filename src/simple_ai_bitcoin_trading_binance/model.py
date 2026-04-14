@@ -24,6 +24,11 @@ class TrainedModel:
     epochs: int
     feature_means: List[float]
     feature_stds: List[float]
+    learning_rate: float = 0.05
+    l2_penalty: float = 1e-4
+    seed: int = 7
+    class_weight_pos: float = 1.0
+    class_weight_neg: float = 1.0
 
     def _normalize(self, features: Tuple[float, ...]) -> Tuple[float, ...]:
         if len(features) != self.feature_dim:
@@ -73,6 +78,70 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, x))))
 
 
+def _class_weights(rows: List[ModelRow]) -> tuple[float, float]:
+    positives = sum(1 for row in rows if row.label == 1)
+    negatives = len(rows) - positives
+    if positives == 0:
+        return 1.0, 1.0
+    if negatives == 0:
+        return 1.0, 1.0
+    total = len(rows)
+    pos_weight = float(negatives) / float(total)
+    neg_weight = float(positives) / float(total)
+    return pos_weight, neg_weight
+
+
+def _f1(tp: int, fp: int, fn: int) -> float:
+    denom = (2 * tp + fp + fn)
+    if denom <= 0:
+        return 0.0
+    return (2.0 * tp) / denom
+
+
+def _confusion(rows: List[ModelRow], model: TrainedModel, threshold: float) -> tuple[int, int, int, int]:
+    tp = fp = tn = fn = 0
+    for row in rows:
+        pred = model.predict(row.features, threshold)
+        label = row.label
+        if pred == 1 and label == 1:
+            tp += 1
+        elif pred == 1 and label == 0:
+            fp += 1
+        elif pred == 0 and label == 0:
+            tn += 1
+        else:
+            fn += 1
+    return tp, fp, tn, fn
+
+
+def calibrate_threshold(rows: List[ModelRow], model: TrainedModel, *, start: float = 0.1, end: float = 0.9,
+                       steps: int = 17) -> float:
+    """Pick a threshold that balances precision and recall for the current model."""
+    if not rows:
+        return 0.5
+    if steps <= 1:
+        return _clamp(0.5, 0.0, 1.0)
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+    if start < 0.0:
+        start = 0.0
+    if end > 1.0:
+        end = 1.0
+    if end <= start:
+        end = min(1.0, start + 0.01)
+
+    for i in range(steps):
+        threshold = start + (end - start) * i / (steps - 1)
+        tp, fp, _, fn = _confusion(rows, model, threshold)
+        score = _f1(tp, fp, fn)
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = threshold
+
+    return best_threshold
+
+
 def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.05,
           seed: int = 7, l2_penalty: float = 1e-4) -> TrainedModel:
     if not rows:
@@ -87,6 +156,10 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
     rng = random.Random(seed)
     weights = [rng.uniform(-0.05, 0.05) for _ in range(feature_dim)]
     bias = 0.0
+    class_weight_pos, class_weight_neg = _class_weights(rows)
+    if class_weight_pos <= 0.0 or class_weight_neg <= 0.0:
+        class_weight_pos = 1.0
+        class_weight_neg = 1.0
 
     indices = list(range(len(rows)))
     for _ in range(epochs):
@@ -97,7 +170,8 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
             y = row.label
             score = bias + sum(w * xi for w, xi in zip(weights, x))
             pred = _sigmoid(score)
-            error = pred - y
+            weight = class_weight_pos if y == 1 else class_weight_neg
+            error = (pred - y) * weight
             for i, xi in enumerate(x):
                 # L2 penalty and signed-gradient update
                 grad = error * xi + l2_penalty * weights[i]
@@ -111,6 +185,11 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
         epochs=epochs,
         feature_means=means,
         feature_stds=stds,
+        learning_rate=float(learning_rate),
+        l2_penalty=float(l2_penalty),
+        seed=int(seed),
+        class_weight_pos=float(class_weight_pos),
+        class_weight_neg=float(class_weight_neg),
     )
 
 
@@ -124,6 +203,48 @@ def evaluate(rows: List[ModelRow], model: TrainedModel, threshold: float = 0.5) 
         if pred == row.label:
             correct += 1
     return correct / len(rows)
+
+
+def evaluate_confusion(rows: List[ModelRow], model: TrainedModel, threshold: float = 0.5) -> tuple[int, int, int, int]:
+    return _confusion(rows, model, threshold)
+
+
+def walk_forward_report(
+    rows: List[ModelRow],
+    *,
+    train_window: int = 300,
+    test_window: int = 60,
+    step: int = 20,
+    epochs: int = 80,
+    calibrate: bool = False,
+) -> dict[str, object]:
+    if len(rows) <= train_window + test_window:
+        raise ValueError("Not enough rows for walk-forward evaluation")
+    if train_window <= 0 or test_window <= 0 or step <= 0:
+        raise ValueError("train_window, test_window, and step must be positive")
+
+    scores: List[float] = []
+    thresholds: List[float] = []
+    for start in range(0, len(rows) - train_window - test_window + 1, step):
+        train_rows = rows[start : start + train_window]
+        test_rows = rows[start + train_window : start + train_window + test_window]
+        model = train(train_rows, epochs=epochs)
+        threshold = 0.5
+        if calibrate and len(test_rows) >= 10:
+            threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
+        score = evaluate(test_rows, model, threshold=threshold)
+        scores.append(score)
+        thresholds.append(threshold)
+
+    return {
+        "folds": len(scores),
+        "average_score": mean(scores) if scores else 0.0,
+        "scores": scores,
+        "thresholds": thresholds,
+        "train_window": train_window,
+        "test_window": test_window,
+        "step": step,
+    }
 
 
 def serialize_model(model: TrainedModel, path) -> None:
@@ -146,5 +267,9 @@ def load_model(path):
         epochs=int(payload["epochs"]),
         feature_means=list(float(x) for x in means),
         feature_stds=list(float(x) for x in stds),
+        learning_rate=float(payload.get("learning_rate", 0.05)),
+        l2_penalty=float(payload.get("l2_penalty", 1e-4)),
+        seed=int(payload.get("seed", 7)),
+        class_weight_pos=float(payload.get("class_weight_pos", 1.0)),
+        class_weight_neg=float(payload.get("class_weight_neg", 1.0)),
     )
-

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlencode
 
@@ -42,6 +43,16 @@ class Candle:
     close_time: int
 
 
+@dataclass(frozen=True)
+class SymbolConstraints:
+    symbol: str
+    min_qty: float
+    max_qty: float
+    step_size: float
+    min_notional: float
+    max_notional: float
+
+
 class BinanceClient:
     """Small HTTP client wrapping only the endpoints required by this tool."""
 
@@ -63,15 +74,15 @@ class BinanceClient:
         if max_calls_per_minute > 2000:
             max_calls_per_minute = 2000
         self._call_delay = 60.0 / max_calls_per_minute
-        self._rate_limit_at: datetime = datetime.utcnow()
+        self._rate_limit_at: datetime = datetime.now(timezone.utc)
 
     def _throttle(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         min_interval = timedelta(seconds=self._call_delay)
         delay = (self._rate_limit_at - now).total_seconds()
         if delay > 0:
             time.sleep(delay)
-        self._rate_limit_at = datetime.utcnow() + min_interval
+        self._rate_limit_at = datetime.now(timezone.utc) + min_interval
 
     def _request(self, method: str, path: str, params: Dict[str, object] | None = None,
                  signed: bool = False) -> Dict[str, object] | List[Dict[str, object]]:
@@ -113,6 +124,144 @@ class BinanceClient:
     def get_exchange_info(self) -> Dict[str, object]:
         endpoint = "/api/v3/exchangeInfo" if self.market_type == "spot" else "/fapi/v1/exchangeInfo"
         return self._request("GET", endpoint)
+
+    @staticmethod
+    def _parse_float(value: object) -> float:
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _parse_filter(filters: list[object], filter_type: str) -> Dict[str, str]:
+        for item in filters:
+            if not isinstance(item, dict):
+                continue
+            if item.get("filterType") == filter_type:
+                return item
+        return {}
+
+    @staticmethod
+    def _quantize_to_step(value: float, step_size: float) -> float:
+        if value <= 0:
+            return 0.0
+        if step_size <= 0:
+            return float(value)
+        try:
+            step = Decimal(str(step_size))
+            if step <= 0:
+                return float(value)
+            v = Decimal(str(value))
+            normalized = (v // step) * step
+            return float(normalized.quantize(step, rounding=ROUND_DOWN))
+        except (InvalidOperation, ValueError):
+            return 0.0
+
+    def get_symbol_constraints(self, symbol: str) -> SymbolConstraints:
+        symbol = symbol.upper()
+        info = self.get_exchange_info()
+        symbols = [item for item in info.get("symbols", []) if isinstance(item, dict) and item.get("symbol") == symbol]
+        if not symbols:
+            raise BinanceAPIError(f"Unknown symbol in exchangeInfo: {symbol}")
+
+        symbol_info = symbols[0]
+        filters = symbol_info.get("filters", [])
+        if not isinstance(filters, list):
+            raise BinanceAPIError(f"Unexpected symbol filters for {symbol}")
+
+        lot_filter = self._parse_filter(filters, "LOT_SIZE")
+        market_lot_filter = self._parse_filter(filters, "MARKET_LOT_SIZE")
+
+        min_qty = self._parse_float(market_lot_filter.get("minQty") if market_lot_filter else lot_filter.get("minQty"))
+        max_qty = self._parse_float(market_lot_filter.get("maxQty") if market_lot_filter else lot_filter.get("maxQty"))
+        step_size = self._parse_float(market_lot_filter.get("stepSize") if market_lot_filter else lot_filter.get("stepSize"))
+
+        if min_qty <= 0:
+            min_qty = self._parse_float(lot_filter.get("minQty"))
+        if max_qty <= 0:
+            max_qty = self._parse_float(lot_filter.get("maxQty"))
+        if step_size <= 0:
+            step_size = self._parse_float(lot_filter.get("stepSize"))
+
+        if min_qty <= 0:
+            min_qty = 0.0
+        if max_qty <= 0:
+            max_qty = 0.0
+        if step_size <= 0:
+            step_size = 0.0
+
+        notional_filter = self._parse_filter(filters, "NOTIONAL")
+        min_notional = self._parse_float(notional_filter.get("minNotional")) if notional_filter else 0.0
+        max_notional = self._parse_float(notional_filter.get("maxNotional")) if notional_filter else 0.0
+
+        if min_notional <= 0:
+            min_notional = self._parse_float(self._parse_filter(filters, "MIN_NOTIONAL").get("notional"))
+
+        if min_notional <= 0:
+            min_notional = 0.0
+
+        return SymbolConstraints(
+            symbol=symbol,
+            min_qty=min_qty,
+            max_qty=max_qty,
+            step_size=step_size,
+            min_notional=min_notional,
+            max_notional=max_notional,
+        )
+
+    def normalize_quantity(self, symbol: str, quantity: float) -> tuple[float, SymbolConstraints]:
+        constraints = self.get_symbol_constraints(symbol)
+        normalized = self._quantize_to_step(quantity, constraints.step_size)
+
+        if normalized <= 0:
+            return 0.0, constraints
+
+        if normalized < constraints.min_qty:
+            return 0.0, constraints
+
+        if constraints.max_qty > 0:
+            normalized = min(normalized, constraints.max_qty)
+        return normalized, constraints
+
+    def get_leverage_brackets(self, symbol: str) -> List[Dict[str, object]]:
+        if self.market_type != "futures":
+            raise BinanceAPIError("Leverage brackets are available only in futures mode")
+
+        payload = self._request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol.upper()}, signed=True)
+        if not isinstance(payload, list):
+            raise BinanceAPIError("Unexpected leverage bracket payload")
+        return payload  # type: ignore[return-value]
+
+    def get_max_leverage(self, symbol: str) -> int:
+        if self.market_type != "futures":
+            return 1
+        payload = self.get_leverage_brackets(symbol)
+        symbol = symbol.upper()
+        for item in payload:
+            if not isinstance(item, dict) or item.get("symbol") != symbol:
+                continue
+            brackets = item.get("brackets")
+            if not isinstance(brackets, list) or not brackets:
+                continue
+            max_leverage = 0
+            for bracket in brackets:
+                if not isinstance(bracket, dict):
+                    continue
+                for key in ("maxLeverage", "initialLeverage"):
+                    value = bracket.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        parsed = int(float(value))
+                    except (TypeError, ValueError):
+                        continue
+                    if parsed > max_leverage:
+                        max_leverage = parsed
+            if max_leverage > 0:
+                return min(max_leverage, _MAX_FUTURES_LEVERAGE)
+        return _MAX_FUTURES_LEVERAGE
 
     def ensure_btcusdc(self) -> Dict[str, object]:
         info = self.get_exchange_info()
@@ -175,8 +324,9 @@ class BinanceClient:
         leverage = int(leverage)
         if leverage < 1:
             leverage = 1
-        if leverage > _MAX_FUTURES_LEVERAGE:
-            leverage = _MAX_FUTURES_LEVERAGE
+        max_leverage = self.get_max_leverage(symbol)
+        if leverage > max_leverage:
+            leverage = max_leverage
         payload = {"symbol": symbol, "leverage": leverage}
         return self._request("POST", "/fapi/v1/leverage", payload, signed=True)
 

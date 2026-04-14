@@ -13,7 +13,15 @@ from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
 from .features import make_rows
-from .model import evaluate, load_model, serialize_model, train
+from .api import SymbolConstraints
+from .model import (
+    calibrate_threshold,
+    evaluate,
+    load_model,
+    serialize_model,
+    train,
+    walk_forward_report,
+)
 from .types import StrategyConfig
 
 
@@ -41,6 +49,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_train.add_argument("--input", default="data/historical_btcusdc.json")
     parser_train.add_argument("--output", default="data/model.json")
     parser_train.add_argument("--epochs", type=int, default=250)
+    parser_train.add_argument("--walk-forward", action="store_true", help="run walk-forward validation before final training")
+    parser_train.add_argument("--walk-forward-train", type=int, default=300)
+    parser_train.add_argument("--walk-forward-test", type=int, default=60)
+    parser_train.add_argument("--walk-forward-step", type=int, default=30)
+    parser_train.add_argument("--calibrate-threshold", action="store_true", help="optimize a probability threshold on validation split")
     parser_train.set_defaults(func=command_train)
 
     parser_tune = subparsers.add_parser("tune", help="perform a focused walk-forward tune over few risk parameters")
@@ -49,6 +62,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_tune.add_argument("--min-risk", type=float, default=0.002)
     parser_tune.add_argument("--max-risk", type=float, default=0.02)
     parser_tune.add_argument("--steps", type=int, default=5)
+    parser_tune.add_argument("--min-leverage", type=float, default=1.0)
+    parser_tune.add_argument("--max-leverage", type=float, default=20.0)
+    parser_tune.add_argument("--min-threshold", type=float, default=0.52)
+    parser_tune.add_argument("--max-threshold", type=float, default=0.88)
+    parser_tune.add_argument("--min-take", type=float, default=0.01)
+    parser_tune.add_argument("--max-take", type=float, default=0.06)
+    parser_tune.add_argument("--min-stop", type=float, default=0.008)
+    parser_tune.add_argument("--max-stop", type=float, default=0.04)
     parser_tune.set_defaults(func=command_tune)
 
     parser_backtest = subparsers.add_parser("backtest", help="run backtest against cached data")
@@ -77,6 +98,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--stop", type=float, default=None)
     parser_strategy.add_argument("--take", type=float, default=None)
     parser_strategy.add_argument("--cooldown", type=int, default=None)
+    parser_strategy.add_argument("--max-open", type=int, default=None)
+    parser_strategy.add_argument("--max-trades-per-day", type=int, default=None)
     parser_strategy.add_argument("--signal-threshold", type=float, default=None)
     parser_strategy.add_argument("--max-drawdown", type=float, default=None)
     parser_strategy.add_argument("--taker-fee-bps", type=float, default=None)
@@ -150,14 +173,97 @@ def _effective_leverage(cfg: StrategyConfig, market_type: str) -> float:
     return float(max(1.0, min(125.0, cfg.leverage)))
 
 
-def _target_notional(cash: float, strategy: StrategyConfig, market_type: str) -> float:
+def _resolve_futures_leverage(runtime, cfg: StrategyConfig) -> float:
+    """Resolve leverage from runtime+strategy with an exchange-side clamp when possible."""
+    requested = _effective_leverage(cfg, runtime.market_type)
+    if runtime.market_type != "futures":
+        return requested
+    if not runtime.api_key or not runtime.api_secret:
+        return requested
+    client = _build_client(runtime)
+    try:
+        max_leverage = client.get_max_leverage(runtime.symbol)
+        if max_leverage > 0:
+            return float(min(requested, max_leverage))
+    except BinanceAPIError:
+        return requested
+    return requested
+
+
+def _resolve_symbol_constraints(runtime, client) -> SymbolConstraints | None:
+    try:
+        return client.get_symbol_constraints(runtime.symbol)
+    except BinanceAPIError:
+        return None
+
+
+def _target_notional(
+    cash: float,
+    strategy: StrategyConfig,
+    market_type: str,
+    *,
+    leverage: float | None = None,
+) -> float:
     if cash <= 0:
         return 0.0
-    leverage = _effective_leverage(strategy, market_type)
+    if leverage is None:
+        leverage = _effective_leverage(strategy, market_type)
     risk_exposure = strategy.risk_per_trade * leverage
     risk_exposure = min(risk_exposure, strategy.max_position_pct * leverage)
     risk_exposure = min(risk_exposure, 1.0)
     return max(0.0, cash * risk_exposure)
+
+
+def _build_order_notional(
+    cash: float,
+    price: float,
+    cfg: StrategyConfig,
+    market_type: str,
+    leverage: float,
+    client,
+    *,
+    constraints: SymbolConstraints | None = None,
+) -> tuple[float, float]:
+    """Build and return adjusted (notional, qty) for a desired trade.
+
+    Returns (notional, qty) after constraints are enforced.
+    """
+    if price <= 0:
+        return 0.0, 0.0
+
+    requested_notional = _target_notional(cash, cfg, market_type, leverage=leverage)
+    if requested_notional <= 0:
+        return 0.0, 0.0
+
+    qty = requested_notional / price
+    if constraints is None:
+        return requested_notional, abs(qty)
+
+    normalized_qty, parsed_constraints = client.normalize_quantity(constraints.symbol, abs(qty))
+    if normalized_qty <= 0:
+        return 0.0, 0.0
+
+    requested_notional = normalized_qty * price
+
+    if normalized_qty < parsed_constraints.min_qty:
+        return 0.0, 0.0
+
+    if parsed_constraints.min_notional > 0 and requested_notional < parsed_constraints.min_notional:
+        return 0.0, 0.0
+
+    if parsed_constraints.max_notional > 0 and requested_notional > parsed_constraints.max_notional:
+        capped_notional = parsed_constraints.max_notional
+        capped_qty, _ = client.normalize_quantity(parsed_constraints.symbol, capped_notional / price)
+        if capped_qty <= 0:
+            return 0.0, 0.0
+        requested_notional = capped_qty * price
+        normalized_qty = capped_qty
+
+    return requested_notional, abs(normalized_qty)
+
+
+def _safe_day_ms(timestamp_ms: int) -> int:
+    return int(timestamp_ms // (24 * 60 * 60 * 1000))
 
 
 def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> int:
@@ -170,8 +276,18 @@ def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> 
     return 1 if score >= cfg.signal_threshold else 0
 
 
-def _paper_or_live_order(client: BinanceClient, runtime, strategy: StrategyConfig, *, side: str, size: float, dry_run: bool) -> None:
-    leverage = _effective_leverage(strategy, runtime.market_type)
+def _paper_or_live_order(
+    client: BinanceClient,
+    runtime,
+    strategy: StrategyConfig,
+    *,
+    side: str,
+    size: float,
+    dry_run: bool,
+    leverage: float | None = None,
+) -> None:
+    if leverage is None:
+        leverage = _effective_leverage(strategy, runtime.market_type)
     response = client.place_order(runtime.symbol, side, size, dry_run=dry_run, leverage=leverage)
     if dry_run:
         print("paper order:", json.dumps(response, indent=2))
@@ -218,6 +334,14 @@ def command_connect(_: argparse.Namespace) -> int:
                     "positions": account.get("positions"),
                     "assets": account.get("assets"),
                 }
+        if runtime.market_type == "futures" and runtime.api_key and runtime.api_secret:
+            try:
+                max_leverage = client.get_max_leverage(runtime.symbol)
+            except BinanceAPIError as exc:
+                print(f"unable to fetch leverage bracket: {exc}", file=sys.stderr)
+            else:
+                print(f"max leverage on {runtime.symbol}: {max_leverage}x")
+
         print("exchange: connected")
         print("market:", runtime.market_type)
         print("testnet:", runtime.testnet)
@@ -243,9 +367,21 @@ def command_status(_: argparse.Namespace) -> int:
 
 def command_strategy(args: argparse.Namespace) -> int:
     cfg = load_strategy()
+    runtime = load_runtime()
     updates = {}
     if args.leverage is not None:
-        updates["leverage"] = max(1.0, args.leverage)
+        requested = max(1.0, args.leverage)
+        if runtime.market_type == "futures":
+            if runtime.api_key and runtime.api_secret:
+                try:
+                    client = _build_client(runtime)
+                    max_leverage = client.get_max_leverage(runtime.symbol)
+                except BinanceAPIError:
+                    max_leverage = 125
+            else:
+                max_leverage = 125
+            requested = min(requested, float(max_leverage))
+        updates["leverage"] = requested
     if args.risk is not None:
         updates["risk_per_trade"] = max(0.0001, args.risk)
     if args.max_position is not None:
@@ -254,6 +390,10 @@ def command_strategy(args: argparse.Namespace) -> int:
         updates["stop_loss_pct"] = max(0.0, min(0.99, args.stop))
     if args.take is not None:
         updates["take_profit_pct"] = max(0.0, min(0.99, args.take))
+    if args.max_open is not None:
+        updates["max_open_positions"] = max(1, args.max_open)
+    if args.max_trades_per_day is not None:
+        updates["max_trades_per_day"] = max(0, args.max_trades_per_day)
     if args.cooldown is not None:
         updates["cooldown_minutes"] = max(0, args.cooldown)
     if args.signal_threshold is not None:
@@ -315,13 +455,40 @@ def command_train(args: argparse.Namespace) -> int:
         print("No rows produced. Fetch more data or increase lookback.")
         return 2
 
+    if args.walk_forward:
+        try:
+            wf = walk_forward_report(
+                rows,
+                train_window=args.walk_forward_train,
+                test_window=args.walk_forward_test,
+                step=args.walk_forward_step,
+                epochs=max(50, args.epochs // 2),
+                calibrate=args.calibrate_threshold,
+            )
+            print(
+                f"walk-forward: folds={wf['folds']} avg_score={wf['average_score']:.4f} "
+                f"(train={wf['train_window']} test={wf['test_window']} step={wf['step']})"
+            )
+            folds = wf["scores"]
+            if folds:
+                print(
+                    "walk-forward fold scores: "
+                    + ", ".join(f"{float(v):.3f}" for v in folds)
+                )
+        except ValueError as exc:
+            print(f"walk-forward unavailable: {exc}")
+
     split = max(2, int(len(rows) * 0.8))
     train_rows = rows[:split]
     test_rows = rows[split:]
 
     model = train(train_rows, epochs=args.epochs)
-    train_score = evaluate(train_rows, model, threshold=cfg.signal_threshold)
-    test_score = evaluate(test_rows, model, threshold=cfg.signal_threshold) if test_rows else 0.0
+    threshold = cfg.signal_threshold
+    if args.calibrate_threshold and test_rows:
+        threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
+    train_score = evaluate(train_rows, model, threshold=threshold)
+    test_score = evaluate(test_rows, model, threshold=threshold) if test_rows else 0.0
+    tuned_score = evaluate(test_rows, model, threshold=threshold) if test_rows else test_score
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     serialize_model(model, output)
@@ -329,13 +496,24 @@ def command_train(args: argparse.Namespace) -> int:
     print(f"rows: {len(rows)} split train={len(train_rows)} test={len(test_rows)}")
     print(f"in-sample directional accuracy: {train_score:.3f}")
     print(f"out-of-sample directional accuracy: {test_score:.3f}")
-    print(f"market={runtime.market_type} leverage={cfg.leverage}")
+    if args.calibrate_threshold and test_rows:
+        print(f"validated threshold: {threshold:.3f}")
+        print(f"out-of-sample directional accuracy (calibrated): {tuned_score:.3f}")
+    resolved_leverage = _resolve_futures_leverage(runtime, cfg)
+    print(f"market={runtime.market_type} leverage={resolved_leverage:.2f}")
     return 0
 
 
 def command_tune(args: argparse.Namespace) -> int:
     cfg = load_strategy()
     runtime = load_runtime()
+    max_leverage = 125.0
+    if runtime.market_type == "futures" and runtime.api_key and runtime.api_secret:
+        try:
+            client = _build_client(runtime)
+            max_leverage = float(client.get_max_leverage(runtime.symbol))
+        except BinanceAPIError:
+            max_leverage = 125.0
     candles = _rows_from_json(args.input)
     rows = _build_model_rows(candles, cfg)
     if len(rows) < 40:
@@ -351,20 +529,50 @@ def command_tune(args: argparse.Namespace) -> int:
 
     risks: Iterable[float] = [cfg.risk_per_trade + (args.max_risk - args.min_risk) * i / max(args.steps - 1, 1)
                               for i in range(args.steps)]
+    levs: Iterable[float] = [args.min_leverage + (args.max_leverage - args.min_leverage) * i / max(args.steps - 1, 1)
+                             for i in range(args.steps)]
+    thrs: Iterable[float] = [args.min_threshold + (args.max_threshold - args.min_threshold) * i / max(args.steps - 1, 1)
+                             for i in range(args.steps)]
+    takes: Iterable[float] = [args.min_take + (args.max_take - args.min_take) * i / max(args.steps - 1, 1)
+                              for i in range(args.steps)]
+    stops: Iterable[float] = [args.min_stop + (args.max_stop - args.min_stop) * i / max(args.steps - 1, 1)
+                              for i in range(args.steps)]
     best: StrategyConfig = cfg
     best_score = float("-inf")
 
     for risk in risks:
-        candidate = StrategyConfig(**{**cfg.asdict(), "risk_per_trade": max(0.0001, risk)})
-        model = train(train_rows, epochs=max(50, candidate.training_epochs // 2))
-        candidate_result = run_backtest(test_rows, model, candidate, market_type=runtime.market_type, starting_cash=1000.0)
-        score = candidate_result.realized_pnl
-        if score > best_score:
-            best_score = score
-            best = candidate
+        for leverage in levs:
+            for threshold in thrs:
+                for take in takes:
+                    for stop in stops:
+                        candidate = StrategyConfig(
+                            **{
+                                **cfg.asdict(),
+                                "risk_per_trade": max(0.0001, risk),
+                                "leverage": max(1.0, min(float(max_leverage), leverage)),
+                                "signal_threshold": max(0.05, min(0.95, threshold)),
+                                "take_profit_pct": max(0.0, min(0.99, take)),
+                                "stop_loss_pct": max(0.0, min(0.99, stop)),
+                            },
+                        )
+                        model = train(train_rows, epochs=max(50, candidate.training_epochs // 2))
+                        candidate_result = run_backtest(
+                            test_rows,
+                            model,
+                            candidate,
+                            market_type=runtime.market_type,
+                            starting_cash=1000.0,
+                        )
+                        score = candidate_result.realized_pnl - candidate_result.total_fees
+                        if score > best_score:
+                            best_score = score
+                            best = candidate
 
     print(f"tune best score: {best_score:.4f}")
-    print(f"tune best config risk={best.risk_per_trade:.4f} take={best.take_profit_pct:.4f} stop={best.stop_loss_pct:.4f}")
+    print(
+        f"tune best config risk={best.risk_per_trade:.4f} take={best.take_profit_pct:.4f} "
+        f"stop={best.stop_loss_pct:.4f} leverage={best.leverage:.1f} threshold={best.signal_threshold:.3f}"
+    )
     if args.save_best:
         save_strategy(best)
         print("Saved tuned strategy.")
@@ -387,6 +595,8 @@ def command_backtest(args: argparse.Namespace) -> int:
     print(f"trades: {result.trades}")
     print(f"win_rate: {result.win_rate:.2%}")
     print(f"realized_pnl: {result.realized_pnl:.2f}")
+    print(f"fees: {result.total_fees:.2f}")
+    print(f"max_exposure: {result.max_exposure:.2f}")
     print(f"starting_cash: {result.starting_cash:.2f}")
     print(f"ending_cash: {result.ending_cash:.2f}")
     print(f"max_drawdown: {result.max_drawdown:.2%}")
@@ -407,10 +617,12 @@ def command_live(args: argparse.Namespace) -> int:
         print("Live mode needs API key and secret. Run configure first or run with --paper.")
         return 2
 
-    leverage = _effective_leverage(cfg, runtime.market_type)
+    leverage = _resolve_futures_leverage(runtime, cfg)
     if runtime.market_type == "futures" and not effective_dry_run:
         try:
-            client.set_leverage(runtime.symbol, int(leverage))
+            set_response = client.set_leverage(runtime.symbol, int(leverage))
+            if isinstance(set_response, dict) and set_response.get("leverage"):
+                leverage = float(set_response.get("leverage"))
         except BinanceAPIError as exc:
             print(f"Failed to set leverage: {exc}", file=sys.stderr)
             return 2
@@ -423,7 +635,7 @@ def command_live(args: argparse.Namespace) -> int:
     qty = 0.0
     wait_ticks = cfg.cooldown_minutes
     cooldown_left = 0
-    leverage = _effective_leverage(cfg, runtime.market_type)
+    leverage = _resolve_futures_leverage(runtime, cfg)
 
     if model_path.exists():
         try:
@@ -440,6 +652,12 @@ def command_live(args: argparse.Namespace) -> int:
 
     fee_rate = max(0.0, cfg.taker_fee_bps) / 10_000.0
     slippage = max(0.0, cfg.slippage_bps) / 10_000.0
+    constraints = _resolve_symbol_constraints(runtime, client)
+    max_daily_trades = int(cfg.max_trades_per_day)
+    if max_daily_trades <= 0:
+        max_daily_trades = 0
+    daily_trade_count: dict[int, int] = {}
+    max_open_positions = max(1, int(cfg.max_open_positions))
 
     for i in range(args.steps):
         try:
@@ -467,16 +685,37 @@ def command_live(args: argparse.Namespace) -> int:
             cooldown_left -= 1
 
         price = latest.close
+        day = _safe_day_ms(latest.timestamp)
+        open_positions = 1 if position_side != 0 else 0
+        trade_cap_reached = max_daily_trades > 0 and daily_trade_count.get(day, 0) >= max_daily_trades
         if position_side == 0 and direction != 0:
-            notional = _target_notional(cash, cfg, runtime.market_type)
+            if trade_cap_reached:
+                print(f"step {i + 1:>2}: trade cap reached ({max_daily_trades}/day), skipping entry")
+                time.sleep(max(1, args.sleep))
+                continue
+            if open_positions >= max_open_positions:
+                print(f"step {i + 1:>2}: max open positions reached ({max_open_positions}), skipping entry")
+                time.sleep(max(1, args.sleep))
+                continue
+
+            notional, qty = _build_order_notional(
+                cash,
+                price,
+                cfg,
+                runtime.market_type,
+                leverage,
+                client,
+                constraints=constraints,
+            )
             if notional <= 0:
-                time.sleep(args.sleep)
+                print(f"step {i + 1:>2}: skipped entry due to order constraints")
+                time.sleep(max(1, args.sleep))
                 continue
 
             if runtime.market_type == "spot":
-                margin = min(cash, notional)
+                margin = min(cash, abs(notional))
             else:
-                margin = min(cash, notional / leverage)
+                margin = min(cash, abs(notional) / leverage)
 
             fee = abs(notional) * fee_rate
             total = margin + fee
@@ -491,10 +730,18 @@ def command_live(args: argparse.Namespace) -> int:
                 time.sleep(max(1, args.sleep))
                 continue
 
+            notional = qty * fill
+            fee = abs(notional) * fee_rate
+            total = margin + fee
+            if total > cash:
+                print(f"step {i + 1:>2}: insufficient cash after fill adjustment")
+                time.sleep(max(1, args.sleep))
+                continue
+
             cash -= total
             position_side = direction
             position_notional = direction * notional
-            qty = abs(notional / fill)
+            qty = abs(qty)
             entry_price = fill
             margin_used = margin
 
@@ -506,6 +753,7 @@ def command_live(args: argparse.Namespace) -> int:
                 side=side,
                 size=qty,
                 dry_run=effective_dry_run,
+                leverage=leverage,
             )
             print(f"step {i + 1:>2}: enter {'long' if position_side > 0 else 'short'} at {fill:.2f} qty={qty:.6f}")
             cooldown_left = 0
@@ -531,7 +779,9 @@ def command_live(args: argparse.Namespace) -> int:
                     side=side_to_close,
                     size=abs(qty),
                     dry_run=effective_dry_run,
+                    leverage=leverage,
                 )
+                daily_trade_count[day] = daily_trade_count.get(day, 0) + 1
                 print(
                     f"step {i + 1:>2}: close {'long' if position_side > 0 else 'short'} "
                     f"pnl={pnl:.2f} cash={cash:.2f}"

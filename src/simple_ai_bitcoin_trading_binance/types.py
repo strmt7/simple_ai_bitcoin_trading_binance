@@ -34,6 +34,7 @@ class StrategyConfig:
     leverage: float = 1.0
     risk_per_trade: float = 0.01
     max_position_pct: float = 0.20
+    max_open_positions: int = 1
     stop_loss_pct: float = 0.02
     take_profit_pct: float = 0.03
     feature_windows: tuple[int, int] = (10, 40)
