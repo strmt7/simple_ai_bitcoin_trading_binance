@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from simple_ai_bitcoin_trading_binance.features import ModelRow
-from simple_ai_bitcoin_trading_binance.model import TrainedModel, evaluate, train
+from pathlib import Path
+
+from simple_ai_bitcoin_trading_binance.model import (
+    TrainedModel,
+    evaluate,
+    load_model,
+    train,
+    walk_forward_report,
+)
 
 
 def _rows() -> list[ModelRow]:
@@ -19,3 +27,36 @@ def test_train_and_evaluate() -> None:
     assert model.feature_dim == 13
     score = evaluate(_rows(), model, threshold=0.5)
     assert 0.0 <= score <= 1.0
+
+
+def test_load_model_backwards_compatibility(tmp_path: Path) -> None:
+    model_path = tmp_path / "legacy_model.json"
+    model_path.write_text(
+        """
+        {
+          "weights": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
+          "bias": 0.01,
+          "feature_dim": 13,
+          "epochs": 10,
+          "feature_means": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "feature_stds": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    model = load_model(model_path)
+    assert isinstance(model, TrainedModel)
+    assert model.learning_rate == 0.05
+    assert model.l2_penalty == 1e-4
+    assert model.class_weight_pos == 1.0
+    assert model.class_weight_neg == 1.0
+
+
+def test_walk_forward_report_runs() -> None:
+    rows = _rows()
+    report = walk_forward_report(rows, train_window=60, test_window=20, step=20, epochs=5, calibrate=False)
+    assert report["folds"] == 3
+    assert report["train_window"] == 60
+    assert report["test_window"] == 20
+    assert report["step"] == 20
+    assert report["average_score"] >= 0.0
