@@ -29,5 +29,5 @@ def test_make_rows_shapes() -> None:
     rows = make_rows(_fake_candles(), short_window=10, long_window=30)
     assert rows
     first = rows[0]
-    assert len(first.features) == 5
+    assert len(first.features) == 13
     assert first.label in (0, 1)
