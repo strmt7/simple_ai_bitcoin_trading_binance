@@ -1,24 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 
 from simple_ai_bitcoin_trading_binance.cli import (
     _artifact_summary,
-    _build_strategy_menu_args,
     _filter_candles_for_time_window,
-    _menu_prompt_bool,
-    _menu_feature_selection,
-    _menu_prompt_float,
-    _menu_prompt_int,
-    _menu_tune_window_args,
+    _parse_feature_selection,
     _recent_artifacts,
     _build_order_notional,
     _build_live_model,
     _effective_leverage,
     _resolve_live_retrain_rows,
-    _run_offline_pipeline,
-    _run_menu,
-    _run_spot_test_order_roundtrip,
+    _tui_actions,
     _show_account_overview,
     _show_recent_artifacts,
     _target_notional,
@@ -29,6 +23,32 @@ from simple_ai_bitcoin_trading_binance.cli import (
 from simple_ai_bitcoin_trading_binance.config import load_strategy
 from simple_ai_bitcoin_trading_binance.api import Candle, SymbolConstraints
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
+
+
+class _AsyncUI:
+    def __init__(self, *, prompts: list[str] | None = None, confirms: list[bool] | None = None) -> None:
+        self._prompts = iter(prompts or [])
+        self._confirms = iter(confirms or [])
+        self.logs: list[str] = []
+
+    async def prompt(self, _label: str, _default: str = "") -> str:
+        return next(self._prompts)
+
+    async def secret(self, _label: str, _default: str = "") -> str:
+        return next(self._prompts)
+
+    async def confirm(self, _message: str) -> bool:
+        return next(self._confirms)
+
+    def append_log(self, text: str) -> None:
+        self.logs.append(text)
+
+
+def _action(title: str):
+    for action in _tui_actions():
+        if action.title == title:
+            return action
+    raise AssertionError(f"missing action: {title}")
 
 
 def test_effective_leverage_clamps_by_market() -> None:
@@ -131,6 +151,11 @@ def test_command_strategy_updates_risk_and_rate_limits(tmp_path, monkeypatch) ->
         taker_fee_bps=None,
         slippage_bps=None,
         label_threshold=None,
+        model_lookback=320,
+        training_epochs=480,
+        confidence_beta=0.92,
+        feature_window_short=12,
+        feature_window_long=48,
         max_trades_per_day=7,
         set_features="momentum_1,rsi",
         enable_feature=None,
@@ -142,6 +167,10 @@ def test_command_strategy_updates_risk_and_rate_limits(tmp_path, monkeypatch) ->
     assert updated.risk_per_trade == 0.003
     assert updated.max_open_positions == 4
     assert updated.max_trades_per_day == 7
+    assert updated.model_lookback == 320
+    assert updated.training_epochs == 480
+    assert updated.confidence_beta == 0.92
+    assert updated.feature_windows == (12, 48)
     assert updated.enabled_features == ("momentum_1", "rsi")
 
 
@@ -220,67 +249,6 @@ def test_build_live_model_returns_existing_when_rows_insufficient(monkeypatch) -
     assert called["value"] is False
 
 
-def test_build_strategy_menu_args_retries_invalid_numeric_input() -> None:
-    cfg = StrategyConfig()
-    responses = iter([
-        "abc",
-        "2",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-    ])
-
-    args = _build_strategy_menu_args(cfg, input_fn=lambda _prompt: next(responses))
-    assert args.leverage == 2.0
-    assert args.risk == cfg.risk_per_trade
-    assert args.max_trades_per_day == cfg.max_trades_per_day
-
-
-def test_menu_feature_selection_toggles_and_preserves() -> None:
-    keep = iter([""])
-    assert _menu_feature_selection(("momentum_1", "rsi"), input_fn=lambda _prompt: next(keep)) == ("momentum_1", "rsi")
-
-    toggle = iter(["2,3"])
-    selected = _menu_feature_selection(("momentum_1", "momentum_3"), input_fn=lambda _prompt: next(toggle))
-    assert "momentum_3" not in selected
-    assert "momentum_10" in selected
-
-
-def test_run_menu_invalid_selection_then_exit(capsys) -> None:
-    responses = iter(["99", "17"])
-    result = _run_menu(input_fn=lambda _prompt: next(responses))
-    output = capsys.readouterr().out
-    assert result == 0
-    assert "Invalid selection." in output
-    assert "Exiting menu." in output
-
-
-def test_run_menu_live_testnet_requires_explicit_confirmation(monkeypatch, capsys) -> None:
-    called = {"live": False}
-
-    def fake_live(_args):
-        called["live"] = True
-        return 0
-
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_live", fake_live)
-    responses = iter(["13", "nope", "17"])
-    result = _run_menu(input_fn=lambda _prompt: next(responses))
-    output = capsys.readouterr().out
-    assert result == 0
-    assert called["live"] is False
-    assert "Testnet execution cancelled." in output
-
-
 def test_main_without_args_routes_to_menu(monkeypatch) -> None:
     called = {"menu": False}
 
@@ -293,213 +261,221 @@ def test_main_without_args_routes_to_menu(monkeypatch) -> None:
     assert called["menu"] is True
 
 
-def test_menu_prompt_int_and_float_retry_until_valid(capsys) -> None:
-    int_answers = iter(["bad", "-1", "4"])
-    float_answers = iter(["bad", "2.5"])
-    assert _menu_prompt_int("Value", 1, minimum=0, input_fn=lambda _prompt: next(int_answers)) == 4
-    assert _menu_prompt_float("Float", 1.0, minimum=0.0, maximum=3.0, input_fn=lambda _prompt: next(float_answers)) == 2.5
-    output = capsys.readouterr().out
-    assert "Enter a whole number." in output
-    assert "Value must be >= 0." in output
-    assert "Enter a numeric value." in output
+def test_command_menu_routes_to_tui_when_tty(monkeypatch) -> None:
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.tui.launch_tui", lambda **_kwargs: 0)
+    from simple_ai_bitcoin_trading_binance.cli import command_menu
+
+    assert command_menu(argparse.Namespace()) == 0
 
 
-def test_menu_prompt_bool_retries_invalid_answer(capsys) -> None:
-    answers = iter(["maybe", "y"])
-    assert _menu_prompt_bool("Proceed", False, input_fn=lambda _prompt: next(answers)) is True
-    assert "Enter y or n." in capsys.readouterr().out
+def test_command_menu_rejects_without_tty(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: False)
+    from simple_ai_bitcoin_trading_binance.cli import command_menu
+
+    assert command_menu(argparse.Namespace()) == 2
+    assert "Interactive console requires a real terminal" in capsys.readouterr().err
 
 
-def test_run_menu_status_then_exit(monkeypatch) -> None:
-    called = {"status": 0}
-
-    def fake_status(_args):
-        called["status"] += 1
-        return 0
-
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_status", fake_status)
-    responses = iter(["1", "17"])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert called["status"] == 1
+def test_parse_feature_selection_supports_blank_all_indices_and_names() -> None:
+    assert _parse_feature_selection("", ("momentum_1", "rsi")) == ("momentum_1", "rsi")
+    assert _parse_feature_selection("all", ("momentum_1",)) == StrategyConfig().enabled_features
+    toggled = _parse_feature_selection("2,rsi", ("momentum_1", "rsi"))
+    assert "momentum_3" in toggled
+    assert "rsi" not in toggled
 
 
-def test_run_menu_configure_and_connect_then_exit(monkeypatch) -> None:
-    called = {"configure": 0, "connect": 0}
+def test_tui_runtime_action_saves_runtime(monkeypatch) -> None:
+    current = type(
+        "R",
+        (),
+        {
+            "symbol": "BTCUSDC",
+            "interval": "15m",
+            "market_type": "spot",
+            "testnet": True,
+            "api_key": "old-key",
+            "api_secret": "old-secret",
+            "dry_run": True,
+            "validate_account": True,
+            "max_rate_calls_per_minute": 1100,
+        },
+    )()
+    saved = {}
 
-    monkeypatch.setattr(
-        "simple_ai_bitcoin_trading_binance.cli.command_configure",
-        lambda _args: called.__setitem__("configure", called["configure"] + 1) or 0,
-    )
-    monkeypatch.setattr(
-        "simple_ai_bitcoin_trading_binance.cli.command_connect",
-        lambda _args: called.__setitem__("connect", called["connect"] + 1) or 0,
-    )
-    responses = iter(["2", "4", "17"])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert called == {"configure": 1, "connect": 1}
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: current)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_runtime", lambda cfg: saved.setdefault("cfg", cfg) or cfg)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._build_client", lambda _runtime: type("C", (), {"ping": lambda self: None, "ensure_btcusdc": lambda self: None})())
+
+    ui = _AsyncUI(prompts=["futures", "1h", "yes", "new-key", "new-secret", "no", "yes", "1500"])
+    result = asyncio.run(_action("Runtime settings").run(ui))
+
+    assert result == 0
+    assert saved["cfg"].market_type == "futures"
+    assert saved["cfg"].interval == "1h"
+    assert saved["cfg"].api_key == "new-key"
+    assert saved["cfg"].dry_run is False
+    assert saved["cfg"].max_rate_calls_per_minute == 1500
 
 
-def test_run_menu_fetch_builds_expected_args(monkeypatch) -> None:
+def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
     captured = {}
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", lambda: StrategyConfig())
 
-    monkeypatch.setattr(
-        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
-        lambda: type(
-            "R",
-            (),
-            {"symbol": "BTCUSDC", "interval": "15m", "market_type": "spot", "testnet": True, "dry_run": True},
-        )(),
-    )
-
-    def fake_fetch(args):
+    def fake_strategy(args):
         captured["args"] = args
         return 0
 
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", fake_fetch)
-    responses = iter(["7", "400", "tmp/fetch.json", "17"])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert captured["args"].limit == 400
-    assert captured["args"].output == "tmp/fetch.json"
-    assert captured["args"].symbol == "BTCUSDC"
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", fake_strategy)
+
+    ui = _AsyncUI(
+        prompts=[
+            "all",
+            "12",
+            "48",
+            "3",
+            "0.02",
+            "0.3",
+            "0.01",
+            "0.05",
+            "1",
+            "2",
+            "7",
+            "0.6",
+            "0.2",
+            "2",
+            "4",
+            "0.002",
+            "300",
+            "500",
+            "0.9",
+        ]
+    )
+    result = asyncio.run(_action("Strategy settings").run(ui))
+
+    assert result == 0
+    assert captured["args"].leverage == 3.0
+    assert captured["args"].feature_window_short == 12
+    assert captured["args"].feature_window_long == 48
+    assert captured["args"].training_epochs == 500
+    assert captured["args"].confidence_beta == 0.9
+    assert "momentum_1" in captured["args"].set_features
 
 
-def test_run_menu_train_and_tune_build_expected_args(monkeypatch) -> None:
+def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypatch) -> None:
     captured = {}
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
+        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m"})(),
+    )
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", lambda args: captured.__setitem__("fetch", args) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", lambda args: captured.__setitem__("train", args) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_tune", lambda args: captured.__setitem__("tune", args) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured.__setitem__("backtest", args) or 0)
 
-    def fake_train(args):
-        captured["train"] = args
-        return 0
+    asyncio.run(_action("Fetch candles").run(_AsyncUI(prompts=["400", "tmp/fetch.json"])))
+    asyncio.run(_action("Train model").run(_AsyncUI(prompts=["data/in.json", "data/out.json", "99", "11", "yes", "310", "70", "20", "no"])))
+    asyncio.run(
+        _action("Tune strategy").run(
+            _AsyncUI(
+                prompts=[
+                    "range",
+                    "2024-01-01",
+                    "2024-02-01",
+                    "data/tune.json",
+                    "yes",
+                    "0.003",
+                    "0.03",
+                    "4",
+                    "1",
+                    "10",
+                    "0.5",
+                    "0.8",
+                    "0.01",
+                    "0.04",
+                    "0.01",
+                    "0.03",
+                ]
+            )
+        )
+    )
+    asyncio.run(_action("Backtest").run(_AsyncUI(prompts=["data/back.json", "data/model.json", "1500"])))
 
-    def fake_tune(args):
-        captured["tune"] = args
-        return 0
-
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", fake_train)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_tune", fake_tune)
-    responses = iter([
-        "8",
-        "data/in.json",
-        "data/out.json",
-        "99",
-        "11",
-        "y",
-        "310",
-        "70",
-        "20",
-        "n",
-        "9",
-        "all",
-        "data/tune.json",
-        "y",
-        "0.003",
-        "0.03",
-        "4",
-        "1",
-        "10",
-        "0.5",
-        "0.8",
-        "0.01",
-        "0.04",
-        "0.01",
-        "0.03",
-        "17",
-    ])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert captured["train"].input == "data/in.json"
-    assert captured["train"].output == "data/out.json"
-    assert captured["train"].epochs == 99
-    assert captured["train"].seed == 11
+    assert captured["fetch"].limit == 400
     assert captured["train"].walk_forward is True
     assert captured["train"].calibrate_threshold is False
-    assert captured["tune"].input == "data/tune.json"
-    assert captured["tune"].save_best is True
-    assert captured["tune"].steps == 4
-
-
-def test_run_menu_backtest_and_evaluate_build_expected_args(monkeypatch) -> None:
-    captured = {}
-
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured.setdefault("backtest", args) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured.setdefault("evaluate", args) or 0)
-    responses = iter([
-        "10",
-        "data/back.json",
-        "data/model.json",
-        "1500",
-        "11",
-        "0.61",
-        "data/eval.json",
-        "data/eval-model.json",
-        "y",
-        "17",
-    ])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert captured["tune"].from_date == "2024-01-01"
+    assert captured["tune"].to_date == "2024-02-01"
     assert captured["backtest"].start_cash == 1500.0
-    assert captured["evaluate"].threshold == 0.61
-    assert captured["evaluate"].calibrate_threshold is True
 
 
-def test_run_menu_strategy_builds_expected_args(monkeypatch) -> None:
-    captured = {}
+def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
+    captured = {"order": []}
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
+        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m"})(),
+    )
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured.setdefault("evaluate", args) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", lambda args: captured["order"].append(("fetch", args.output)) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", lambda args: captured["order"].append(("train", args.output)) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured["order"].append(("backtest", args.model)) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured["order"].append(("evaluate", args.model)) or 0)
 
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", lambda: StrategyConfig())
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", lambda args: captured.setdefault("strategy", args) or 0)
-    responses = iter([
-        "3",
-        "2",
-        "0.02",
-        "0.3",
-        "0.01",
-        "0.05",
-        "1",
-        "2",
-        "7",
-        "0.6",
-        "0.2",
-        "2",
-        "4",
-        "0.002",
-        "",
-        "17",
-    ])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert captured["strategy"].leverage == 2.0
-    assert captured["strategy"].max_trades_per_day == 7
-    assert captured["strategy"].label_threshold == 0.002
+    ui_eval = _AsyncUI(prompts=["0.61", "data/eval.json", "data/eval-model.json", "yes"])
+    asyncio.run(_action("Evaluate").run(ui_eval))
+
+    ui_pipeline = _AsyncUI(
+        prompts=[
+            "tmp/history.json",
+            "tmp/model.json",
+            "220",
+            "50",
+            "7",
+            "yes",
+            "300",
+            "60",
+            "30",
+            "yes",
+            "1000",
+        ]
+    )
+    asyncio.run(_action("Offline pipeline").run(ui_pipeline))
+
+    assert captured["order"] == [
+        ("evaluate", "data/eval-model.json"),
+        ("fetch", "tmp/history.json"),
+        ("train", "tmp/model.json"),
+        ("backtest", "tmp/model.json"),
+        ("evaluate", "tmp/model.json"),
+    ]
 
 
-def test_run_menu_live_variants_build_expected_args(monkeypatch) -> None:
+def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
     calls = []
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_live", lambda args: calls.append(args) or 0)
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
+        lambda: type("R", (), {"market_type": "spot", "testnet": True, "api_key": "k", "api_secret": "s", "symbol": "BTCUSDC"})(),
+    )
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli._build_client",
+        lambda _runtime: type(
+            "C",
+            (),
+            {"place_order": lambda self, symbol, side, quantity, dry_run=False: {"status": "FILLED", "orderId": 1 if side == "BUY" else 2, "executedQty": quantity}},
+        )(),
+    )
 
-    def fake_live(args):
-        calls.append(args)
-        return 0
+    asyncio.run(_action("Paper loop").run(_AsyncUI(prompts=["3", "0", "1", "120", "100"])))
+    asyncio.run(_action("Testnet loop").run(_AsyncUI(prompts=["2", "0", "0", "240", "120"], confirms=[True])))
+    asyncio.run(_action("Testnet loop").run(_AsyncUI(prompts=[], confirms=[False])))
+    asyncio.run(_action("Spot roundtrip").run(_AsyncUI(prompts=["0.00008"], confirms=[True])))
 
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_live", fake_live)
-    responses = iter([
-        "12",
-        "3",
-        "0",
-        "1",
-        "120",
-        "100",
-        "13",
-        "TESTNET",
-        "2",
-        "0",
-        "0",
-        "240",
-        "120",
-        "17",
-    ])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert len(calls) == 2
-    assert calls[0].paper is True
-    assert calls[0].live is False
-    assert calls[0].steps == 3
-    assert calls[1].paper is False
-    assert calls[1].live is True
-    assert calls[1].steps == 2
+    assert calls[0].paper is True and calls[0].steps == 3
+    assert calls[1].live is True and calls[1].steps == 2
+    assert "Spot test roundtrip complete." in capsys.readouterr().out
 
 
 def test_recent_artifacts_and_summary(tmp_path) -> None:
@@ -549,73 +525,6 @@ def test_show_account_overview_prints_balances(monkeypatch, capsys) -> None:
     assert "Account overview" in output
     assert "BTC" in output
     assert "USDC" in output
-
-
-def test_run_offline_pipeline_invokes_commands_in_order(monkeypatch) -> None:
-    calls = []
-
-    monkeypatch.setattr(
-        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
-        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m"})(),
-    )
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", lambda args: calls.append(("fetch", args.output)) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", lambda args: calls.append(("train", args.output)) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: calls.append(("backtest", args.model)) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: calls.append(("evaluate", args.model)) or 0)
-
-    responses = iter([
-        "tmp/history.json",
-        "tmp/model.json",
-        "220",
-        "50",
-        "7",
-        "y",
-        "300",
-        "60",
-        "30",
-        "y",
-        "1000",
-    ])
-    assert _run_offline_pipeline(input_fn=lambda _prompt: next(responses)) == 0
-    assert [name for name, _value in calls] == ["fetch", "train", "backtest", "evaluate"]
-
-
-def test_run_spot_test_order_roundtrip_guards_and_executes(monkeypatch, capsys) -> None:
-    runtime = type(
-        "R",
-        (),
-        {"market_type": "spot", "testnet": True, "api_key": "k", "api_secret": "s", "symbol": "BTCUSDC"},
-    )()
-    calls = []
-
-    class _Client:
-        def place_order(self, symbol, side, quantity, dry_run):
-            calls.append((symbol, side, quantity, dry_run))
-            return {"status": "FILLED", "orderId": len(calls), "executedQty": quantity}
-
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: runtime)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._build_client", lambda _runtime: _Client())
-    answers = iter(["ROUNDTRIP", "0.00008"])
-    assert _run_spot_test_order_roundtrip(input_fn=lambda _prompt: next(answers)) == 0
-    assert calls == [
-        ("BTCUSDC", "BUY", 0.00008, False),
-        ("BTCUSDC", "SELL", 0.00008, False),
-    ]
-    assert "Spot test roundtrip complete." in capsys.readouterr().out
-
-
-def test_run_menu_new_options(monkeypatch) -> None:
-    calls = {"account": 0, "dashboard": 0, "pipeline": 0, "artifacts": 0, "roundtrip": 0}
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._show_account_overview", lambda: calls.__setitem__("account", calls["account"] + 1) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_dashboard", lambda _args: calls.__setitem__("dashboard", calls["dashboard"] + 1) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._run_offline_pipeline", lambda input_fn: calls.__setitem__("pipeline", calls["pipeline"] + 1) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._show_recent_artifacts", lambda: calls.__setitem__("artifacts", calls["artifacts"] + 1) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._run_spot_test_order_roundtrip", lambda input_fn: calls.__setitem__("roundtrip", calls["roundtrip"] + 1) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m", "market_type": "spot", "testnet": True, "dry_run": True})())
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", lambda: StrategyConfig())
-    responses = iter(["5", "6", "14", "15", "16", "17"])
-    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
-    assert calls == {"account": 1, "dashboard": 1, "pipeline": 1, "artifacts": 1, "roundtrip": 1}
 
 
 def test_command_live_rejects_conflicting_force_modes(capsys) -> None:
@@ -668,18 +577,3 @@ def test_filter_candles_for_time_window_rejects_invalid_inputs() -> None:
         assert "from_date must be <=" in str(exc)
     else:
         raise AssertionError("expected ValueError")
-
-
-def test_menu_tune_window_args_supports_all_modes(capsys) -> None:
-    all_mode = iter([""])
-    assert _menu_tune_window_args(input_fn=lambda _prompt: next(all_mode)) == (None, None, None)
-
-    lookback_mode = iter(["lookback", "14"])
-    assert _menu_tune_window_args(input_fn=lambda _prompt: next(lookback_mode)) == (14, None, None)
-
-    range_mode = iter(["range", "2024-01-01", "2024-02-01"])
-    assert _menu_tune_window_args(input_fn=lambda _prompt: next(range_mode)) == (None, "2024-01-01", "2024-02-01")
-
-    unknown_mode = iter(["weird"])
-    assert _menu_tune_window_args(input_fn=lambda _prompt: next(unknown_mode)) == (None, None, None)
-    assert "Unknown tune window mode" in capsys.readouterr().out

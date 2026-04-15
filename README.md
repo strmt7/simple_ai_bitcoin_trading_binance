@@ -1,16 +1,15 @@
 # simple_ai_bitcoin_trading_binance
 
-Simple AI Bitcoin trading CLI (BTCUSDC test-trade focused)
+Interactive BTCUSDC testnet trading console for Binance.
 
-This repository is a compact, testnet-first trading assistant that keeps scope intentionally narrow:
+The project is intentionally narrow and operator-focused:
 
-- Supports only `BTCUSDC` for both market data and signal execution.
-- Supports Binance spot and futures endpoints.
-- Uses only free/public Binance REST endpoints for discovery, market data, and order simulation/execution.
-- Supports Binance paper/trade flows on testnet using `/api`, `/api/v3`, `/fapi` testnet hosts.
-- Supports model training, tuning, backtesting, and live loop execution.
-- Stores credentials locally in a user config file with restrictive permissions (`600`).
-- Redacts credential fields from CLI status output and generated JSON run artifacts.
+- `BTCUSDC` only for data, training, backtesting, and execution
+- Binance spot and futures testnet support
+- one primary interface: the interactive terminal console
+- guided runtime editing, strategy editing, feature selection, training, tuning, backtesting, and live-loop control
+- local credential storage with `600` permissions
+- credential redaction in visible status output and generated JSON artifacts
 
 ## Safety defaults
 
@@ -24,21 +23,33 @@ This repository is a compact, testnet-first trading assistant that keeps scope i
 
 ```bash
 python3 -m pip install -e .
-simple-ai-trading configure
-simple-ai-trading fetch --limit 500
-simple-ai-trading train --epochs 250
-simple-ai-trading train --calibrate-threshold
-simple-ai-trading backtest
-simple-ai-trading live --steps 10 --sleep 5
+simple-ai-trading
 ```
+
+If your shell does not expose the console entrypoint:
 
 ```bash
-simple-ai-trading evaluate --input data/historical_btcusdc.json --model data/model.json --calibrate-threshold
+PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli
 ```
 
-By default data is stored under `data/historical_btcusdc.json` and `data/model.json`.
+This opens the interactive console inside the current terminal window. The console is the primary operator workflow.
 
-If you need to point the client at a different compatible host without changing code, use environment overrides:
+Use the left action list to:
+
+- edit runtime settings
+- edit strategy and feature selection
+- fetch candles
+- train or retrain the model
+- tune over all data, a lookback window, or an explicit date range
+- run backtests and evaluation
+- run paper or authenticated testnet live loops
+- inspect recent artifacts and account state
+
+By default data is written to `data/historical_btcusdc.json` and `data/model.json`.
+
+## Host overrides
+
+If you need to point the client at a compatible proxy or alternate host without code changes, use environment overrides:
 
 ```bash
 BINANCE_BASE_URL=https://example-proxy.local simple-ai-trading connect
@@ -46,101 +57,66 @@ BINANCE_SPOT_BASE_URL=https://spot-proxy.local simple-ai-trading connect
 BINANCE_FUTURES_BASE_URL=https://futures-proxy.local simple-ai-trading connect
 ```
 
-If your shell does not source the console entrypoint, run with `PYTHONPATH=src`:
+## Interactive console capabilities
 
-```bash
-PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli status
-PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli fetch
-```
+### Runtime settings
 
-## Commands
+The console edits:
 
-### `configure`
-
-Prompts for:
-
-- symbol (kept at `BTCUSDC` by default)
 - interval
-- market mode (`spot` or `futures`)
-- testnet mode
-- Binance API key and secret
-- paper mode toggle
+- market type
+- testnet flag
+- API key and secret
+- paper/live default
+- startup validation
+- max REST calls per minute
 
-### `fetch`
+### Strategy settings
 
-Fetches market bars from Binance and stores them as JSON in `data/historical_btcusdc.json` by default.
+The console edits:
 
-### `train`
+- leverage
+- risk per trade
+- max position percent
+- stop loss and take profit
+- cooldown
+- max open positions
+- max trades per day
+- signal threshold
+- max drawdown
+- taker fee and slippage
+- label threshold
+- model lookback
+- training epochs
+- confidence beta
+- short and long feature windows
+- enabled model features
 
-Builds feature rows from historical candles and trains a pure-stdlib logistic model. Saved to `data/model.json`.
-- `--calibrate-threshold` runs a validation sweep to tune the decision cut.
-- `--walk-forward` runs a rolling walk-forward validation pass before final training.
-- `--walk-forward-train`, `--walk-forward-test`, and `--walk-forward-step` control that validation windowing.
+### Tuning windows
 
-### `backtest`
+The console supports:
 
-Runs a conservative backtest against cached data with stop-loss / take-profit risk limits, fees, and drawdown tracking.
-- Reports fee totals, max exposure, and whether the run terminated by drawdown limit.
-- Backtests now track if the run was terminated early by the drawdown cap, allowing strategy tuning to reject unstable parameter sets.
+- all available data
+- a recent lookback window in days
+- an explicit inclusive date range
 
-### `evaluate`
+### Model and execution workflow
 
-Evaluates a saved model against cached candles.
-- `--threshold` forces a custom decision boundary.
-- `--calibrate-threshold` runs an F1 sweep on the validation tail.
-- Prints accuracy, precision, recall, F1, and confusion counts for transparency.
-
-### `connect`
-
-Checks exchange connectivity, validates BTCUSDC availability on the selected market, and optionally prints account metadata.
-- In futures mode (with API credentials), prints the exchange max leverage for BTCUSDC.
-
-### `live`
-
-Runs a real-time loop that continuously re-trains on a rolling window and executes paper or live orders.
-- `--paper` forces dry-run execution even when runtime is set to live.
-- Spot mode always executes at 1x. Futures mode uses configured leverage (clamped by exchange leverage bracket when credentials are present).
-- `--leverage` overrides leverage for the current run in futures mode.
-- `--retrain-interval` controls how often the in-loop model is rebuilt from recent history (`0` disables periodic rebuild).
-- `--retrain-window` sets how many latest feature rows are used per rebuild.
-- `--retrain-min-rows` sets the minimum rows required before any periodic rebuild is attempted.
-
-Leverage details:
-- spot mode always runs at 1x.
-- futures mode can use 1x–125x and is capped by exchange bracket values when credentials are available.
-- `paper` mode is paper-only, even on futures.
-
-If you want to test multiple leverage scenarios without changing persisted strategy settings, pass `--leverage` directly to `live` each run.
-
-### `tune`
-
-The tune command runs a constrained grid search over risk and execution parameters and chooses candidates based on:
-- realized PnL minus fees
-- penalties for excessive drawdown
-- hard rejection of runs that hit the drawdown limit
-- trade activity floor (to avoid selecting no-trade candidates)
-
-### `strategy`
-
-Adjusts risk controls and model-related parameters (`risk_per_trade`, `stop_loss_pct`, leverage, and more).
-
-- use `--leverage` to set intended futures leverage (clamped to exchange limits).
-- use `--max-open` to cap concurrent open positions.
-- use `--max-trades-per-day` to cap entries (set `0` for no cap).
-
-### `status`
-
-Prints current runtime and strategy settings.
+- training uses the current feature selection from strategy settings
+- evaluation and backtesting use the current saved model artifact
+- the live loop supports paper mode and explicit authenticated testnet execution
+- spot roundtrip execution is an explicit console action, not an automatic side effect
 
 ## Development
 
 ```bash
-python3 -m pytest
+.venv/bin/python -m pytest -q
+.venv/bin/python -m coverage run --source=src/simple_ai_bitcoin_trading_binance -m pytest -q
 ```
 
 ## Limitations
 
-- No deep-learning frameworks are used currently to keep bootstrap dependencies minimal.
+- The current model backend is still intentionally lightweight and conservative; it is configurable and retrainable, but it is not a large deep-learning stack.
 - This is not production trading software; behavior is intentionally conservative and constrained to test-phase workflows.
 - API key security depends on file-system permissions and host security; do not commit secrets to version control.
 - Host selection is configurable via environment overrides, but execution scope remains BTCUSDC-only and testnet-first.

@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Iterable, Sequence
 
 from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
@@ -27,7 +27,7 @@ from .model import (
     train,
     walk_forward_report,
 )
-from .types import StrategyConfig
+from .types import RuntimeConfig, StrategyConfig
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -43,11 +43,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_connect = subparsers.add_parser("connect", help="validate credentials and connectivity")
     parser_connect.set_defaults(func=command_connect)
 
-    parser_dashboard = subparsers.add_parser("dashboard", help="render operator dashboard snapshot")
-    parser_dashboard.add_argument("--with-account", action="store_true", help="include authenticated account balances when credentials are present")
-    parser_dashboard.set_defaults(func=command_dashboard)
-
-    parser_menu = subparsers.add_parser("menu", help="launch interactive operator menu")
+    parser_menu = subparsers.add_parser("menu", help="launch the interactive operator console")
     parser_menu.set_defaults(func=command_menu)
 
     parser_fetch = subparsers.add_parser("fetch", help="download BTCUSDC klines")
@@ -152,6 +148,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--taker-fee-bps", type=float, default=None)
     parser_strategy.add_argument("--slippage-bps", type=float, default=None)
     parser_strategy.add_argument("--label-threshold", type=float, default=None)
+    parser_strategy.add_argument("--model-lookback", type=int, default=None)
+    parser_strategy.add_argument("--training-epochs", type=int, default=None)
+    parser_strategy.add_argument("--confidence-beta", type=float, default=None)
+    parser_strategy.add_argument("--feature-window-short", type=int, default=None)
+    parser_strategy.add_argument("--feature-window-long", type=int, default=None)
     parser_strategy.add_argument("--set-features", default=None, help="comma-separated ordered feature list for retraining")
     parser_strategy.add_argument("--enable-feature", action="append", default=None, help="enable a feature by name")
     parser_strategy.add_argument("--disable-feature", action="append", default=None, help="disable a feature by name")
@@ -170,119 +171,169 @@ def _build_client(runtime):
     )
 
 
-def _menu_prompt(text: str, *, input_fn: Callable[[str], str] = input) -> str:
-    return input_fn(text).strip()
-
-
-def _menu_prompt_default(text: str, current: str, *, input_fn: Callable[[str], str] = input) -> str:
-    value = _menu_prompt(f"{text} [{current}]: ", input_fn=input_fn)
-    return value or current
-
-
-def _menu_prompt_int(text: str, current: int, *, minimum: int | None = None,
-                     input_fn: Callable[[str], str] = input) -> int:
+async def _ui_prompt_int(ui, label: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
     while True:
-        raw = _menu_prompt(f"{text} [{current}]: ", input_fn=input_fn)
-        if not raw:
-            return current
+        raw = await ui.prompt(label, str(default))
         try:
             value = int(raw)
         except ValueError:
-            print("Enter a whole number.")
+            ui.append_log("Enter a whole number.")
             continue
         if minimum is not None and value < minimum:
-            print(f"Value must be >= {minimum}.")
+            ui.append_log(f"Value must be >= {minimum}.")
+            continue
+        if maximum is not None and value > maximum:
+            ui.append_log(f"Value must be <= {maximum}.")
             continue
         return value
 
 
-def _menu_prompt_float(text: str, current: float, *, minimum: float | None = None,
-                       maximum: float | None = None, input_fn: Callable[[str], str] = input) -> float:
+async def _ui_prompt_float(
+    ui,
+    label: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     while True:
-        raw = _menu_prompt(f"{text} [{current}]: ", input_fn=input_fn)
-        if not raw:
-            return current
+        raw = await ui.prompt(label, str(default))
         try:
             value = float(raw)
         except ValueError:
-            print("Enter a numeric value.")
+            ui.append_log("Enter a numeric value.")
             continue
         if minimum is not None and value < minimum:
-            print(f"Value must be >= {minimum}.")
+            ui.append_log(f"Value must be >= {minimum}.")
             continue
         if maximum is not None and value > maximum:
-            print(f"Value must be <= {maximum}.")
+            ui.append_log(f"Value must be <= {maximum}.")
             continue
         return value
 
 
-def _menu_prompt_bool(text: str, current: bool, *, input_fn: Callable[[str], str] = input) -> bool:
-    default = "y" if current else "n"
+async def _ui_prompt_bool(ui, label: str, default: bool) -> bool:
+    default_text = "yes" if default else "no"
     while True:
-        raw = _menu_prompt(f"{text} (y/n) [{default}]: ", input_fn=input_fn).lower()
-        if not raw:
-            return current
-        if raw in {"y", "yes"}:
+        raw = (await ui.prompt(f"{label} [yes/no]", default_text)).strip().lower()
+        if raw in {"y", "yes", "true", "1"}:
             return True
-        if raw in {"n", "no"}:
+        if raw in {"n", "no", "false", "0"}:
             return False
-        print("Enter y or n.")
+        ui.append_log("Enter yes or no.")
 
 
-def _build_strategy_menu_args(cfg: StrategyConfig, *, input_fn: Callable[[str], str] = input) -> argparse.Namespace:
-    return argparse.Namespace(
-        leverage=_menu_prompt_float("Leverage", cfg.leverage, minimum=1.0, input_fn=input_fn),
-        risk=_menu_prompt_float("Risk per trade", cfg.risk_per_trade, minimum=0.0001, input_fn=input_fn),
-        max_position=_menu_prompt_float("Max position pct", cfg.max_position_pct, minimum=0.0, maximum=1.0, input_fn=input_fn),
-        stop=_menu_prompt_float("Stop loss pct", cfg.stop_loss_pct, minimum=0.0, maximum=0.99, input_fn=input_fn),
-        take=_menu_prompt_float("Take profit pct", cfg.take_profit_pct, minimum=0.0, maximum=0.99, input_fn=input_fn),
-        cooldown=_menu_prompt_int("Cooldown minutes", cfg.cooldown_minutes, minimum=0, input_fn=input_fn),
-        max_open=_menu_prompt_int("Max open positions", cfg.max_open_positions, minimum=0, input_fn=input_fn),
-        max_trades_per_day=_menu_prompt_int("Max trades per day", cfg.max_trades_per_day, minimum=0, input_fn=input_fn),
-        signal_threshold=_menu_prompt_float("Signal threshold", cfg.signal_threshold, minimum=0.01, maximum=0.99, input_fn=input_fn),
-        max_drawdown=_menu_prompt_float("Max drawdown limit", cfg.max_drawdown_limit, minimum=0.0, input_fn=input_fn),
-        taker_fee_bps=_menu_prompt_float("Taker fee bps", cfg.taker_fee_bps, minimum=0.0, input_fn=input_fn),
-        slippage_bps=_menu_prompt_float("Slippage bps", cfg.slippage_bps, minimum=0.0, input_fn=input_fn),
-        label_threshold=_menu_prompt_float("Label threshold", cfg.label_threshold, minimum=0.0001, input_fn=input_fn),
-        set_features=",".join(_menu_feature_selection(cfg.enabled_features, input_fn=input_fn)),
-        enable_feature=None,
-        disable_feature=None,
-    )
-
-
-def _menu_feature_selection(current: Sequence[str], *, input_fn: Callable[[str], str] = input) -> tuple[str, ...]:
-    selected = list(normalize_enabled_features(current))
-    print("Model feature selection")
-    for index, name in enumerate(FEATURE_NAMES, start=1):
-        mark = "x" if name in selected else " "
-        print(f"{index:>2}. [{mark}] {name}")
-    raw = _menu_prompt("Toggle feature numbers (comma-separated), 'all', or blank to keep: ", input_fn=input_fn).lower()
-    if not raw:
-        return tuple(selected)
-    if raw == "all":
-        return tuple(FEATURE_NAMES)
-    toggles = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
+def _parse_feature_selection(raw: str, current: Sequence[str]) -> tuple[str, ...]:
+    candidate = raw.strip().lower()
+    if not candidate:
+        return tuple(current)
+    if candidate == "all":
+        return FEATURE_NAMES
+    selected = list(current)
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
             continue
-        try:
-            value = int(chunk)
-        except ValueError:
-            continue
-        if 1 <= value <= len(FEATURE_NAMES):
-            toggles.append(FEATURE_NAMES[value - 1])
-    for name in toggles:
+        if token.isdigit():
+            index = int(token) - 1
+            if index < 0 or index >= len(FEATURE_NAMES):
+                raise ValueError(f"Feature index out of range: {token}")
+            name = FEATURE_NAMES[index]
+        else:
+            name = token
+            if name not in FEATURE_NAMES:
+                raise ValueError(f"Unknown feature: {token}")
         if name in selected:
-            selected.remove(name)
+            selected = [feature for feature in selected if feature != name]
         else:
             selected.append(name)
     return normalize_enabled_features(selected)
 
 
-def _menu_data_path(name: str, *, input_fn: Callable[[str], str] = input) -> str:
-    default = f"data/{name}"
-    return _menu_prompt_default(f"{name} path", default, input_fn=input_fn)
+async def _ui_prompt_feature_selection(ui, current: Sequence[str]) -> tuple[str, ...]:
+    lines = ["Toggle features by number or name, comma-separated. Use 'all' to enable every feature."]
+    enabled = set(current)
+    for index, name in enumerate(FEATURE_NAMES, start=1):
+        marker = "x" if name in enabled else " "
+        lines.append(f"{index:>2}. [{marker}] {name}")
+    while True:
+        raw = await ui.prompt("\n".join(lines), "")
+        try:
+            return _parse_feature_selection(raw, current)
+        except ValueError as exc:
+            ui.append_log(str(exc))
+
+
+async def _ui_prompt_runtime(ui, current) -> object:
+    market_type = (await ui.prompt("Market type [spot/futures]", current.market_type)).strip().lower()
+    if market_type not in {"spot", "futures"}:
+        market_type = current.market_type
+    interval = (await ui.prompt("Kline interval", current.interval)).strip() or current.interval
+    testnet = await _ui_prompt_bool(ui, "Use Binance testnet", current.testnet)
+    api_key = (await ui.secret("Binance API key [blank keeps current]", "")).strip() or current.api_key
+    api_secret = (await ui.secret("Binance API secret [blank keeps current]", "")).strip() or current.api_secret
+    dry_run = await _ui_prompt_bool(ui, "Paper trading mode", current.dry_run)
+    validate_account = await _ui_prompt_bool(ui, "Validate credentials at startup", current.validate_account)
+    max_rate = await _ui_prompt_int(ui, "Max REST calls per minute", current.max_rate_calls_per_minute, minimum=1)
+    return RuntimeConfig(
+        symbol="BTCUSDC",
+        interval=interval,
+        market_type=market_type,
+        testnet=testnet,
+        api_key=api_key,
+        api_secret=api_secret,
+        dry_run=dry_run,
+        validate_account=validate_account,
+        max_rate_calls_per_minute=max_rate,
+    )
+
+
+async def _ui_prompt_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
+    enabled_features = await _ui_prompt_feature_selection(ui, cfg.enabled_features)
+    feature_window_short = await _ui_prompt_int(ui, "Feature window short", cfg.feature_windows[0], minimum=1)
+    feature_window_long = await _ui_prompt_int(
+        ui,
+        "Feature window long",
+        max(cfg.feature_windows[1], feature_window_short + 1),
+        minimum=feature_window_short + 1,
+    )
+    return argparse.Namespace(
+        leverage=await _ui_prompt_float(ui, "Leverage", cfg.leverage, minimum=1.0),
+        risk=await _ui_prompt_float(ui, "Risk per trade", cfg.risk_per_trade, minimum=0.0001),
+        max_position=await _ui_prompt_float(ui, "Max position percent", cfg.max_position_pct, minimum=0.0, maximum=1.0),
+        stop=await _ui_prompt_float(ui, "Stop loss percent", cfg.stop_loss_pct, minimum=0.0, maximum=0.99),
+        take=await _ui_prompt_float(ui, "Take profit percent", cfg.take_profit_pct, minimum=0.0, maximum=0.99),
+        cooldown=await _ui_prompt_int(ui, "Cooldown minutes", cfg.cooldown_minutes, minimum=0),
+        max_open=await _ui_prompt_int(ui, "Max open positions", cfg.max_open_positions, minimum=0),
+        max_trades_per_day=await _ui_prompt_int(ui, "Max trades per day", cfg.max_trades_per_day, minimum=0),
+        signal_threshold=await _ui_prompt_float(ui, "Signal threshold", cfg.signal_threshold, minimum=0.01, maximum=0.99),
+        max_drawdown=await _ui_prompt_float(ui, "Max drawdown limit", cfg.max_drawdown_limit, minimum=0.0, maximum=1.0),
+        taker_fee_bps=await _ui_prompt_float(ui, "Taker fee bps", cfg.taker_fee_bps, minimum=0.0),
+        slippage_bps=await _ui_prompt_float(ui, "Slippage bps", cfg.slippage_bps, minimum=0.0),
+        label_threshold=await _ui_prompt_float(ui, "Label threshold", cfg.label_threshold, minimum=0.0001),
+        model_lookback=await _ui_prompt_int(ui, "Model lookback rows", cfg.model_lookback, minimum=10),
+        training_epochs=await _ui_prompt_int(ui, "Training epochs", cfg.training_epochs, minimum=1),
+        confidence_beta=await _ui_prompt_float(ui, "Confidence beta", cfg.confidence_beta, minimum=0.0, maximum=1.0),
+        feature_window_short=feature_window_short,
+        feature_window_long=feature_window_long,
+        set_features=",".join(enabled_features),
+        enable_feature=None,
+        disable_feature=None,
+    )
+
+
+async def _ui_prompt_tune_window(ui) -> tuple[int | None, str | None, str | None]:
+    while True:
+        mode = (await ui.prompt("Tune window [all/lookback/range]", "all")).strip().lower()
+        if mode in {"", "all"}:
+            return None, None, None
+        if mode == "lookback":
+            return await _ui_prompt_int(ui, "Lookback days", 30, minimum=1), None, None
+        if mode == "range":
+            from_date = (await ui.prompt("From date YYYY-MM-DD", "")).strip() or None
+            to_date = (await ui.prompt("To date YYYY-MM-DD", "")).strip() or None
+            return None, from_date, to_date
+        ui.append_log("Choose all, lookback, or range.")
 
 
 def _recent_artifacts(*, base_dir: Path = Path("data"), limit: int = 8) -> list[Path]:
@@ -295,23 +346,6 @@ def _recent_artifacts(*, base_dir: Path = Path("data"), limit: int = 8) -> list[
 
 def _artifact_summary(path: Path) -> str:
     return load_artifact_preview(path)
-
-
-def _print_menu_header() -> None:
-    runtime = load_runtime()
-    strategy = load_strategy()
-    print("\nOperator console")
-    print(
-        "runtime: "
-        f"symbol={runtime.symbol} interval={runtime.interval} market={runtime.market_type} "
-        f"testnet={runtime.testnet} paper_default={runtime.dry_run}"
-    )
-    print(
-        "strategy: "
-        f"threshold={strategy.signal_threshold:.3f} risk={strategy.risk_per_trade:.4f} "
-        f"stop={strategy.stop_loss_pct:.4f} take={strategy.take_profit_pct:.4f} "
-        f"cooldown={strategy.cooldown_minutes}m max_trades={strategy.max_trades_per_day}"
-    )
 
 
 def _show_recent_artifacts() -> int:
@@ -365,256 +399,264 @@ def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
     runtime = load_runtime()
     strategy = load_strategy()
     notes = [
-        "Primary entrypoints: menu for guided operation, dashboard for overview, subcommands for scripting.",
-        "Use the explicit spot roundtrip or --live path only on testnet.",
+        "Operate the system from the interactive console actions and modal forms.",
+        "Use authenticated execution only on testnet and only after checking runtime state.",
     ]
     return DashboardSnapshot(
         runtime=runtime.public_dict(),
         strategy=strategy.asdict(),
         artifacts=[_artifact_summary(path) for path in _recent_artifacts()],
-        account_lines=_account_overview_lines(runtime) if with_account else ["Account lookup skipped. Use --with-account to include it."],
+        account_lines=_account_overview_lines(runtime) if with_account else ["Account lookup skipped for this refresh cycle."],
         notes=notes,
     )
 
 
-def command_dashboard(args: argparse.Namespace) -> int:
-    snapshot = _dashboard_snapshot(with_account=bool(getattr(args, "with_account", False)))
-    print(render_dashboard(snapshot))
-    return 0
-
-
-def _run_offline_pipeline(*, input_fn: Callable[[str], str] = input) -> int:
-    historical = _menu_data_path("historical_btcusdc.json", input_fn=input_fn)
-    model = _menu_data_path("model.json", input_fn=input_fn)
-    fetch_args = argparse.Namespace(
-        symbol=load_runtime().symbol,
-        interval=load_runtime().interval,
-        limit=_menu_prompt_int("Fetch limit", 500, minimum=1, input_fn=input_fn),
-        output=historical,
-    )
-    train_args = argparse.Namespace(
-        input=historical,
-        output=model,
-        epochs=_menu_prompt_int("Training epochs", 120, minimum=1, input_fn=input_fn),
-        seed=_menu_prompt_int("Training seed", 7, minimum=0, input_fn=input_fn),
-        walk_forward=_menu_prompt_bool("Run walk-forward validation", True, input_fn=input_fn),
-        walk_forward_train=_menu_prompt_int("Walk-forward train window", 300, minimum=2, input_fn=input_fn),
-        walk_forward_test=_menu_prompt_int("Walk-forward test window", 60, minimum=1, input_fn=input_fn),
-        walk_forward_step=_menu_prompt_int("Walk-forward step", 30, minimum=1, input_fn=input_fn),
-        calibrate_threshold=_menu_prompt_bool("Calibrate threshold", True, input_fn=input_fn),
-    )
-    backtest_args = argparse.Namespace(
-        input=historical,
-        model=model,
-        start_cash=_menu_prompt_float("Backtest starting cash", 1000.0, minimum=1.0, input_fn=input_fn),
-    )
-    evaluate_args = argparse.Namespace(
-        input=historical,
-        model=model,
-        threshold=None,
-        calibrate_threshold=True,
-    )
-    for fn, args in (
-        (command_fetch, fetch_args),
-        (command_train, train_args),
-        (command_backtest, backtest_args),
-        (command_evaluate, evaluate_args),
-    ):
-        result = fn(args)
-        if result != 0:
-            return result
-    return 0
-
-
-def _run_spot_test_order_roundtrip(*, input_fn: Callable[[str], str] = input) -> int:
-    runtime = load_runtime()
-    if runtime.market_type != "spot":
-        print("Spot test order is only available when runtime.market_type=spot.")
-        return 2
-    if not runtime.testnet:
-        print("Spot test order requires testnet=true.")
-        return 2
-    if not runtime.api_key or not runtime.api_secret:
-        print("Spot test order requires configured API credentials.")
-        return 2
-    confirm = _menu_prompt("Type ROUNDTRIP to place a minimal BUY then SELL on spot testnet: ", input_fn=input_fn)
-    if confirm != "ROUNDTRIP":
-        print("Spot test order cancelled.")
+def _tui_actions():
+    from .tui import TUIAction
+    async def _overview(ui):
+        ui.append_log(render_dashboard(_dashboard_snapshot(with_account=True)))
         return 0
-    quantity = _menu_prompt_float("Order quantity", 0.00008, minimum=0.00001, input_fn=input_fn)
-    client = _build_client(runtime)
-    try:
-        buy = client.place_order(runtime.symbol, "BUY", quantity, dry_run=False)
-        sell = client.place_order(runtime.symbol, "SELL", quantity, dry_run=False)
-    except BinanceAPIError as exc:
-        print(f"Spot test order failed: {exc}", file=sys.stderr)
-        return 2
-    print("Spot test roundtrip complete.")
-    print(json.dumps(
-        {
-            "buy_status": buy.get("status"),
-            "buy_orderId": buy.get("orderId"),
-            "buy_executedQty": buy.get("executedQty"),
-            "sell_status": sell.get("status"),
-            "sell_orderId": sell.get("orderId"),
-            "sell_executedQty": sell.get("executedQty"),
-        },
-        indent=2,
-    ))
-    return 0
 
+    async def _runtime(ui):
+        current = load_runtime()
+        next_runtime = await _ui_prompt_runtime(ui, current)
+        save_runtime(next_runtime)
+        if next_runtime.validate_account and next_runtime.api_key and next_runtime.api_secret:
+            client = _build_client(next_runtime)
+            try:
+                client.ping()
+                client.ensure_btcusdc()
+            except BinanceAPIError as exc:
+                print(f"Configuration saved, but validation failed: {exc}", file=sys.stderr)
+                return 2
+        print("Runtime config saved to", config_paths()["runtime"])
+        print(f"market={next_runtime.market_type} testnet={next_runtime.testnet} paper={next_runtime.dry_run}")
+        return 0
 
-def _menu_tune_window_args(*, input_fn: Callable[[str], str] = input) -> tuple[int | None, str | None, str | None]:
-    mode = _menu_prompt("Tune window mode [all/lookback/range] [all]: ", input_fn=input_fn).lower()
-    if not mode or mode == "all":
-        return None, None, None
-    if mode == "lookback":
-        return _menu_prompt_int("Tune lookback days", 30, minimum=1, input_fn=input_fn), None, None
-    if mode == "range":
-        from_date = _menu_prompt("Tune from date YYYY-MM-DD: ", input_fn=input_fn) or None
-        to_date = _menu_prompt("Tune to date YYYY-MM-DD: ", input_fn=input_fn) or None
-        return None, from_date, to_date
-    print("Unknown tune window mode; using all data.")
-    return None, None, None
+    async def _strategy(ui):
+        return command_strategy(await _ui_prompt_strategy_args(ui, load_strategy()))
 
+    async def _connect(_ui):
+        return command_connect(argparse.Namespace())
 
-def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
-    while True:
-        _print_menu_header()
-        print("1. Status")
-        print("2. Configure runtime")
-        print("3. Configure strategy")
-        print("4. Test connectivity")
-        print("5. Account overview")
-        print("6. Dashboard snapshot")
-        print("7. Fetch market data")
-        print("8. Train model")
-        print("9. Tune strategy")
-        print("10. Run backtest")
-        print("11. Evaluate model")
-        print("12. Run paper session")
-        print("13. Run spot/futures testnet session")
-        print("14. Run full offline pipeline")
-        print("15. View recent artifacts")
-        print("16. Spot testnet BUY+SELL roundtrip")
-        print("17. Exit")
+    async def _account(_ui):
+        return _show_account_overview()
 
-        choice = _menu_prompt("Select option: ", input_fn=input_fn)
-        if choice == "1":
-            command_status(argparse.Namespace())
-        elif choice == "2":
-            command_configure(argparse.Namespace())
-        elif choice == "3":
-            cfg = load_strategy()
-            command_strategy(_build_strategy_menu_args(cfg, input_fn=input_fn))
-        elif choice == "4":
-            command_connect(argparse.Namespace())
-        elif choice == "5":
-            _show_account_overview()
-        elif choice == "6":
-            command_dashboard(argparse.Namespace(with_account=True))
-        elif choice == "7":
-            runtime = load_runtime()
-            args = argparse.Namespace(
+    async def _fetch(ui):
+        runtime = load_runtime()
+        return command_fetch(
+            argparse.Namespace(
                 symbol=runtime.symbol,
                 interval=runtime.interval,
-                limit=_menu_prompt_int("Fetch limit", 500, minimum=1, input_fn=input_fn),
-                output=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
+                limit=await _ui_prompt_int(ui, "Fetch limit", 500, minimum=1),
+                output=await ui.prompt("Candle output path", "data/historical_btcusdc.json"),
             )
-            command_fetch(args)
-        elif choice == "8":
-            args = argparse.Namespace(
-                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
-                output=_menu_data_path("model.json", input_fn=input_fn),
-                epochs=_menu_prompt_int("Training epochs", 250, minimum=1, input_fn=input_fn),
-                seed=_menu_prompt_int("Training seed", 7, minimum=0, input_fn=input_fn),
-                walk_forward=_menu_prompt_bool("Run walk-forward validation", False, input_fn=input_fn),
-                walk_forward_train=_menu_prompt_int("Walk-forward train window", 300, minimum=2, input_fn=input_fn),
-                walk_forward_test=_menu_prompt_int("Walk-forward test window", 60, minimum=1, input_fn=input_fn),
-                walk_forward_step=_menu_prompt_int("Walk-forward step", 30, minimum=1, input_fn=input_fn),
-                calibrate_threshold=_menu_prompt_bool("Calibrate threshold", True, input_fn=input_fn),
+        )
+
+    async def _train(ui):
+        return command_train(
+            argparse.Namespace(
+                input=await ui.prompt("Training input path", "data/historical_btcusdc.json"),
+                output=await ui.prompt("Model output path", "data/model.json"),
+                epochs=await _ui_prompt_int(ui, "Training epochs", 250, minimum=1),
+                seed=await _ui_prompt_int(ui, "Training seed", 7, minimum=0),
+                walk_forward=await _ui_prompt_bool(ui, "Run walk-forward validation", False),
+                walk_forward_train=await _ui_prompt_int(ui, "Walk-forward train window", 300, minimum=2),
+                walk_forward_test=await _ui_prompt_int(ui, "Walk-forward test window", 60, minimum=1),
+                walk_forward_step=await _ui_prompt_int(ui, "Walk-forward step", 30, minimum=1),
+                calibrate_threshold=await _ui_prompt_bool(ui, "Calibrate threshold", True),
             )
-            command_train(args)
-        elif choice == "9":
-            lookback_days, from_date, to_date = _menu_tune_window_args(input_fn=input_fn)
-            args = argparse.Namespace(
-                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
-                save_best=_menu_prompt_bool("Save tuned strategy", False, input_fn=input_fn),
-                min_risk=_menu_prompt_float("Min risk", 0.002, minimum=0.0001, input_fn=input_fn),
-                max_risk=_menu_prompt_float("Max risk", 0.02, minimum=0.0001, input_fn=input_fn),
-                steps=_menu_prompt_int("Tune steps", 5, minimum=1, input_fn=input_fn),
-                min_leverage=_menu_prompt_float("Min leverage", 1.0, minimum=1.0, input_fn=input_fn),
-                max_leverage=_menu_prompt_float("Max leverage", 20.0, minimum=1.0, input_fn=input_fn),
-                min_threshold=_menu_prompt_float("Min threshold", 0.52, minimum=0.01, maximum=0.99, input_fn=input_fn),
-                max_threshold=_menu_prompt_float("Max threshold", 0.88, minimum=0.01, maximum=0.99, input_fn=input_fn),
-                min_take=_menu_prompt_float("Min take profit", 0.01, minimum=0.0, maximum=0.99, input_fn=input_fn),
-                max_take=_menu_prompt_float("Max take profit", 0.06, minimum=0.0, maximum=0.99, input_fn=input_fn),
-                min_stop=_menu_prompt_float("Min stop loss", 0.008, minimum=0.0, maximum=0.99, input_fn=input_fn),
-                max_stop=_menu_prompt_float("Max stop loss", 0.04, minimum=0.0, maximum=0.99, input_fn=input_fn),
+        )
+
+    async def _tune(ui):
+        lookback_days, from_date, to_date = await _ui_prompt_tune_window(ui)
+        return command_tune(
+            argparse.Namespace(
+                input=await ui.prompt("Tune input path", "data/historical_btcusdc.json"),
+                save_best=await _ui_prompt_bool(ui, "Persist the best strategy", False),
+                min_risk=await _ui_prompt_float(ui, "Minimum risk", 0.002, minimum=0.0001),
+                max_risk=await _ui_prompt_float(ui, "Maximum risk", 0.02, minimum=0.0001),
+                steps=await _ui_prompt_int(ui, "Grid steps", 5, minimum=1),
+                min_leverage=await _ui_prompt_float(ui, "Minimum leverage", 1.0, minimum=1.0),
+                max_leverage=await _ui_prompt_float(ui, "Maximum leverage", 20.0, minimum=1.0),
+                min_threshold=await _ui_prompt_float(ui, "Minimum threshold", 0.52, minimum=0.01, maximum=0.99),
+                max_threshold=await _ui_prompt_float(ui, "Maximum threshold", 0.88, minimum=0.01, maximum=0.99),
+                min_take=await _ui_prompt_float(ui, "Minimum take profit", 0.01, minimum=0.0, maximum=0.99),
+                max_take=await _ui_prompt_float(ui, "Maximum take profit", 0.06, minimum=0.0, maximum=0.99),
+                min_stop=await _ui_prompt_float(ui, "Minimum stop loss", 0.008, minimum=0.0, maximum=0.99),
+                max_stop=await _ui_prompt_float(ui, "Maximum stop loss", 0.04, minimum=0.0, maximum=0.99),
                 lookback_days=lookback_days,
                 from_date=from_date,
                 to_date=to_date,
             )
-            command_tune(args)
-        elif choice == "10":
-            args = argparse.Namespace(
-                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
-                model=_menu_data_path("model.json", input_fn=input_fn),
-                start_cash=_menu_prompt_float("Starting cash", 1000.0, minimum=1.0, input_fn=input_fn),
+        )
+
+    async def _backtest(ui):
+        return command_backtest(
+            argparse.Namespace(
+                input=await ui.prompt("Backtest input path", "data/historical_btcusdc.json"),
+                model=await ui.prompt("Model path", "data/model.json"),
+                start_cash=await _ui_prompt_float(ui, "Starting cash", 1000.0, minimum=1.0),
             )
-            command_backtest(args)
-        elif choice == "11":
-            threshold_raw = _menu_prompt("Evaluation threshold [strategy default]: ", input_fn=input_fn)
-            args = argparse.Namespace(
-                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
-                model=_menu_data_path("model.json", input_fn=input_fn),
+        )
+
+    async def _evaluate(ui):
+        threshold_raw = (await ui.prompt("Evaluation threshold [blank=strategy default]", "")).strip()
+        return command_evaluate(
+            argparse.Namespace(
+                input=await ui.prompt("Evaluation input path", "data/historical_btcusdc.json"),
+                model=await ui.prompt("Model path", "data/model.json"),
                 threshold=float(threshold_raw) if threshold_raw else None,
-                calibrate_threshold=_menu_prompt_bool("Calibrate threshold", False, input_fn=input_fn),
+                calibrate_threshold=await _ui_prompt_bool(ui, "Calibrate threshold", False),
             )
-            command_evaluate(args)
-        elif choice == "12":
-            args = argparse.Namespace(
-                steps=_menu_prompt_int("Paper steps", 20, minimum=1, input_fn=input_fn),
-                sleep=_menu_prompt_int("Paper sleep seconds", 5, minimum=0, input_fn=input_fn),
+        )
+
+    async def _pipeline(ui):
+        runtime = load_runtime()
+        historical = await ui.prompt("Historical candle path", "data/historical_btcusdc.json")
+        model = await ui.prompt("Model artifact path", "data/model.json")
+        fetch_args = argparse.Namespace(
+            symbol=runtime.symbol,
+            interval=runtime.interval,
+            limit=await _ui_prompt_int(ui, "Fetch limit", 500, minimum=1),
+            output=historical,
+        )
+        train_args = argparse.Namespace(
+            input=historical,
+            output=model,
+            epochs=await _ui_prompt_int(ui, "Training epochs", 120, minimum=1),
+            seed=await _ui_prompt_int(ui, "Training seed", 7, minimum=0),
+            walk_forward=await _ui_prompt_bool(ui, "Run walk-forward validation", True),
+            walk_forward_train=await _ui_prompt_int(ui, "Walk-forward train window", 300, minimum=2),
+            walk_forward_test=await _ui_prompt_int(ui, "Walk-forward test window", 60, minimum=1),
+            walk_forward_step=await _ui_prompt_int(ui, "Walk-forward step", 30, minimum=1),
+            calibrate_threshold=await _ui_prompt_bool(ui, "Calibrate threshold", True),
+        )
+        backtest_args = argparse.Namespace(
+            input=historical,
+            model=model,
+            start_cash=await _ui_prompt_float(ui, "Backtest starting cash", 1000.0, minimum=1.0),
+        )
+        evaluate_args = argparse.Namespace(
+            input=historical,
+            model=model,
+            threshold=None,
+            calibrate_threshold=True,
+        )
+        for fn, args in (
+            (command_fetch, fetch_args),
+            (command_train, train_args),
+            (command_backtest, backtest_args),
+            (command_evaluate, evaluate_args),
+        ):
+            result = fn(args)
+            if result != 0:
+                return result
+        return 0
+
+    async def _paper(ui):
+        return command_live(
+            argparse.Namespace(
+                steps=await _ui_prompt_int(ui, "Paper loop steps", 20, minimum=1),
+                sleep=await _ui_prompt_int(ui, "Sleep seconds", 5, minimum=0),
                 leverage=None,
-                retrain_interval=_menu_prompt_int("Retrain interval", 0, minimum=0, input_fn=input_fn),
-                retrain_window=_menu_prompt_int("Retrain window", 300, minimum=1, input_fn=input_fn),
-                retrain_min_rows=_menu_prompt_int("Retrain minimum rows", 240, minimum=1, input_fn=input_fn),
+                retrain_interval=await _ui_prompt_int(ui, "Retrain interval", 0, minimum=0),
+                retrain_window=await _ui_prompt_int(ui, "Retrain window", 300, minimum=1),
+                retrain_min_rows=await _ui_prompt_int(ui, "Retrain minimum rows", 240, minimum=1),
                 paper=True,
                 live=False,
             )
-            command_live(args)
-        elif choice == "13":
-            confirm = _menu_prompt("Type TESTNET to allow authenticated testnet execution: ", input_fn=input_fn)
-            if confirm != "TESTNET":
-                print("Testnet execution cancelled.")
-                continue
-            args = argparse.Namespace(
-                steps=_menu_prompt_int("Live testnet steps", 1, minimum=1, input_fn=input_fn),
-                sleep=_menu_prompt_int("Live testnet sleep seconds", 5, minimum=0, input_fn=input_fn),
+        )
+
+    async def _live(ui):
+        if not await ui.confirm("Run authenticated testnet execution?"):
+            print("Testnet execution cancelled.")
+            return 0
+        return command_live(
+            argparse.Namespace(
+                steps=await _ui_prompt_int(ui, "Live steps", 1, minimum=1),
+                sleep=await _ui_prompt_int(ui, "Sleep seconds", 5, minimum=0),
                 leverage=None,
-                retrain_interval=_menu_prompt_int("Retrain interval", 0, minimum=0, input_fn=input_fn),
-                retrain_window=_menu_prompt_int("Retrain window", 300, minimum=1, input_fn=input_fn),
-                retrain_min_rows=_menu_prompt_int("Retrain minimum rows", 240, minimum=1, input_fn=input_fn),
+                retrain_interval=await _ui_prompt_int(ui, "Retrain interval", 0, minimum=0),
+                retrain_window=await _ui_prompt_int(ui, "Retrain window", 300, minimum=1),
+                retrain_min_rows=await _ui_prompt_int(ui, "Retrain minimum rows", 240, minimum=1),
                 paper=False,
                 live=True,
             )
-            command_live(args)
-        elif choice == "14":
-            _run_offline_pipeline(input_fn=input_fn)
-        elif choice == "15":
-            _show_recent_artifacts()
-        elif choice == "16":
-            _run_spot_test_order_roundtrip(input_fn=input_fn)
-        elif choice in {"17", "q", "quit", "exit"}:
-            print("Exiting menu.")
+        )
+
+    async def _roundtrip(ui):
+        if not await ui.confirm("Place a minimal BUY then SELL on spot testnet?"):
+            print("Spot test order cancelled.")
             return 0
-        else:
-            print("Invalid selection.")
+        quantity = await _ui_prompt_float(ui, "Roundtrip quantity", 0.00008, minimum=0.00001)
+        runtime = load_runtime()
+        if runtime.market_type != "spot":
+            print("Spot test order is only available when runtime.market_type=spot.")
+            return 2
+        if not runtime.testnet:
+            print("Spot test order requires testnet=true.")
+            return 2
+        if not runtime.api_key or not runtime.api_secret:
+            print("Spot test order requires configured API credentials.")
+            return 2
+        client = _build_client(runtime)
+        try:
+            buy = client.place_order(runtime.symbol, "BUY", quantity, dry_run=False)
+            sell = client.place_order(runtime.symbol, "SELL", quantity, dry_run=False)
+        except BinanceAPIError as exc:
+            print(f"Spot test order failed: {exc}", file=sys.stderr)
+            return 2
+        print("Spot test roundtrip complete.")
+        print(
+            json.dumps(
+                {
+                    "buy_status": buy.get("status"),
+                    "buy_orderId": buy.get("orderId"),
+                    "buy_executedQty": buy.get("executedQty"),
+                    "sell_status": sell.get("status"),
+                    "sell_orderId": sell.get("orderId"),
+                    "sell_executedQty": sell.get("executedQty"),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    async def _artifacts(_ui):
+        return _show_recent_artifacts()
+
+    return [
+        TUIAction("1", "Overview", "Refresh runtime, strategy, artifact, and account context.", _overview),
+        TUIAction("2", "Runtime settings", "Edit testnet, credentials, interval, and rate controls.", _runtime),
+        TUIAction("3", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
+        TUIAction("4", "Connect", "Validate exchange connectivity and the configured target.", _connect),
+        TUIAction("5", "Account", "Inspect authenticated balances and positions.", _account),
+        TUIAction("6", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
+        TUIAction("7", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
+        TUIAction("8", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
+        TUIAction("9", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
+        TUIAction("10", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
+        TUIAction("11", "Offline pipeline", "Run fetch, train, backtest, and evaluate as one guided flow.", _pipeline),
+        TUIAction("12", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
+        TUIAction("13", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
+        TUIAction("14", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
+        TUIAction("15", "Recent artifacts", "Print the latest local artifacts into the console log.", _artifacts),
+    ]
 
 
 def command_menu(_: argparse.Namespace) -> int:
-    return _run_menu()
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("Interactive console requires a real terminal (TTY).", file=sys.stderr)
+        return 2
+
+    from .tui import launch_tui
+
+    return launch_tui(
+        title="simple-ai-trading interactive console",
+        actions=_tui_actions(),
+        snapshot_provider=lambda: render_dashboard(_dashboard_snapshot(with_account=False)),
+    )
 
 
 def _load_json_candles(path: str) -> list[dict[str, object]]:
@@ -1020,6 +1062,18 @@ def command_strategy(args: argparse.Namespace) -> int:
         updates["slippage_bps"] = max(0.0, args.slippage_bps)
     if args.label_threshold is not None:
         updates["label_threshold"] = max(0.0001, args.label_threshold)
+    if getattr(args, "model_lookback", None) is not None:
+        updates["model_lookback"] = max(10, int(args.model_lookback))
+    if getattr(args, "training_epochs", None) is not None:
+        updates["training_epochs"] = max(1, int(args.training_epochs))
+    if getattr(args, "confidence_beta", None) is not None:
+        updates["confidence_beta"] = _clamp(float(args.confidence_beta), 0.0, 1.0)
+    feature_window_short = getattr(args, "feature_window_short", None)
+    feature_window_long = getattr(args, "feature_window_long", None)
+    if feature_window_short is not None or feature_window_long is not None:
+        short_window = max(1, int(feature_window_short if feature_window_short is not None else cfg.feature_windows[0]))
+        long_window = max(short_window + 1, int(feature_window_long if feature_window_long is not None else cfg.feature_windows[1]))
+        updates["feature_windows"] = (short_window, long_window)
     try:
         if getattr(args, "set_features", None):
             updates["enabled_features"] = normalize_enabled_features(

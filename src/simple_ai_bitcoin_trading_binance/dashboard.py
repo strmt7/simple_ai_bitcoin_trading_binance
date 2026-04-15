@@ -60,7 +60,7 @@ def render_dashboard(snapshot: DashboardSnapshot, *, width: int = 88) -> str:
         _box("Account", _account_lines(snapshot.account_lines), width=width),
         _box("Recent artifacts", _artifact_lines(snapshot.artifacts), width=width),
         _box("Actions", [
-            "Use menu for guided actions or subcommands for automation.",
+            "Use the interactive console actions and modal forms for all operator workflows.",
             "Safe authenticated testnet execution is explicit; secrets stay redacted in visible output.",
             *snapshot.notes,
         ], width=width),
