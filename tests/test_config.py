@@ -111,9 +111,10 @@ def test_load_strategy_coerces_feature_windows(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setenv("HOME", str(tmp_path))
     cfg_file = config_paths()["strategy"]
     cfg_file.parent.mkdir(parents=True, exist_ok=True)
-    cfg_file.write_text('{"feature_windows": [6, 18], "risk_per_trade": 0.001}', encoding="utf-8")
+    cfg_file.write_text('{"feature_windows": [6, 18], "risk_per_trade": 0.001, "enabled_features": ["momentum_1", "rsi"]}', encoding="utf-8")
     loaded = load_strategy()
     assert loaded.feature_windows == (6, 18)
+    assert loaded.enabled_features == ("momentum_1", "rsi")
 
 
 def test_load_strategy_coerces_invalid_feature_windows(tmp_path: Path, monkeypatch) -> None:
@@ -134,6 +135,15 @@ def test_load_strategy_feature_windows_conversion_fails_and_falls_back(tmp_path:
     loaded = load_strategy()
     assert loaded.feature_windows == (10, 40)
     assert loaded.risk_per_trade == 0.004
+
+
+def test_load_strategy_invalid_enabled_features_falls_back_to_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["strategy"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text('{"enabled_features": ["not-real"]}', encoding="utf-8")
+    loaded = load_strategy()
+    assert "momentum_1" in loaded.enabled_features
 
 
 def test_read_config_json_rejects_non_dict_payload(tmp_path: Path) -> None:

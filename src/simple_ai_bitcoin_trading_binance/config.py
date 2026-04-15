@@ -7,6 +7,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import Callable, Dict
 
+from .features import normalize_enabled_features
 from .types import RuntimeConfig, StrategyConfig, config_paths
 
 SUPPORTED_SYMBOL = "BTCUSDC"
@@ -66,6 +67,14 @@ def load_strategy() -> StrategyConfig:
             payload["feature_windows"] = (10, 40)
     else:
         payload["feature_windows"] = (10, 40)
+    enabled_features = payload.get("enabled_features")
+    if isinstance(enabled_features, (list, tuple)):
+        try:
+            payload["enabled_features"] = normalize_enabled_features(enabled_features)
+        except ValueError:
+            payload["enabled_features"] = normalize_enabled_features()
+    else:
+        payload["enabled_features"] = normalize_enabled_features()
     return StrategyConfig(**{k: v for k, v in payload.items() if hasattr(StrategyConfig, k)})
 
 

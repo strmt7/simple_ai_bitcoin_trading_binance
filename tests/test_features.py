@@ -4,9 +4,11 @@ import math
 import pytest
 from simple_ai_bitcoin_trading_binance.api import Candle
 from simple_ai_bitcoin_trading_binance.features import (
+    FEATURE_NAMES,
     feature_signature,
     make_rows,
     make_rows_legacy,
+    normalize_enabled_features,
     _safe_div,
     _sma,
     _ema,
@@ -46,6 +48,22 @@ def test_make_rows_shapes() -> None:
     assert first.label in (0, 1)
 
 
+def test_make_rows_respects_enabled_feature_subset() -> None:
+    selected = ("momentum_1", "rsi", "volume_ratio")
+    rows = make_rows(_fake_candles(), short_window=10, long_window=30, enabled_features=selected)
+    assert rows
+    assert len(rows[0].features) == 3
+
+
+def test_normalize_enabled_features_validates_input() -> None:
+    assert normalize_enabled_features(["momentum_1", "rsi"]) == ("momentum_1", "rsi")
+    assert normalize_enabled_features() == FEATURE_NAMES
+    with pytest.raises(ValueError, match="Unknown feature"):
+        normalize_enabled_features(["not-real"])
+    with pytest.raises(ValueError, match="At least one feature"):
+        normalize_enabled_features([])
+
+
 def test_feature_utilities() -> None:
     assert _safe_div(10.0, 0.0) == 0.0
     assert math.isnan(_sma([1.0, 2.0], 3))
@@ -82,7 +100,7 @@ def test_make_rows_filters_invalid_candles_and_stable_signature() -> None:
     ]
     rows = make_rows(candles, short_window=5, long_window=10)
     assert rows == []
-    assert feature_signature(10, 20, 0.001) == "feature_version=v1|feature_count=13|short_window=10|long_window=20|label_threshold=0.001"
+    assert feature_signature(10, 20, 0.001) == "feature_version=v1|feature_count=13|feature_names=momentum_1,momentum_3,momentum_10,momentum_20,ema_spread,rsi,ema_gap,relative_atr,volatility_20,volume_ratio,trend_acceleration,gap_to_vwap,volume_trend|short_window=10|long_window=20|label_threshold=0.001"
 
 
 def test_make_rows_rejects_invalid_windows() -> None:

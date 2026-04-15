@@ -28,21 +28,45 @@ FEATURE_NAMES = (
     "volume_trend",
 )
 
+
+def normalize_enabled_features(enabled_features: Sequence[str] | None = None) -> tuple[str, ...]:
+    if enabled_features is None:
+        return tuple(FEATURE_NAMES)
+    normalized: list[str] = []
+    for name in enabled_features:
+        feature_name = str(name)
+        if feature_name not in FEATURE_NAMES:
+            raise ValueError(f"Unknown feature: {feature_name}")
+        if feature_name not in normalized:
+            normalized.append(feature_name)
+    if not normalized:
+        raise ValueError("At least one feature must remain enabled")
+    return tuple(normalized)
+
+
+def _feature_indices(enabled_features: Sequence[str] | None = None) -> tuple[int, ...]:
+    normalized = normalize_enabled_features(enabled_features)
+    return tuple(FEATURE_NAMES.index(name) for name in normalized)
+
+
 def feature_signature(
     short_window: int,
     long_window: int,
     label_threshold: float,
     *,
     feature_version: str = FEATURE_VERSION,
+    enabled_features: Sequence[str] | None = None,
 ) -> str:
     """Return a deterministic signature for a feature configuration."""
     short_window = int(short_window)
     long_window = int(long_window)
     threshold = float(label_threshold)
+    selected = normalize_enabled_features(enabled_features)
     return "|".join(
         [
             f"feature_version={feature_version}",
-            f"feature_count={len(FEATURE_NAMES)}",
+            f"feature_count={len(selected)}",
+            f"feature_names={','.join(selected)}",
             f"short_window={short_window}",
             f"long_window={long_window}",
             f"label_threshold={threshold:.10g}",
@@ -76,8 +100,8 @@ class ModelRow:
     label: int
 
 
-def feature_dimension() -> int:
-    return len(FEATURE_NAMES)
+def feature_dimension(enabled_features: Sequence[str] | None = None) -> int:
+    return len(normalize_enabled_features(enabled_features))
 
 
 def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -143,12 +167,14 @@ def make_rows(
     *,
     lookahead: int = 1,
     label_threshold: float = 0.001,
+    enabled_features: Sequence[str] | None = None,
 ) -> List[ModelRow]:
     if short_window <= 0 or long_window <= 0 or lookahead <= 0:
         raise ValueError("short_window, long_window, and lookahead must be positive")
     if long_window < short_window:
         raise ValueError("long_window must be greater than or equal to short_window")
 
+    selected_indices = _feature_indices(enabled_features)
     candles = [c for c in candles if _valid_ohlcv(c)]
     candles = sorted(candles, key=lambda c: c.open_time)
     closes = [c.close for c in candles]
@@ -198,7 +224,7 @@ def make_rows(
         vol_long = _sma(volume_window[-long_window:], min(long_window, len(volume_window)))
         volume_trend = _safe_div(vol_short - vol_long, vol_long)
 
-        features = tuple(_safe_features([
+        full_features = tuple(_safe_features([
             momentum,
             momentum_3,
             momentum_10,
@@ -213,6 +239,7 @@ def make_rows(
             gap_to_vwap,
             volume_trend,
         ]))
+        features = tuple(full_features[index] for index in selected_indices)
 
         if not all(math.isfinite(v) for v in features):
             continue
