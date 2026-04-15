@@ -670,6 +670,89 @@ def test_command_tune_uses_fallback_and_can_save_best(tmp_path, monkeypatch, cap
     assert "Saved tuned strategy." in output
 
 
+def test_command_live_paper_flag_overrides_runtime_live_without_credentials(tmp_path, monkeypatch) -> None:
+    class _LiveClient:
+        def ensure_btcusdc(self):
+            return {"symbol": "BTCUSDC"}
+
+        def get_klines(self, symbol: str, interval: str, limit: int = 500, start_time=None, end_time=None):
+            return _simple_candles(limit)
+
+        def place_order(self, symbol: str, side: str, size: float, *, dry_run: bool, leverage: float = 1.0):
+            return {"symbol": symbol, "side": side, "size": size, "dry_run": dry_run}
+
+        def get_symbol_constraints(self, symbol: str):
+            return SimpleNamespace(
+                symbol=symbol,
+                min_qty=0.0001,
+                max_qty=100.0,
+                step_size=0.0001,
+                min_notional=5.0,
+                max_notional=0.0,
+            )
+
+        def normalize_quantity(self, symbol: str, quantity: float):
+            constraints = self.get_symbol_constraints(symbol)
+            return max(constraints.min_qty, round(quantity, 4)), constraints
+
+    class _AlwaysLongModel:
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            return 0.95
+
+        def predict(self, _features: tuple[float, ...], threshold: float) -> int:
+            return int(0.95 >= threshold)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=False, market_type="spot", api_key="", api_secret=""))
+    save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2))
+    monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=True, leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 0
+
+
+def test_command_live_spot_leverage_override_is_inactive(tmp_path, monkeypatch, capsys) -> None:
+    class _LiveClient:
+        def ensure_btcusdc(self):
+            return {"symbol": "BTCUSDC"}
+
+        def get_klines(self, symbol: str, interval: str, limit: int = 500, start_time=None, end_time=None):
+            return _simple_candles(limit)
+
+        def place_order(self, symbol: str, side: str, size: float, *, dry_run: bool, leverage: float = 1.0):
+            return {"symbol": symbol, "side": side, "size": size, "dry_run": dry_run, "leverage": leverage}
+
+        def get_symbol_constraints(self, symbol: str):
+            return SimpleNamespace(
+                symbol=symbol,
+                min_qty=0.0001,
+                max_qty=100.0,
+                step_size=0.0001,
+                min_notional=5.0,
+                max_notional=0.0,
+            )
+
+        def normalize_quantity(self, symbol: str, quantity: float):
+            constraints = self.get_symbol_constraints(symbol)
+            return max(constraints.min_qty, round(quantity, 4)), constraints
+
+    class _AlwaysLongModel:
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            return 0.95
+
+        def predict(self, _features: tuple[float, ...], threshold: float) -> int:
+            return int(0.95 >= threshold)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2))
+    monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, leverage=20.0, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 0
+    assert "Leverage override is spot-inactive" in capsys.readouterr().out
+
+
 def test_command_backtest_artifact_is_emitted(tmp_path, monkeypatch) -> None:
     from simple_ai_bitcoin_trading_binance.model import serialize_model
 
