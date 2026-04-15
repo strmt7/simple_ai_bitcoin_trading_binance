@@ -26,19 +26,31 @@ from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
 
 class _AsyncUI:
-    def __init__(self, *, prompts: list[str] | None = None, confirms: list[bool] | None = None) -> None:
-        self._prompts = iter(prompts or [])
+    def __init__(
+        self,
+        *,
+        prompts: list[str] | None = None,
+        confirms: list[bool] | None = None,
+        forms: list[dict[str, str] | None] | None = None,
+    ) -> None:
+        self._prompts = list(prompts or [])
         self._confirms = iter(confirms or [])
+        self._forms = list(forms or [])
         self.logs: list[str] = []
 
     async def prompt(self, _label: str, _default: str = "") -> str:
-        return next(self._prompts)
+        return self._prompts.pop(0)
 
     async def secret(self, _label: str, _default: str = "") -> str:
-        return next(self._prompts)
+        return self._prompts.pop(0)
 
     async def confirm(self, _message: str) -> bool:
         return next(self._confirms)
+
+    async def form(self, _title: str, fields) -> dict[str, str] | None:
+        if self._forms:
+            return self._forms.pop(0)
+        return {field.key: self._prompts.pop(0) for field in fields}
 
     def append_log(self, text: str) -> None:
         self.logs.append(text)
@@ -309,7 +321,20 @@ def test_tui_runtime_action_saves_runtime(monkeypatch) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_runtime", lambda cfg: saved.setdefault("cfg", cfg) or cfg)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._build_client", lambda _runtime: type("C", (), {"ping": lambda self: None, "ensure_btcusdc": lambda self: None})())
 
-    ui = _AsyncUI(prompts=["futures", "1h", "yes", "new-key", "new-secret", "no", "yes", "1500"])
+    ui = _AsyncUI(
+        forms=[
+            {
+                "market_type": "futures",
+                "interval": "1h",
+                "testnet": "yes",
+                "api_key": "new-key",
+                "api_secret": "new-secret",
+                "dry_run": "no",
+                "validate_account": "yes",
+                "max_rate_calls_per_minute": "1500",
+            }
+        ]
+    )
     result = asyncio.run(_action("Runtime settings").run(ui))
 
     assert result == 0
@@ -331,27 +356,29 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", fake_strategy)
 
     ui = _AsyncUI(
-        prompts=[
-            "all",
-            "12",
-            "48",
-            "3",
-            "0.02",
-            "0.3",
-            "0.01",
-            "0.05",
-            "1",
-            "2",
-            "7",
-            "0.6",
-            "0.2",
-            "2",
-            "4",
-            "0.002",
-            "300",
-            "500",
-            "0.9",
-        ]
+        prompts=["all"],
+        forms=[
+            {
+                "leverage": "3",
+                "risk": "0.02",
+                "max_position": "0.3",
+                "stop": "0.01",
+                "take": "0.05",
+                "cooldown": "1",
+                "max_open": "2",
+                "max_trades_per_day": "7",
+                "signal_threshold": "0.6",
+                "max_drawdown": "0.2",
+                "taker_fee_bps": "2",
+                "slippage_bps": "4",
+                "label_threshold": "0.002",
+                "model_lookback": "300",
+                "training_epochs": "500",
+                "confidence_beta": "0.9",
+                "feature_window_short": "12",
+                "feature_window_long": "48",
+            }
+        ],
     )
     result = asyncio.run(_action("Strategy settings").run(ui))
 
@@ -375,33 +402,62 @@ def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypat
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_tune", lambda args: captured.__setitem__("tune", args) or 0)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured.__setitem__("backtest", args) or 0)
 
-    asyncio.run(_action("Fetch candles").run(_AsyncUI(prompts=["400", "tmp/fetch.json"])))
-    asyncio.run(_action("Train model").run(_AsyncUI(prompts=["data/in.json", "data/out.json", "99", "11", "yes", "310", "70", "20", "no"])))
     asyncio.run(
-        _action("Tune strategy").run(
+        _action("Fetch candles").run(
+            _AsyncUI(forms=[{"limit": "400", "output": "tmp/fetch.json"}])
+        )
+    )
+    asyncio.run(
+        _action("Train model").run(
             _AsyncUI(
-                prompts=[
-                    "range",
-                    "2024-01-01",
-                    "2024-02-01",
-                    "data/tune.json",
-                    "yes",
-                    "0.003",
-                    "0.03",
-                    "4",
-                    "1",
-                    "10",
-                    "0.5",
-                    "0.8",
-                    "0.01",
-                    "0.04",
-                    "0.01",
-                    "0.03",
+                forms=[
+                    {
+                        "input": "data/in.json",
+                        "output": "data/out.json",
+                        "epochs": "99",
+                        "seed": "11",
+                        "walk_forward": "yes",
+                        "walk_forward_train": "310",
+                        "walk_forward_test": "70",
+                        "walk_forward_step": "20",
+                        "calibrate_threshold": "no",
+                    }
                 ]
             )
         )
     )
-    asyncio.run(_action("Backtest").run(_AsyncUI(prompts=["data/back.json", "data/model.json", "1500"])))
+    asyncio.run(
+        _action("Tune strategy").run(
+            _AsyncUI(
+                forms=[
+                    {
+                        "input": "data/tune.json",
+                        "window_mode": "range",
+                        "lookback_days": "30",
+                        "from_date": "2024-01-01",
+                        "to_date": "2024-02-01",
+                        "save_best": "yes",
+                        "min_risk": "0.003",
+                        "max_risk": "0.03",
+                        "steps": "4",
+                        "min_leverage": "1",
+                        "max_leverage": "10",
+                        "min_threshold": "0.5",
+                        "max_threshold": "0.8",
+                        "min_take": "0.01",
+                        "max_take": "0.04",
+                        "min_stop": "0.01",
+                        "max_stop": "0.03",
+                    }
+                ]
+            )
+        )
+    )
+    asyncio.run(
+        _action("Backtest").run(
+            _AsyncUI(forms=[{"input": "data/back.json", "model": "data/model.json", "start_cash": "1500"}])
+        )
+    )
 
     assert captured["fetch"].limit == 400
     assert captured["train"].walk_forward is True
@@ -423,22 +479,33 @@ def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured["order"].append(("backtest", args.model)) or 0)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured["order"].append(("evaluate", args.model)) or 0)
 
-    ui_eval = _AsyncUI(prompts=["0.61", "data/eval.json", "data/eval-model.json", "yes"])
+    ui_eval = _AsyncUI(
+        forms=[
+            {
+                "input": "data/eval.json",
+                "model": "data/eval-model.json",
+                "threshold": "0.61",
+                "calibrate_threshold": "yes",
+            }
+        ]
+    )
     asyncio.run(_action("Evaluate").run(ui_eval))
 
     ui_pipeline = _AsyncUI(
-        prompts=[
-            "tmp/history.json",
-            "tmp/model.json",
-            "220",
-            "50",
-            "7",
-            "yes",
-            "300",
-            "60",
-            "30",
-            "yes",
-            "1000",
+        forms=[
+            {
+                "historical": "tmp/history.json",
+                "model": "tmp/model.json",
+                "limit": "220",
+                "epochs": "50",
+                "seed": "7",
+                "walk_forward": "yes",
+                "walk_forward_train": "300",
+                "walk_forward_test": "60",
+                "walk_forward_step": "30",
+                "calibrate_threshold": "yes",
+                "start_cash": "1000",
+            }
         ]
     )
     asyncio.run(_action("Offline pipeline").run(ui_pipeline))
@@ -468,14 +535,50 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
         )(),
     )
 
-    asyncio.run(_action("Paper loop").run(_AsyncUI(prompts=["3", "0", "1", "120", "100"])))
-    asyncio.run(_action("Testnet loop").run(_AsyncUI(prompts=["2", "0", "0", "240", "120"], confirms=[True])))
+    asyncio.run(
+        _action("Paper loop").run(
+            _AsyncUI(
+                forms=[
+                    {
+                        "steps": "3",
+                        "sleep": "0",
+                        "retrain_interval": "1",
+                        "retrain_window": "120",
+                        "retrain_min_rows": "100",
+                    }
+                ]
+            )
+        )
+    )
+    asyncio.run(
+        _action("Testnet loop").run(
+            _AsyncUI(
+                forms=[
+                    {
+                        "steps": "2",
+                        "sleep": "0",
+                        "retrain_interval": "0",
+                        "retrain_window": "240",
+                        "retrain_min_rows": "120",
+                    }
+                ],
+                confirms=[True],
+            )
+        )
+    )
     asyncio.run(_action("Testnet loop").run(_AsyncUI(prompts=[], confirms=[False])))
     asyncio.run(_action("Spot roundtrip").run(_AsyncUI(prompts=["0.00008"], confirms=[True])))
 
     assert calls[0].paper is True and calls[0].steps == 3
     assert calls[1].live is True and calls[1].steps == 2
     assert "Spot test roundtrip complete." in capsys.readouterr().out
+
+
+def test_tui_help_action_writes_operator_help() -> None:
+    ui = _AsyncUI()
+    result = asyncio.run(_action("Help").run(ui))
+    assert result == 0
+    assert any("Operator help" in entry for entry in ui.logs)
 
 
 def test_recent_artifacts_and_summary(tmp_path) -> None:

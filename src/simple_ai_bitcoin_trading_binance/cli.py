@@ -223,6 +223,40 @@ async def _ui_prompt_bool(ui, label: str, default: bool) -> bool:
         ui.append_log("Enter yes or no.")
 
 
+def _parse_form_bool(raw: str, default: bool) -> bool:
+    token = raw.strip().lower()
+    if token in {"y", "yes", "true", "1", "on"}:
+        return True
+    if token in {"n", "no", "false", "0", "off"}:
+        return False
+    return default
+
+
+def _parse_form_int(raw: str, *, label: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    value = default if not raw.strip() else int(raw.strip())
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} must be >= {minimum}.")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} must be <= {maximum}.")
+    return value
+
+
+def _parse_form_float(
+    raw: str,
+    *,
+    label: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = default if not raw.strip() else float(raw.strip())
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} must be >= {minimum}.")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} must be <= {maximum}.")
+    return value
+
+
 def _parse_feature_selection(raw: str, current: Sequence[str]) -> tuple[str, ...]:
     candidate = raw.strip().lower()
     if not candidate:
@@ -265,16 +299,38 @@ async def _ui_prompt_feature_selection(ui, current: Sequence[str]) -> tuple[str,
 
 
 async def _ui_prompt_runtime(ui, current) -> object:
-    market_type = (await ui.prompt("Market type [spot/futures]", current.market_type)).strip().lower()
+    from .tui import FormField
+
+    payload = await ui.form(
+        "Runtime settings",
+        [
+            FormField("market_type", "Market type [spot/futures]", current.market_type),
+            FormField("interval", "Kline interval", current.interval),
+            FormField("testnet", "Use Binance testnet [yes/no]", "yes" if current.testnet else "no"),
+            FormField("api_key", "Binance API key [blank keeps current]", "", password=True),
+            FormField("api_secret", "Binance API secret [blank keeps current]", "", password=True),
+            FormField("dry_run", "Paper trading mode [yes/no]", "yes" if current.dry_run else "no"),
+            FormField("validate_account", "Validate credentials at startup [yes/no]", "yes" if current.validate_account else "no"),
+            FormField("max_rate_calls_per_minute", "Max REST calls per minute", str(current.max_rate_calls_per_minute)),
+        ],
+    )
+    if payload is None:
+        return current
+    market_type = payload["market_type"].strip().lower()
     if market_type not in {"spot", "futures"}:
         market_type = current.market_type
-    interval = (await ui.prompt("Kline interval", current.interval)).strip() or current.interval
-    testnet = await _ui_prompt_bool(ui, "Use Binance testnet", current.testnet)
-    api_key = (await ui.secret("Binance API key [blank keeps current]", "")).strip() or current.api_key
-    api_secret = (await ui.secret("Binance API secret [blank keeps current]", "")).strip() or current.api_secret
-    dry_run = await _ui_prompt_bool(ui, "Paper trading mode", current.dry_run)
-    validate_account = await _ui_prompt_bool(ui, "Validate credentials at startup", current.validate_account)
-    max_rate = await _ui_prompt_int(ui, "Max REST calls per minute", current.max_rate_calls_per_minute, minimum=1)
+    interval = payload["interval"].strip() or current.interval
+    testnet = _parse_form_bool(payload["testnet"], current.testnet)
+    api_key = payload["api_key"].strip() or current.api_key
+    api_secret = payload["api_secret"].strip() or current.api_secret
+    dry_run = _parse_form_bool(payload["dry_run"], current.dry_run)
+    validate_account = _parse_form_bool(payload["validate_account"], current.validate_account)
+    max_rate = _parse_form_int(
+        payload["max_rate_calls_per_minute"],
+        label="Max REST calls per minute",
+        default=current.max_rate_calls_per_minute,
+        minimum=1,
+    )
     return RuntimeConfig(
         symbol="BTCUSDC",
         interval=interval,
@@ -289,31 +345,80 @@ async def _ui_prompt_runtime(ui, current) -> object:
 
 
 async def _ui_prompt_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
+    from .tui import FormField
+
     enabled_features = await _ui_prompt_feature_selection(ui, cfg.enabled_features)
-    feature_window_short = await _ui_prompt_int(ui, "Feature window short", cfg.feature_windows[0], minimum=1)
-    feature_window_long = await _ui_prompt_int(
-        ui,
-        "Feature window long",
-        max(cfg.feature_windows[1], feature_window_short + 1),
+    payload = await ui.form(
+        "Strategy settings",
+        [
+            FormField("leverage", "Leverage", str(cfg.leverage)),
+            FormField("risk", "Risk per trade", str(cfg.risk_per_trade)),
+            FormField("max_position", "Max position percent", str(cfg.max_position_pct)),
+            FormField("stop", "Stop loss percent", str(cfg.stop_loss_pct)),
+            FormField("take", "Take profit percent", str(cfg.take_profit_pct)),
+            FormField("cooldown", "Cooldown minutes", str(cfg.cooldown_minutes)),
+            FormField("max_open", "Max open positions", str(cfg.max_open_positions)),
+            FormField("max_trades_per_day", "Max trades per day", str(cfg.max_trades_per_day)),
+            FormField("signal_threshold", "Signal threshold", str(cfg.signal_threshold)),
+            FormField("max_drawdown", "Max drawdown limit", str(cfg.max_drawdown_limit)),
+            FormField("taker_fee_bps", "Taker fee bps", str(cfg.taker_fee_bps)),
+            FormField("slippage_bps", "Slippage bps", str(cfg.slippage_bps)),
+            FormField("label_threshold", "Label threshold", str(cfg.label_threshold)),
+            FormField("model_lookback", "Model lookback rows", str(cfg.model_lookback)),
+            FormField("training_epochs", "Training epochs", str(cfg.training_epochs)),
+            FormField("confidence_beta", "Confidence beta", str(cfg.confidence_beta)),
+            FormField("feature_window_short", "Feature window short", str(cfg.feature_windows[0])),
+            FormField("feature_window_long", "Feature window long", str(cfg.feature_windows[1])),
+        ],
+    )
+    if payload is None:
+        return argparse.Namespace(
+            leverage=None,
+            risk=None,
+            max_position=None,
+            stop=None,
+            take=None,
+            cooldown=None,
+            max_open=None,
+            max_trades_per_day=None,
+            signal_threshold=None,
+            max_drawdown=None,
+            taker_fee_bps=None,
+            slippage_bps=None,
+            label_threshold=None,
+            model_lookback=None,
+            training_epochs=None,
+            confidence_beta=None,
+            feature_window_short=None,
+            feature_window_long=None,
+            set_features=None,
+            enable_feature=None,
+            disable_feature=None,
+        )
+    feature_window_short = _parse_form_int(payload["feature_window_short"], label="Feature window short", default=cfg.feature_windows[0], minimum=1)
+    feature_window_long = _parse_form_int(
+        payload["feature_window_long"],
+        label="Feature window long",
+        default=max(cfg.feature_windows[1], feature_window_short + 1),
         minimum=feature_window_short + 1,
     )
     return argparse.Namespace(
-        leverage=await _ui_prompt_float(ui, "Leverage", cfg.leverage, minimum=1.0),
-        risk=await _ui_prompt_float(ui, "Risk per trade", cfg.risk_per_trade, minimum=0.0001),
-        max_position=await _ui_prompt_float(ui, "Max position percent", cfg.max_position_pct, minimum=0.0, maximum=1.0),
-        stop=await _ui_prompt_float(ui, "Stop loss percent", cfg.stop_loss_pct, minimum=0.0, maximum=0.99),
-        take=await _ui_prompt_float(ui, "Take profit percent", cfg.take_profit_pct, minimum=0.0, maximum=0.99),
-        cooldown=await _ui_prompt_int(ui, "Cooldown minutes", cfg.cooldown_minutes, minimum=0),
-        max_open=await _ui_prompt_int(ui, "Max open positions", cfg.max_open_positions, minimum=0),
-        max_trades_per_day=await _ui_prompt_int(ui, "Max trades per day", cfg.max_trades_per_day, minimum=0),
-        signal_threshold=await _ui_prompt_float(ui, "Signal threshold", cfg.signal_threshold, minimum=0.01, maximum=0.99),
-        max_drawdown=await _ui_prompt_float(ui, "Max drawdown limit", cfg.max_drawdown_limit, minimum=0.0, maximum=1.0),
-        taker_fee_bps=await _ui_prompt_float(ui, "Taker fee bps", cfg.taker_fee_bps, minimum=0.0),
-        slippage_bps=await _ui_prompt_float(ui, "Slippage bps", cfg.slippage_bps, minimum=0.0),
-        label_threshold=await _ui_prompt_float(ui, "Label threshold", cfg.label_threshold, minimum=0.0001),
-        model_lookback=await _ui_prompt_int(ui, "Model lookback rows", cfg.model_lookback, minimum=10),
-        training_epochs=await _ui_prompt_int(ui, "Training epochs", cfg.training_epochs, minimum=1),
-        confidence_beta=await _ui_prompt_float(ui, "Confidence beta", cfg.confidence_beta, minimum=0.0, maximum=1.0),
+        leverage=_parse_form_float(payload["leverage"], label="Leverage", default=cfg.leverage, minimum=1.0),
+        risk=_parse_form_float(payload["risk"], label="Risk per trade", default=cfg.risk_per_trade, minimum=0.0001),
+        max_position=_parse_form_float(payload["max_position"], label="Max position percent", default=cfg.max_position_pct, minimum=0.0, maximum=1.0),
+        stop=_parse_form_float(payload["stop"], label="Stop loss percent", default=cfg.stop_loss_pct, minimum=0.0, maximum=0.99),
+        take=_parse_form_float(payload["take"], label="Take profit percent", default=cfg.take_profit_pct, minimum=0.0, maximum=0.99),
+        cooldown=_parse_form_int(payload["cooldown"], label="Cooldown minutes", default=cfg.cooldown_minutes, minimum=0),
+        max_open=_parse_form_int(payload["max_open"], label="Max open positions", default=cfg.max_open_positions, minimum=0),
+        max_trades_per_day=_parse_form_int(payload["max_trades_per_day"], label="Max trades per day", default=cfg.max_trades_per_day, minimum=0),
+        signal_threshold=_parse_form_float(payload["signal_threshold"], label="Signal threshold", default=cfg.signal_threshold, minimum=0.01, maximum=0.99),
+        max_drawdown=_parse_form_float(payload["max_drawdown"], label="Max drawdown limit", default=cfg.max_drawdown_limit, minimum=0.0, maximum=1.0),
+        taker_fee_bps=_parse_form_float(payload["taker_fee_bps"], label="Taker fee bps", default=cfg.taker_fee_bps, minimum=0.0),
+        slippage_bps=_parse_form_float(payload["slippage_bps"], label="Slippage bps", default=cfg.slippage_bps, minimum=0.0),
+        label_threshold=_parse_form_float(payload["label_threshold"], label="Label threshold", default=cfg.label_threshold, minimum=0.0001),
+        model_lookback=_parse_form_int(payload["model_lookback"], label="Model lookback rows", default=cfg.model_lookback, minimum=10),
+        training_epochs=_parse_form_int(payload["training_epochs"], label="Training epochs", default=cfg.training_epochs, minimum=1),
+        confidence_beta=_parse_form_float(payload["confidence_beta"], label="Confidence beta", default=cfg.confidence_beta, minimum=0.0, maximum=1.0),
         feature_window_short=feature_window_short,
         feature_window_long=feature_window_long,
         set_features=",".join(enabled_features),
@@ -412,14 +517,34 @@ def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
 
 
 def _tui_actions():
-    from .tui import TUIAction
+    from .tui import FormField, TUIAction
     async def _overview(ui):
         ui.append_log(render_dashboard(_dashboard_snapshot(with_account=True)))
         return 0
 
+    async def _help(ui):
+        ui.append_log(
+            "\n".join(
+                [
+                    "Operator help",
+                    "- Start with Runtime settings to enter API credentials securely.",
+                    "- Run Connect before any data, training, or live action.",
+                    "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest.",
+                    "- Use Paper loop before Testnet loop.",
+                    "- Spot roundtrip is the smallest authenticated execution check.",
+                    "- Keys: j/k move, enter runs the selected action, r refreshes, q quits.",
+                ]
+            )
+        )
+        return 0
+
     async def _runtime(ui):
         current = load_runtime()
-        next_runtime = await _ui_prompt_runtime(ui, current)
+        try:
+            next_runtime = await _ui_prompt_runtime(ui, current)
+        except ValueError as exc:
+            print(f"Runtime settings invalid: {exc}", file=sys.stderr)
+            return 2
         save_runtime(next_runtime)
         if next_runtime.validate_account and next_runtime.api_key and next_runtime.api_secret:
             client = _build_client(next_runtime)
@@ -434,7 +559,15 @@ def _tui_actions():
         return 0
 
     async def _strategy(ui):
-        return command_strategy(await _ui_prompt_strategy_args(ui, load_strategy()))
+        try:
+            args = await _ui_prompt_strategy_args(ui, load_strategy())
+        except ValueError as exc:
+            print(f"Strategy settings invalid: {exc}", file=sys.stderr)
+            return 2
+        if args.set_features is None and args.leverage is None:
+            print("Strategy update cancelled.")
+            return 0
+        return command_strategy(args)
 
     async def _connect(_ui):
         return command_connect(argparse.Namespace())
@@ -444,47 +577,138 @@ def _tui_actions():
 
     async def _fetch(ui):
         runtime = load_runtime()
+        payload = await ui.form(
+            "Fetch candles",
+            [
+                FormField("limit", "Fetch limit", "500"),
+                FormField("output", "Candle output path", "data/historical_btcusdc.json"),
+            ],
+        )
+        if payload is None:
+            print("Fetch cancelled.")
+            return 0
+        try:
+            limit = _parse_form_int(payload["limit"], label="Fetch limit", default=500, minimum=1)
+        except ValueError as exc:
+            print(f"Fetch settings invalid: {exc}", file=sys.stderr)
+            return 2
         return command_fetch(
             argparse.Namespace(
                 symbol=runtime.symbol,
                 interval=runtime.interval,
-                limit=await _ui_prompt_int(ui, "Fetch limit", 500, minimum=1),
-                output=await ui.prompt("Candle output path", "data/historical_btcusdc.json"),
+                limit=limit,
+                output=payload["output"].strip() or "data/historical_btcusdc.json",
             )
         )
 
     async def _train(ui):
+        payload = await ui.form(
+            "Train model",
+            [
+                FormField("input", "Training input path", "data/historical_btcusdc.json"),
+                FormField("output", "Model output path", "data/model.json"),
+                FormField("epochs", "Training epochs", "250"),
+                FormField("seed", "Training seed", "7"),
+                FormField("walk_forward", "Run walk-forward validation [yes/no]", "no"),
+                FormField("walk_forward_train", "Walk-forward train window", "300"),
+                FormField("walk_forward_test", "Walk-forward test window", "60"),
+                FormField("walk_forward_step", "Walk-forward step", "30"),
+                FormField("calibrate_threshold", "Calibrate threshold [yes/no]", "yes"),
+            ],
+        )
+        if payload is None:
+            print("Training cancelled.")
+            return 0
+        try:
+            epochs = _parse_form_int(payload["epochs"], label="Training epochs", default=250, minimum=1)
+            seed = _parse_form_int(payload["seed"], label="Training seed", default=7, minimum=0)
+            walk_forward_train = _parse_form_int(payload["walk_forward_train"], label="Walk-forward train window", default=300, minimum=2)
+            walk_forward_test = _parse_form_int(payload["walk_forward_test"], label="Walk-forward test window", default=60, minimum=1)
+            walk_forward_step = _parse_form_int(payload["walk_forward_step"], label="Walk-forward step", default=30, minimum=1)
+        except ValueError as exc:
+            print(f"Training settings invalid: {exc}", file=sys.stderr)
+            return 2
         return command_train(
             argparse.Namespace(
-                input=await ui.prompt("Training input path", "data/historical_btcusdc.json"),
-                output=await ui.prompt("Model output path", "data/model.json"),
-                epochs=await _ui_prompt_int(ui, "Training epochs", 250, minimum=1),
-                seed=await _ui_prompt_int(ui, "Training seed", 7, minimum=0),
-                walk_forward=await _ui_prompt_bool(ui, "Run walk-forward validation", False),
-                walk_forward_train=await _ui_prompt_int(ui, "Walk-forward train window", 300, minimum=2),
-                walk_forward_test=await _ui_prompt_int(ui, "Walk-forward test window", 60, minimum=1),
-                walk_forward_step=await _ui_prompt_int(ui, "Walk-forward step", 30, minimum=1),
-                calibrate_threshold=await _ui_prompt_bool(ui, "Calibrate threshold", True),
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                output=payload["output"].strip() or "data/model.json",
+                epochs=epochs,
+                seed=seed,
+                walk_forward=_parse_form_bool(payload["walk_forward"], False),
+                walk_forward_train=walk_forward_train,
+                walk_forward_test=walk_forward_test,
+                walk_forward_step=walk_forward_step,
+                calibrate_threshold=_parse_form_bool(payload["calibrate_threshold"], True),
             )
         )
 
     async def _tune(ui):
-        lookback_days, from_date, to_date = await _ui_prompt_tune_window(ui)
+        payload = await ui.form(
+            "Tune strategy",
+            [
+                FormField("input", "Tune input path", "data/historical_btcusdc.json"),
+                FormField("window_mode", "Window mode [all/lookback/range]", "all"),
+                FormField("lookback_days", "Lookback days", "30"),
+                FormField("from_date", "From date YYYY-MM-DD", ""),
+                FormField("to_date", "To date YYYY-MM-DD", ""),
+                FormField("save_best", "Persist the best strategy [yes/no]", "no"),
+                FormField("min_risk", "Minimum risk", "0.002"),
+                FormField("max_risk", "Maximum risk", "0.02"),
+                FormField("steps", "Grid steps", "5"),
+                FormField("min_leverage", "Minimum leverage", "1.0"),
+                FormField("max_leverage", "Maximum leverage", "20.0"),
+                FormField("min_threshold", "Minimum threshold", "0.52"),
+                FormField("max_threshold", "Maximum threshold", "0.88"),
+                FormField("min_take", "Minimum take profit", "0.01"),
+                FormField("max_take", "Maximum take profit", "0.06"),
+                FormField("min_stop", "Minimum stop loss", "0.008"),
+                FormField("max_stop", "Maximum stop loss", "0.04"),
+            ],
+        )
+        if payload is None:
+            print("Tune cancelled.")
+            return 0
+        mode = payload["window_mode"].strip().lower()
+        lookback_days = None
+        from_date = None
+        to_date = None
+        try:
+            if mode == "lookback":
+                lookback_days = _parse_form_int(payload["lookback_days"], label="Lookback days", default=30, minimum=1)
+            elif mode == "range":
+                from_date = payload["from_date"].strip() or None
+                to_date = payload["to_date"].strip() or None
+            elif mode not in {"", "all"}:
+                raise ValueError("Window mode must be all, lookback, or range.")
+            steps = _parse_form_int(payload["steps"], label="Grid steps", default=5, minimum=1)
+            min_risk = _parse_form_float(payload["min_risk"], label="Minimum risk", default=0.002, minimum=0.0001)
+            max_risk = _parse_form_float(payload["max_risk"], label="Maximum risk", default=0.02, minimum=0.0001)
+            min_leverage = _parse_form_float(payload["min_leverage"], label="Minimum leverage", default=1.0, minimum=1.0)
+            max_leverage = _parse_form_float(payload["max_leverage"], label="Maximum leverage", default=20.0, minimum=1.0)
+            min_threshold = _parse_form_float(payload["min_threshold"], label="Minimum threshold", default=0.52, minimum=0.01, maximum=0.99)
+            max_threshold = _parse_form_float(payload["max_threshold"], label="Maximum threshold", default=0.88, minimum=0.01, maximum=0.99)
+            min_take = _parse_form_float(payload["min_take"], label="Minimum take profit", default=0.01, minimum=0.0, maximum=0.99)
+            max_take = _parse_form_float(payload["max_take"], label="Maximum take profit", default=0.06, minimum=0.0, maximum=0.99)
+            min_stop = _parse_form_float(payload["min_stop"], label="Minimum stop loss", default=0.008, minimum=0.0, maximum=0.99)
+            max_stop = _parse_form_float(payload["max_stop"], label="Maximum stop loss", default=0.04, minimum=0.0, maximum=0.99)
+        except ValueError as exc:
+            print(f"Tune settings invalid: {exc}", file=sys.stderr)
+            return 2
         return command_tune(
             argparse.Namespace(
-                input=await ui.prompt("Tune input path", "data/historical_btcusdc.json"),
-                save_best=await _ui_prompt_bool(ui, "Persist the best strategy", False),
-                min_risk=await _ui_prompt_float(ui, "Minimum risk", 0.002, minimum=0.0001),
-                max_risk=await _ui_prompt_float(ui, "Maximum risk", 0.02, minimum=0.0001),
-                steps=await _ui_prompt_int(ui, "Grid steps", 5, minimum=1),
-                min_leverage=await _ui_prompt_float(ui, "Minimum leverage", 1.0, minimum=1.0),
-                max_leverage=await _ui_prompt_float(ui, "Maximum leverage", 20.0, minimum=1.0),
-                min_threshold=await _ui_prompt_float(ui, "Minimum threshold", 0.52, minimum=0.01, maximum=0.99),
-                max_threshold=await _ui_prompt_float(ui, "Maximum threshold", 0.88, minimum=0.01, maximum=0.99),
-                min_take=await _ui_prompt_float(ui, "Minimum take profit", 0.01, minimum=0.0, maximum=0.99),
-                max_take=await _ui_prompt_float(ui, "Maximum take profit", 0.06, minimum=0.0, maximum=0.99),
-                min_stop=await _ui_prompt_float(ui, "Minimum stop loss", 0.008, minimum=0.0, maximum=0.99),
-                max_stop=await _ui_prompt_float(ui, "Maximum stop loss", 0.04, minimum=0.0, maximum=0.99),
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                save_best=_parse_form_bool(payload["save_best"], False),
+                min_risk=min_risk,
+                max_risk=max_risk,
+                steps=steps,
+                min_leverage=min_leverage,
+                max_leverage=max_leverage,
+                min_threshold=min_threshold,
+                max_threshold=max_threshold,
+                min_take=min_take,
+                max_take=max_take,
+                min_stop=min_stop,
+                max_stop=max_stop,
                 lookback_days=lookback_days,
                 from_date=from_date,
                 to_date=to_date,
@@ -492,50 +716,108 @@ def _tui_actions():
         )
 
     async def _backtest(ui):
+        payload = await ui.form(
+            "Backtest",
+            [
+                FormField("input", "Backtest input path", "data/historical_btcusdc.json"),
+                FormField("model", "Model path", "data/model.json"),
+                FormField("start_cash", "Starting cash", "1000"),
+            ],
+        )
+        if payload is None:
+            print("Backtest cancelled.")
+            return 0
+        try:
+            start_cash = _parse_form_float(payload["start_cash"], label="Starting cash", default=1000.0, minimum=1.0)
+        except ValueError as exc:
+            print(f"Backtest settings invalid: {exc}", file=sys.stderr)
+            return 2
         return command_backtest(
             argparse.Namespace(
-                input=await ui.prompt("Backtest input path", "data/historical_btcusdc.json"),
-                model=await ui.prompt("Model path", "data/model.json"),
-                start_cash=await _ui_prompt_float(ui, "Starting cash", 1000.0, minimum=1.0),
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                model=payload["model"].strip() or "data/model.json",
+                start_cash=start_cash,
             )
         )
 
     async def _evaluate(ui):
-        threshold_raw = (await ui.prompt("Evaluation threshold [blank=strategy default]", "")).strip()
+        payload = await ui.form(
+            "Evaluate model",
+            [
+                FormField("input", "Evaluation input path", "data/historical_btcusdc.json"),
+                FormField("model", "Model path", "data/model.json"),
+                FormField("threshold", "Evaluation threshold [blank=strategy default]", ""),
+                FormField("calibrate_threshold", "Calibrate threshold [yes/no]", "no"),
+            ],
+        )
+        if payload is None:
+            print("Evaluation cancelled.")
+            return 0
+        threshold_raw = payload["threshold"].strip()
         return command_evaluate(
             argparse.Namespace(
-                input=await ui.prompt("Evaluation input path", "data/historical_btcusdc.json"),
-                model=await ui.prompt("Model path", "data/model.json"),
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                model=payload["model"].strip() or "data/model.json",
                 threshold=float(threshold_raw) if threshold_raw else None,
-                calibrate_threshold=await _ui_prompt_bool(ui, "Calibrate threshold", False),
+                calibrate_threshold=_parse_form_bool(payload["calibrate_threshold"], False),
             )
         )
 
     async def _pipeline(ui):
         runtime = load_runtime()
-        historical = await ui.prompt("Historical candle path", "data/historical_btcusdc.json")
-        model = await ui.prompt("Model artifact path", "data/model.json")
+        payload = await ui.form(
+            "Offline pipeline",
+            [
+                FormField("historical", "Historical candle path", "data/historical_btcusdc.json"),
+                FormField("model", "Model artifact path", "data/model.json"),
+                FormField("limit", "Fetch limit", "500"),
+                FormField("epochs", "Training epochs", "120"),
+                FormField("seed", "Training seed", "7"),
+                FormField("walk_forward", "Run walk-forward validation [yes/no]", "yes"),
+                FormField("walk_forward_train", "Walk-forward train window", "300"),
+                FormField("walk_forward_test", "Walk-forward test window", "60"),
+                FormField("walk_forward_step", "Walk-forward step", "30"),
+                FormField("calibrate_threshold", "Calibrate threshold [yes/no]", "yes"),
+                FormField("start_cash", "Backtest starting cash", "1000"),
+            ],
+        )
+        if payload is None:
+            print("Pipeline cancelled.")
+            return 0
+        historical = payload["historical"].strip() or "data/historical_btcusdc.json"
+        model = payload["model"].strip() or "data/model.json"
+        try:
+            limit = _parse_form_int(payload["limit"], label="Fetch limit", default=500, minimum=1)
+            epochs = _parse_form_int(payload["epochs"], label="Training epochs", default=120, minimum=1)
+            seed = _parse_form_int(payload["seed"], label="Training seed", default=7, minimum=0)
+            walk_forward_train = _parse_form_int(payload["walk_forward_train"], label="Walk-forward train window", default=300, minimum=2)
+            walk_forward_test = _parse_form_int(payload["walk_forward_test"], label="Walk-forward test window", default=60, minimum=1)
+            walk_forward_step = _parse_form_int(payload["walk_forward_step"], label="Walk-forward step", default=30, minimum=1)
+            start_cash = _parse_form_float(payload["start_cash"], label="Backtest starting cash", default=1000.0, minimum=1.0)
+        except ValueError as exc:
+            print(f"Pipeline settings invalid: {exc}", file=sys.stderr)
+            return 2
         fetch_args = argparse.Namespace(
             symbol=runtime.symbol,
             interval=runtime.interval,
-            limit=await _ui_prompt_int(ui, "Fetch limit", 500, minimum=1),
+            limit=limit,
             output=historical,
         )
         train_args = argparse.Namespace(
             input=historical,
             output=model,
-            epochs=await _ui_prompt_int(ui, "Training epochs", 120, minimum=1),
-            seed=await _ui_prompt_int(ui, "Training seed", 7, minimum=0),
-            walk_forward=await _ui_prompt_bool(ui, "Run walk-forward validation", True),
-            walk_forward_train=await _ui_prompt_int(ui, "Walk-forward train window", 300, minimum=2),
-            walk_forward_test=await _ui_prompt_int(ui, "Walk-forward test window", 60, minimum=1),
-            walk_forward_step=await _ui_prompt_int(ui, "Walk-forward step", 30, minimum=1),
-            calibrate_threshold=await _ui_prompt_bool(ui, "Calibrate threshold", True),
+            epochs=epochs,
+            seed=seed,
+            walk_forward=_parse_form_bool(payload["walk_forward"], True),
+            walk_forward_train=walk_forward_train,
+            walk_forward_test=walk_forward_test,
+            walk_forward_step=walk_forward_step,
+            calibrate_threshold=_parse_form_bool(payload["calibrate_threshold"], True),
         )
         backtest_args = argparse.Namespace(
             input=historical,
             model=model,
-            start_cash=await _ui_prompt_float(ui, "Backtest starting cash", 1000.0, minimum=1.0),
+            start_cash=start_cash,
         )
         evaluate_args = argparse.Namespace(
             input=historical,
@@ -555,14 +837,36 @@ def _tui_actions():
         return 0
 
     async def _paper(ui):
+        payload = await ui.form(
+            "Paper loop",
+            [
+                FormField("steps", "Paper loop steps", "20"),
+                FormField("sleep", "Sleep seconds", "5"),
+                FormField("retrain_interval", "Retrain interval", "0"),
+                FormField("retrain_window", "Retrain window", "300"),
+                FormField("retrain_min_rows", "Retrain minimum rows", "240"),
+            ],
+        )
+        if payload is None:
+            print("Paper loop cancelled.")
+            return 0
+        try:
+            steps = _parse_form_int(payload["steps"], label="Paper loop steps", default=20, minimum=1)
+            sleep = _parse_form_int(payload["sleep"], label="Sleep seconds", default=5, minimum=0)
+            retrain_interval = _parse_form_int(payload["retrain_interval"], label="Retrain interval", default=0, minimum=0)
+            retrain_window = _parse_form_int(payload["retrain_window"], label="Retrain window", default=300, minimum=1)
+            retrain_min_rows = _parse_form_int(payload["retrain_min_rows"], label="Retrain minimum rows", default=240, minimum=1)
+        except ValueError as exc:
+            print(f"Paper loop settings invalid: {exc}", file=sys.stderr)
+            return 2
         return command_live(
             argparse.Namespace(
-                steps=await _ui_prompt_int(ui, "Paper loop steps", 20, minimum=1),
-                sleep=await _ui_prompt_int(ui, "Sleep seconds", 5, minimum=0),
+                steps=steps,
+                sleep=sleep,
                 leverage=None,
-                retrain_interval=await _ui_prompt_int(ui, "Retrain interval", 0, minimum=0),
-                retrain_window=await _ui_prompt_int(ui, "Retrain window", 300, minimum=1),
-                retrain_min_rows=await _ui_prompt_int(ui, "Retrain minimum rows", 240, minimum=1),
+                retrain_interval=retrain_interval,
+                retrain_window=retrain_window,
+                retrain_min_rows=retrain_min_rows,
                 paper=True,
                 live=False,
             )
@@ -572,14 +876,36 @@ def _tui_actions():
         if not await ui.confirm("Run authenticated testnet execution?"):
             print("Testnet execution cancelled.")
             return 0
+        payload = await ui.form(
+            "Testnet loop",
+            [
+                FormField("steps", "Live steps", "1"),
+                FormField("sleep", "Sleep seconds", "5"),
+                FormField("retrain_interval", "Retrain interval", "0"),
+                FormField("retrain_window", "Retrain window", "300"),
+                FormField("retrain_min_rows", "Retrain minimum rows", "240"),
+            ],
+        )
+        if payload is None:
+            print("Testnet loop cancelled.")
+            return 0
+        try:
+            steps = _parse_form_int(payload["steps"], label="Live steps", default=1, minimum=1)
+            sleep = _parse_form_int(payload["sleep"], label="Sleep seconds", default=5, minimum=0)
+            retrain_interval = _parse_form_int(payload["retrain_interval"], label="Retrain interval", default=0, minimum=0)
+            retrain_window = _parse_form_int(payload["retrain_window"], label="Retrain window", default=300, minimum=1)
+            retrain_min_rows = _parse_form_int(payload["retrain_min_rows"], label="Retrain minimum rows", default=240, minimum=1)
+        except ValueError as exc:
+            print(f"Testnet loop settings invalid: {exc}", file=sys.stderr)
+            return 2
         return command_live(
             argparse.Namespace(
-                steps=await _ui_prompt_int(ui, "Live steps", 1, minimum=1),
-                sleep=await _ui_prompt_int(ui, "Sleep seconds", 5, minimum=0),
+                steps=steps,
+                sleep=sleep,
                 leverage=None,
-                retrain_interval=await _ui_prompt_int(ui, "Retrain interval", 0, minimum=0),
-                retrain_window=await _ui_prompt_int(ui, "Retrain window", 300, minimum=1),
-                retrain_min_rows=await _ui_prompt_int(ui, "Retrain minimum rows", 240, minimum=1),
+                retrain_interval=retrain_interval,
+                retrain_window=retrain_window,
+                retrain_min_rows=retrain_min_rows,
                 paper=False,
                 live=True,
             )
@@ -628,20 +954,21 @@ def _tui_actions():
 
     return [
         TUIAction("1", "Overview", "Refresh runtime, strategy, artifact, and account context.", _overview),
-        TUIAction("2", "Runtime settings", "Edit testnet, credentials, interval, and rate controls.", _runtime),
-        TUIAction("3", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
+        TUIAction("2", "Help", "Show the recommended operator workflow and keyboard shortcuts.", _help),
+        TUIAction("3", "Runtime settings", "Enter credentials securely and configure the runtime target.", _runtime),
         TUIAction("4", "Connect", "Validate exchange connectivity and the configured target.", _connect),
         TUIAction("5", "Account", "Inspect authenticated balances and positions.", _account),
         TUIAction("6", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
-        TUIAction("7", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
-        TUIAction("8", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
-        TUIAction("9", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
-        TUIAction("10", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
-        TUIAction("11", "Offline pipeline", "Run fetch, train, backtest, and evaluate as one guided flow.", _pipeline),
-        TUIAction("12", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
-        TUIAction("13", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
-        TUIAction("14", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
-        TUIAction("15", "Recent artifacts", "Print the latest local artifacts into the console log.", _artifacts),
+        TUIAction("7", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
+        TUIAction("8", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
+        TUIAction("9", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
+        TUIAction("10", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
+        TUIAction("11", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
+        TUIAction("12", "Offline pipeline", "Run fetch, train, backtest, and evaluate as one guided flow.", _pipeline),
+        TUIAction("13", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
+        TUIAction("14", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
+        TUIAction("15", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
+        TUIAction("16", "Recent artifacts", "Print the latest local artifacts into the console log.", _artifacts),
     ]
 
 

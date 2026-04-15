@@ -18,8 +18,8 @@ This runbook is for the next iteration, when the interactive console will be exe
 3. Binance testnet credentials exist and are valid.
 4. Interactive console starts cleanly in a real terminal.
 5. Runtime config is explicitly checked before any live step.
-5. Cached historical data and a model artifact can be regenerated locally if needed.
-6. No command output or artifact should contain raw API keys or secrets.
+6. Cached historical data and a model artifact can be regenerated locally if needed.
+7. No command output or artifact should contain raw API keys or secrets.
 
 ## Launch
 
@@ -39,6 +39,13 @@ From the console, open `Runtime settings` and verify:
 - `strategy.max_drawdown_limit` is conservative
 - `strategy.max_trades_per_day` is not unintentionally disabled
 - `strategy.max_open_positions >= 1`
+
+UI notes:
+
+- use the left action list for navigation
+- `Action` shows the selected operation and when to use it
+- `Overview` shows current runtime, strategy, and account context
+- `Activity` shows command output and failures
 
 Optional host override checks:
 

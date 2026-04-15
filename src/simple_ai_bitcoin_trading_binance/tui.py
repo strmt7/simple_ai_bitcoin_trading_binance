@@ -11,9 +11,9 @@ from typing import Awaitable, Callable
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, OptionList, RichLog, Static
+from textual.widgets import Button, Footer, Header, Input, Label, OptionList, RichLog, Static, TabbedContent, TabPane
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,14 @@ class TUIAction:
     title: str
     description: str
     run: Callable[["TerminalUI"], Awaitable[int | None] | int | None]
+
+
+@dataclass(frozen=True)
+class FormField:
+    key: str
+    label: str
+    value: str = ""
+    password: bool = False
 
 
 class PromptScreen(ModalScreen[str | None]):
@@ -76,6 +84,62 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "confirm")
 
 
+class FormScreen(ModalScreen[dict[str, str] | None]):
+    def __init__(self, title: str, fields: list[FormField]) -> None:
+        super().__init__()
+        self.title_text = title
+        self.fields = fields
+
+    def compose(self) -> ComposeResult:
+        rows = []
+        for field in self.fields:
+            rows.append(
+                Vertical(
+                    Label(field.label, classes="form-label"),
+                    Input(value=field.value, password=field.password, id=f"field-{field.key}"),
+                    classes="form-row",
+                )
+            )
+        yield Vertical(
+            Label(self.title_text, id="form-title"),
+            VerticalScroll(*rows, id="form-fields"),
+            Horizontal(
+                Button("Save", variant="primary", id="save"),
+                Button("Cancel", id="cancel"),
+                id="form-buttons",
+            ),
+            id="form-dialog",
+        )
+
+    def on_mount(self) -> None:
+        if self.fields:
+            self.query_one(f"#field-{self.fields[0].key}", Input).focus()
+
+    def _values(self) -> dict[str, str]:
+        payload = {}
+        for field in self.fields:
+            payload[field.key] = self.query_one(f"#field-{field.key}", Input).value.strip()
+        return payload
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        current_id = event.input.id or ""
+        ids = [f"field-{field.key}" for field in self.fields]
+        if current_id not in ids:
+            self.dismiss(self._values())
+            return
+        index = ids.index(current_id)
+        if index >= len(ids) - 1:
+            self.dismiss(self._values())
+            return
+        self.query_one(f"#{ids[index + 1]}", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save":
+            self.dismiss(self._values())
+        else:
+            self.dismiss(None)
+
+
 class TerminalUI:
     def __init__(self, app: "OperatorApp") -> None:
         self.app = app
@@ -91,6 +155,9 @@ class TerminalUI:
     async def confirm(self, message: str) -> bool:
         return bool(await self.app.push_screen_wait(ConfirmScreen(message)))
 
+    async def form(self, title: str, fields: list[FormField]) -> dict[str, str] | None:
+        return await self.app.push_screen_wait(FormScreen(title, fields))
+
     def append_log(self, text: str) -> None:
         self.app.append_log(text)
 
@@ -104,43 +171,56 @@ class OperatorApp(App[int]):
         height: 1fr;
     }
     #actions {
-        width: 28;
-        border: solid $primary;
+        width: 24;
+        min-width: 22;
+        border: tall $primary;
+        background: $surface;
     }
     #right {
         width: 1fr;
     }
-    #details {
-        height: 6;
-        border: solid $warning;
+    #status {
+        height: 2;
+        border: solid $secondary;
         padding: 0 1;
+        content-align: left middle;
     }
-    #preview {
+    #workspace {
         height: 1fr;
         border: solid $accent;
-        padding: 0 1;
     }
-    #status {
-        height: 1;
-        border: solid $secondary;
+    #details, #preview, #log {
+        height: 1fr;
         padding: 0 1;
     }
     #log {
-        height: 8;
-        border: solid $success;
+        border: none;
     }
-    #prompt-dialog, #confirm-dialog {
-        width: 70;
+    #prompt-dialog, #confirm-dialog, #form-dialog {
+        width: 72;
         height: auto;
         padding: 1 2;
         border: heavy $primary;
         background: $panel;
         align: center middle;
     }
-    #prompt-buttons, #confirm-buttons {
+    #prompt-buttons, #confirm-buttons, #form-buttons {
         height: auto;
         align-horizontal: right;
         padding-top: 1;
+    }
+    #form-title {
+        padding-bottom: 1;
+        text-style: bold;
+    }
+    #form-fields {
+        max-height: 18;
+    }
+    .form-row {
+        padding-bottom: 1;
+    }
+    .form-label {
+        padding-bottom: 0;
     }
     """
 
@@ -161,24 +241,25 @@ class OperatorApp(App[int]):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Horizontal(
-            OptionList(*[f"{action.key}. {action.title}" for action in self.actions_data], id="actions"),
-            Vertical(
-                Static("", id="status"),
-                Static("", id="details"),
-                Static("", id="preview"),
-                RichLog(id="log", wrap=True, highlight=True, markup=False),
-                id="right",
-            ),
-            id="body",
-        )
+        with Horizontal(id="body"):
+            yield OptionList(*[action.title for action in self.actions_data], id="actions")
+            with Vertical(id="right"):
+                yield Static("", id="status")
+                with TabbedContent(id="workspace"):
+                    with TabPane("Action", id="panel-action"):
+                        yield Static("", id="details")
+                    with TabPane("Overview", id="panel-overview"):
+                        yield Static("", id="preview")
+                    with TabPane("Activity", id="panel-activity"):
+                        yield RichLog(id="log", wrap=True, highlight=True, markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#actions", OptionList).highlighted = 0
+        self._activate_workspace("panel-overview")
         self.refresh_preview()
         self._update_action_details()
-        self.set_status("Ready")
+        self.set_status("Ready. Enter runs the selected action.")
 
     def set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
@@ -187,6 +268,12 @@ class OperatorApp(App[int]):
         log = self.query_one("#log", RichLog)
         for line in text.splitlines() or [""]:
             log.write(line)
+
+    def _activate_workspace(self, panel_id: str) -> None:
+        try:
+            self.query_one("#workspace", TabbedContent).active = panel_id
+        except Exception:
+            return
 
     def _update_action_details(self) -> None:
         action = self._current_action()
@@ -197,7 +284,7 @@ class OperatorApp(App[int]):
             break_long_words=False,
             break_on_hyphens=False,
         ) or [action.description]
-        details.update("\n".join([action.title, *wrapped]))
+        details.update("\n".join([action.title, "", *wrapped, "", "Press Enter to run."]))
 
     def refresh_preview(self) -> None:
         preview = self.query_one("#preview", Static)
@@ -214,6 +301,7 @@ class OperatorApp(App[int]):
         return self.actions_data[index]
 
     async def _execute_action(self, action: TUIAction) -> None:
+        self._activate_workspace("panel-activity")
         self.set_status(f"Running: {action.title}")
         stream = io.StringIO()
         result: int | None = None
@@ -240,18 +328,21 @@ class OperatorApp(App[int]):
 
     def action_refresh_preview(self) -> None:
         self.refresh_preview()
+        self._activate_workspace("panel-overview")
         self.set_status("Refreshed")
 
     def action_cursor_down(self) -> None:
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_down()
         self._update_action_details()
+        self._activate_workspace("panel-action")
         self.set_status(self._current_action().title)
 
     def action_cursor_up(self) -> None:
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_up()
         self._update_action_details()
+        self._activate_workspace("panel-action")
         self.set_status(self._current_action().title)
 
     async def on_option_list_option_selected(self, _event: OptionList.OptionSelected) -> None:
