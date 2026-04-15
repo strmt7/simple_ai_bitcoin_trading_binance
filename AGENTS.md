@@ -22,6 +22,10 @@ Do not expand to broad directory scans on first pass. Open more files only when 
 - Preserve conservative defaults (`testnet`, `dry_run` behavior, BTCUSDC-only execution).
 - Do not claim production readiness or profitability without reproducible evidence from test artifacts.
 - Keep secrets out of prompts, logs, and history.
+- Avoid unnecessary hardcoded host assumptions; prefer configuration or environment overrides when host selection can be made safely dynamic.
+- Never print, serialize, commit, or echo raw credentials, API keys, secrets, tokens, or signed request material.
+- Any runtime/config payload written to stdout, stderr, JSON artifacts, docs, or tests must use deterministic redaction for secret fields.
+- Add or update tests whenever credential-handling code changes so that raw secret values are provably absent from outputs and artifacts.
 - Keep changes in this repo scoped and avoid editing unrelated files.
 
 ## Verification minimum

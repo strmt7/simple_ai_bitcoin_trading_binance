@@ -1,5 +1,9 @@
 # Implementation Planning: BTCUSDC Testnet Trading CLI
 
+Status note:
+- This document is a living roadmap, not a snapshot of current gaps.
+- Several items below have already been implemented on the active branch; use tests, README, and CI status as the source of truth for current behavior.
+
 ## Purpose
 
 This document defines the concrete roadmap to evolve

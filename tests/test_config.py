@@ -80,6 +80,12 @@ def test_load_runtime_supports_payload_overrides(tmp_path: Path, monkeypatch) ->
     assert loaded.max_rate_calls_per_minute == 5
 
 
+def test_runtime_public_dict_redacts_credentials() -> None:
+    payload = RuntimeConfig(api_key="x", api_secret="y").public_dict()
+    assert payload["api_key"] == "<redacted>"
+    assert payload["api_secret"] == "<redacted>"
+
+
 def test_load_runtime_forces_supported_symbol(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     loaded = load_runtime({"symbol": "ETHUSDC"})
