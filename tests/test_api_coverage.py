@@ -530,6 +530,56 @@ def test_get_max_leverage_missing_symbol_uses_default(monkeypatch) -> None:
     assert client.get_max_leverage("BTCUSDC") == 125
 
 
+def test_retry_delay_caps_large_retry_after() -> None:
+    client = BinanceClient(api_key="k", api_secret="s")
+    assert client._retry_delay(0, 429, retry_after=3600.0) == 60.0
+
+
+def test_request_retryable_api_code_exhausts_and_raises(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", max_retries=1)
+    client._call_delay = 0.0
+    responses = [
+        _FakeResponse(200, payload={"code": -1003, "msg": "Too many requests"}),
+        _FakeResponse(200, payload={"code": -1003, "msg": "Too many requests"}),
+    ]
+    sleep_calls: list[float] = []
+
+    def request(_method: str, _url: str, params=None, timeout=None):
+        return responses.pop(0)
+
+    monkeypatch.setattr(client.session, "request", request)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    with pytest.raises(BinanceAPIError, match="Too many requests"):
+        client._request("GET", "/api/v3/ping")
+    assert sleep_calls == [0.5]
+    assert client.last_request_info["attempts"] == 2
+
+
+def test_get_max_leverage_defaults_when_brackets_have_no_numeric_values(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", market_type="futures")
+
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda _method, _path, _params=None, signed=False: [{"symbol": "BTCUSDC", "brackets": [{"foo": "bar"}]}],
+    )
+    assert client.get_max_leverage("BTCUSDC") == 125
+
+
+def test_place_order_spot_live_uses_spot_endpoint(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", market_type="spot")
+    calls: list[tuple[str, str, dict, bool]] = []
+
+    def request(method: str, path: str, params=None, signed: bool = False):
+        calls.append((method, path, params or {}, signed))
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_request", request)
+    payload = client.place_order("BTCUSDC", "BUY", 0.25, dry_run=False, leverage=1.0)
+    assert payload == {"ok": True}
+    assert calls == [("POST", "/api/v3/order", {"symbol": "BTCUSDC", "side": "BUY", "type": "MARKET", "quantity": "0.25000000"}, True)]
+
+
 def test_set_leverage_low_and_high_clamp(monkeypatch) -> None:
     client = BinanceClient(api_key="k", api_secret="s", market_type="futures")
 
