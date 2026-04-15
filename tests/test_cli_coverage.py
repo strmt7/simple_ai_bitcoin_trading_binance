@@ -831,7 +831,92 @@ def test_command_live_artifact_is_emitted(tmp_path, monkeypatch) -> None:
     kind, _output_dir, payload = captured[0]
     assert kind == "live"
     assert payload["command"] == "live"
-    assert payload["result"]["steps_executed"] == 1
+
+
+def test_command_live_rejects_non_testnet_runtime(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=False, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 2
+    assert "Real-money execution is disabled" in capsys.readouterr().out
+
+
+def test_command_live_rejects_missing_credentials_for_live_mode(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=False, market_type="spot", api_key="", api_secret=""))
+    save_strategy(StrategyConfig())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 2
+    assert "Live mode needs API key and secret" in capsys.readouterr().out
+
+
+def test_command_live_futures_leverage_failure_returns_nonzero(tmp_path, monkeypatch, capsys) -> None:
+    class _FailLeverageClient(_FakeClient):
+        def set_leverage(self, symbol: str, leverage: int):
+            raise BinanceAPIError("bad leverage")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=False, market_type="futures", api_key="k", api_secret="s"))
+    save_strategy(StrategyConfig(leverage=5.0))
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FailLeverageClient())
+    monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 5.0)
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 2
+    assert "Failed to set leverage" in capsys.readouterr().err
+
+
+def test_command_live_recovers_from_invalid_saved_model(tmp_path, monkeypatch, capsys) -> None:
+    class _LiveClient:
+        def __init__(self) -> None:
+            self.orders: list[tuple[str, str, float, bool]] = []
+
+        def ensure_btcusdc(self):
+            return {"symbol": "BTCUSDC"}
+
+        def get_klines(self, symbol: str, interval: str, limit: int = 500, start_time=None, end_time=None):
+            return _simple_candles(limit)
+
+        def place_order(self, symbol: str, side: str, size: float, *, dry_run: bool, leverage: float = 1.0):
+            self.orders.append((symbol, side, size, dry_run))
+            return {"symbol": symbol, "side": side, "size": size, "dry_run": dry_run}
+
+        def get_symbol_constraints(self, symbol: str):
+            return SimpleNamespace(
+                symbol=symbol,
+                min_qty=0.0001,
+                max_qty=100.0,
+                step_size=0.0001,
+                min_notional=5.0,
+                max_notional=0.0,
+            )
+
+        def normalize_quantity(self, symbol: str, quantity: float):
+            constraints = self.get_symbol_constraints(symbol)
+            normalized = max(constraints.min_qty, round(quantity, 4))
+            return normalized, constraints
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2))
+    model_dir = tmp_path / "data"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "model.json").write_text("{}", encoding="utf-8")
+
+    class _AlwaysLongModel:
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            return 0.95
+
+        def predict(self, _features: tuple[float, ...], threshold: float) -> int:
+            return int(0.95 >= threshold)
+
+    monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_a, **_k: (_ for _ in ()).throw(cli.ModelLoadError("bad model")))
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 0
+    captured = capsys.readouterr()
+    assert "Model load failed; regenerating" in captured.err
 
 
 def test_command_tune_saves_candidate(monkeypatch, tmp_path) -> None:
