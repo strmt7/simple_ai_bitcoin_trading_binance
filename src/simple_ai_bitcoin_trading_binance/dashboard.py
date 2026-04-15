@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,12 +18,13 @@ class DashboardSnapshot:
     notes: list[str]
 
 
-def _box(title: str, lines: list[str], *, width: int = 88) -> str:
-    inner = max(20, width - 4)
-    top = f"+- {title[: inner - 2].ljust(inner - 2, '-')} -+"
-    body = [f"| {line[:inner].ljust(inner)} |" for line in lines] or [f"| {'':{inner}} |"]
-    bottom = "+" + ("-" * (width - 2)) + "+"
-    return "\n".join([top, *body, bottom])
+def _section(title: str, lines: list[str], *, width: int) -> str:
+    inner = max(28, width - 2)
+    output = [title]
+    for line in lines or [""]:
+        wrapped = textwrap.wrap(str(line), width=inner, break_long_words=False, break_on_hyphens=False) or [""]
+        output.extend(f"  {item}" for item in wrapped)
+    return "\n".join(output)
 
 
 def _runtime_lines(runtime: dict[str, Any]) -> list[str]:
@@ -53,17 +55,21 @@ def _account_lines(lines: list[str]) -> list[str]:
     return lines or ["No account data loaded."]
 
 
-def render_dashboard(snapshot: DashboardSnapshot, *, width: int = 88) -> str:
+def render_dashboard(snapshot: DashboardSnapshot, *, width: int = 72) -> str:
     sections = [
-        _box("Runtime", _runtime_lines(snapshot.runtime), width=width),
-        _box("Strategy", _strategy_lines(snapshot.strategy), width=width),
-        _box("Account", _account_lines(snapshot.account_lines), width=width),
-        _box("Recent artifacts", _artifact_lines(snapshot.artifacts), width=width),
-        _box("Actions", [
-            "Use the interactive console actions and modal forms for all operator workflows.",
-            "Safe authenticated testnet execution is explicit; secrets stay redacted in visible output.",
-            *snapshot.notes,
-        ], width=width),
+        _section("Runtime", _runtime_lines(snapshot.runtime), width=width),
+        _section("Strategy", _strategy_lines(snapshot.strategy), width=width),
+        _section("Account", _account_lines(snapshot.account_lines), width=width),
+        _section("Recent artifacts", _artifact_lines(snapshot.artifacts), width=width),
+        _section(
+            "Actions",
+            [
+                "Use the interactive console actions and modal forms for all operator workflows.",
+                "Safe authenticated testnet execution is explicit; secrets stay redacted in visible output.",
+                *snapshot.notes,
+            ],
+            width=width,
+        ),
     ]
     return "\n\n".join(sections)
 

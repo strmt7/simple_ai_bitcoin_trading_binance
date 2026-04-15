@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import textwrap
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -103,24 +104,29 @@ class OperatorApp(App[int]):
         height: 1fr;
     }
     #actions {
-        width: 34;
+        width: 28;
         border: solid $primary;
     }
     #right {
         width: 1fr;
     }
+    #details {
+        height: 6;
+        border: solid $warning;
+        padding: 0 1;
+    }
     #preview {
         height: 1fr;
         border: solid $accent;
-        padding: 1;
+        padding: 0 1;
     }
     #status {
-        height: 3;
+        height: 1;
         border: solid $secondary;
         padding: 0 1;
     }
     #log {
-        height: 12;
+        height: 8;
         border: solid $success;
     }
     #prompt-dialog, #confirm-dialog {
@@ -146,7 +152,7 @@ class OperatorApp(App[int]):
         Binding("k", "cursor_up", "Up"),
     ]
 
-    def __init__(self, *, title_text: str, actions: list[TUIAction], snapshot_provider: Callable[[], str]) -> None:
+    def __init__(self, *, title_text: str, actions: list[TUIAction], snapshot_provider: Callable[..., str]) -> None:
         super().__init__()
         self.title = title_text
         self.actions_data = actions
@@ -156,9 +162,10 @@ class OperatorApp(App[int]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Horizontal(
-            OptionList(*[f"{action.key}. {action.title} — {action.description}" for action in self.actions_data], id="actions"),
+            OptionList(*[f"{action.key}. {action.title}" for action in self.actions_data], id="actions"),
             Vertical(
                 Static("", id="status"),
+                Static("", id="details"),
                 Static("", id="preview"),
                 RichLog(id="log", wrap=True, highlight=True, markup=False),
                 id="right",
@@ -170,7 +177,8 @@ class OperatorApp(App[int]):
     def on_mount(self) -> None:
         self.query_one("#actions", OptionList).highlighted = 0
         self.refresh_preview()
-        self.set_status(self._current_action().description)
+        self._update_action_details()
+        self.set_status("Ready")
 
     def set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
@@ -180,8 +188,25 @@ class OperatorApp(App[int]):
         for line in text.splitlines() or [""]:
             log.write(line)
 
+    def _update_action_details(self) -> None:
+        action = self._current_action()
+        details = self.query_one("#details", Static)
+        wrapped = textwrap.wrap(
+            action.description,
+            width=max(24, details.size.width - 4 if details.size.width else 52),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [action.description]
+        details.update("\n".join([action.title, *wrapped]))
+
     def refresh_preview(self) -> None:
-        self.query_one("#preview", Static).update(self.snapshot_provider())
+        preview = self.query_one("#preview", Static)
+        width = max(40, preview.size.width - 2 if preview.size.width else 70)
+        try:
+            rendered = self.snapshot_provider(width)
+        except TypeError:
+            rendered = self.snapshot_provider()
+        preview.update(rendered)
 
     def _current_action(self) -> TUIAction:
         option_list = self.query_one("#actions", OptionList)
@@ -220,12 +245,14 @@ class OperatorApp(App[int]):
     def action_cursor_down(self) -> None:
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_down()
-        self.set_status(self._current_action().description)
+        self._update_action_details()
+        self.set_status(self._current_action().title)
 
     def action_cursor_up(self) -> None:
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_up()
-        self.set_status(self._current_action().description)
+        self._update_action_details()
+        self.set_status(self._current_action().title)
 
     async def on_option_list_option_selected(self, _event: OptionList.OptionSelected) -> None:
         await self._execute_action(self._current_action())

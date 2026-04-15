@@ -24,6 +24,7 @@ class _FakeInput:
 class _FakeStatic:
     def __init__(self) -> None:
         self.value = ""
+        self.size = type("Size", (), {"width": 70})()
 
     def update(self, value: str) -> None:
         self.value = value
@@ -106,6 +107,7 @@ def test_operator_app_methods(monkeypatch) -> None:
     widgets = {
         "#actions": _FakeOptionList(),
         "#status": _FakeStatic(),
+        "#details": _FakeStatic(),
         "#preview": _FakeStatic(),
         "#log": _FakeRichLog(),
     }
@@ -124,14 +126,15 @@ def test_operator_app_methods(monkeypatch) -> None:
             TUIAction("1", "Sync", "sync description", sync_action),
             TUIAction("2", "Async", "async description", async_action),
         ],
-        snapshot_provider=lambda: "snapshot",
+        snapshot_provider=lambda _width=70: "snapshot",
     )
     monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
 
     assert list(app.compose())
     app.on_mount()
     assert widgets["#preview"].value == "snapshot"
-    assert widgets["#status"].value == "sync description"
+    assert widgets["#status"].value == "Ready"
+    assert widgets["#details"].value.startswith("Sync")
 
     asyncio.run(app._execute_action(app.actions_data[0]))
     assert "sync output" in widgets["#log"].lines
@@ -145,9 +148,9 @@ def test_operator_app_methods(monkeypatch) -> None:
     assert widgets["#status"].value == "Refreshed"
 
     app.action_cursor_down()
-    assert widgets["#status"].value == "async description"
+    assert widgets["#status"].value == "Async"
     app.action_cursor_up()
-    assert widgets["#status"].value == "sync description"
+    assert widgets["#status"].value == "Sync"
 
     asyncio.run(app.on_option_list_option_selected(object()))
     assert widgets["#status"].value == "Sync complete (1)"

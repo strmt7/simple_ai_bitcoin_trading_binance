@@ -655,7 +655,7 @@ def command_menu(_: argparse.Namespace) -> int:
     return launch_tui(
         title="simple-ai-trading interactive console",
         actions=_tui_actions(),
-        snapshot_provider=lambda: render_dashboard(_dashboard_snapshot(with_account=False)),
+        snapshot_provider=lambda width=72: render_dashboard(_dashboard_snapshot(with_account=False), width=width),
     )
 
 
