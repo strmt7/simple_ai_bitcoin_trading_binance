@@ -339,3 +339,15 @@ No roadmap item is considered done until:
 - associated docs are updated,
 - and the change is pushed with a short commit message including the milestone ID.
 
+
+## Current Iteration Snapshot
+
+- Completed (2026-04-15): Milestone B feature/model compatibility baseline
+  - Added explicit feature schema metadata (`FEATURE_VERSION`, `FEATURE_NAMES`) and helper `feature_dimension`.
+  - Added `StrategyConfig.feature_version` defaulting to current schema.
+  - Hardened `load_model` to require version/dimension/weight/stats consistency and raise `ModelLoadError` or `ModelFeatureMismatchError` on incompatibility.
+  - Updated CLI analytical commands to fail early on model incompatibility and live path to regenerate model on hard load failures.
+  - Updated test coverage for missing and mismatched model metadata paths and ensured expected JSON fixtures now include model schema version.
+
+- Next immediate step:
+  - Add drift/quality guards on feature row generation and persisted run metadata so incompatible feature windows/inputs are caught before training and trading loops.

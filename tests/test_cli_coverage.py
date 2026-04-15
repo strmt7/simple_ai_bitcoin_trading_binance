@@ -269,6 +269,7 @@ def test_command_evaluate_runs_with_model_file(tmp_path, monkeypatch) -> None:
             {
                 "weights": [0.1] + [0.0] * 12,
                 "bias": 0.01,
+                "feature_version": "v1",
                 "feature_dim": 13,
                 "epochs": 5,
                 "feature_means": [1.0] * 13,

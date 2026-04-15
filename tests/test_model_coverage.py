@@ -20,6 +20,7 @@ from simple_ai_bitcoin_trading_binance.model import (
     train,
     calibrate_threshold,
     evaluate_confusion,
+    ModelLoadError,
     load_model,
     walk_forward_report,
 )
@@ -160,7 +161,7 @@ def test_model_train_and_calibrate_edges() -> None:
     assert report["folds"] == len(report["scores"])
 
 
-def test_load_model_fill_defaults_for_missing_fields(tmp_path) -> None:
+def test_load_model_rejects_missing_feature_version(tmp_path) -> None:
     payload = tmp_path / "legacy_model.json"
     payload.write_text(
         """
@@ -175,11 +176,8 @@ def test_load_model_fill_defaults_for_missing_fields(tmp_path) -> None:
         """.strip(),
         encoding="utf-8",
     )
-    model = load_model(payload)
-    assert model.learning_rate == 0.05
-    assert model.l2_penalty == 1e-4
-    assert model.class_weight_pos == 1.0
-    assert model.class_weight_neg == 1.0
+    with pytest.raises(ModelLoadError, match="missing `feature_version`"):
+        load_model(payload)
 
 
 def test_evaluate_clamp_and_empty_inputs() -> None:

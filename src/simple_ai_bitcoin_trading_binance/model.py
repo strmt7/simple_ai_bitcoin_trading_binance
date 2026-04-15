@@ -9,11 +9,19 @@ from dataclasses import asdict, dataclass
 from statistics import mean, pstdev
 from typing import Iterable, List, Tuple
 
-from .features import ModelRow
+from .features import FEATURE_VERSION, feature_dimension, ModelRow
 
 
 def _clamp(x: float, low: float, high: float) -> float:
     return low if x < low else (high if x > high else x)
+
+
+class ModelLoadError(ValueError):
+    """Raised when a model artifact is invalid or incompatible."""
+
+
+class ModelFeatureMismatchError(ModelLoadError):
+    """Raised when feature metadata diverges between model and current runtime."""
 
 
 @dataclass
@@ -24,6 +32,7 @@ class TrainedModel:
     epochs: int
     feature_means: List[float]
     feature_stds: List[float]
+    feature_version: str = FEATURE_VERSION
     learning_rate: float = 0.05
     l2_penalty: float = 1e-4
     seed: int = 7
@@ -306,20 +315,56 @@ def serialize_model(model: TrainedModel, path) -> None:
     path.write_text(json.dumps(asdict(model), indent=2), encoding="utf-8")
 
 
-def load_model(path):
+def load_model(
+    path,
+    *,
+    expected_feature_version: str | None = FEATURE_VERSION,
+    expected_feature_dim: int | None = None,
+) -> TrainedModel:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    model_version = payload.get("feature_version")
+    if not isinstance(model_version, str) or not model_version:
+        raise ModelLoadError("Model metadata is missing `feature_version`; please retrain the model")
+
+    if expected_feature_version is not None and model_version != expected_feature_version:
+        raise ModelFeatureMismatchError(
+            f"Feature version mismatch: model={model_version} runtime={expected_feature_version}"
+        )
+
     dim = int(payload["feature_dim"])
     means = payload.get("feature_means")
     stds = payload.get("feature_stds")
-    if not means:
-        means = [0.0] * dim
-    if not stds:
-        stds = [1.0] * dim
+    if means is None:
+        raise ModelLoadError("Model payload missing feature_means")
+    if stds is None:
+        raise ModelLoadError("Model payload missing feature_stds")
+    if not isinstance(means, list) or not isinstance(stds, list):
+        raise ModelLoadError("Model payload feature stats must be arrays")
+
+    if len(means) != dim:
+        raise ModelLoadError("Model payload feature_dim does not match feature_means length")
+    if len(stds) != dim:
+        raise ModelLoadError("Model payload feature_dim does not match feature_stds length")
+
+    if expected_feature_dim is None:
+        expected_feature_dim = feature_dimension()
+    if dim != expected_feature_dim:
+        raise ModelFeatureMismatchError(
+            f"Feature dimension mismatch: model={dim} expected={expected_feature_dim}"
+        )
+
+    weights = payload.get("weights")
+    if not isinstance(weights, list):
+        raise ModelLoadError("Model payload missing weights")
+    if len(weights) != dim:
+        raise ModelLoadError("Model payload weights length does not match feature_dim")
+
     return TrainedModel(
-        weights=list(payload["weights"]),
+        weights=list(float(w) for w in weights),
         bias=float(payload["bias"]),
         feature_dim=dim,
         epochs=int(payload["epochs"]),
+        feature_version=str(model_version),
         feature_means=list(float(x) for x in means),
         feature_stds=list(float(x) for x in stds),
         learning_rate=float(payload.get("learning_rate", 0.05)),
