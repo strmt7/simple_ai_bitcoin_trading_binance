@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import argparse
 
-from simple_ai_bitcoin_trading_binance.cli import _build_order_notional, _effective_leverage, _target_notional, command_strategy
+from simple_ai_bitcoin_trading_binance.cli import (
+    _build_order_notional,
+    _build_live_model,
+    _effective_leverage,
+    _resolve_live_retrain_rows,
+    _target_notional,
+    command_strategy,
+)
 from simple_ai_bitcoin_trading_binance.config import load_strategy
 from simple_ai_bitcoin_trading_binance.api import SymbolConstraints
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
@@ -116,3 +123,78 @@ def test_command_strategy_updates_risk_and_rate_limits(tmp_path, monkeypatch) ->
     assert updated.risk_per_trade == 0.003
     assert updated.max_open_positions == 4
     assert updated.max_trades_per_day == 7
+
+
+def test_resolve_live_retrain_rows_handles_short_full_and_tail_windows() -> None:
+    rows = list(range(10))
+    assert _resolve_live_retrain_rows(rows[:3], retrain_window=5, retrain_min_rows=4) == []
+    assert _resolve_live_retrain_rows(rows[:5], retrain_window=5, retrain_min_rows=4) == rows[:5]
+    assert _resolve_live_retrain_rows(rows, retrain_window=4, retrain_min_rows=4) == rows[-4:]
+
+
+def test_build_live_model_respects_existing_model_and_retrain_cadence(monkeypatch) -> None:
+    cfg = StrategyConfig(training_epochs=100)
+    rows = list(range(12))
+    existing = object()
+
+    assert _build_live_model(
+        rows,
+        model=existing,
+        retrain_every=0,
+        step=5,
+        cfg=cfg,
+        retrain_window=10,
+        retrain_min_rows=4,
+    ) is existing
+
+    assert _build_live_model(
+        rows,
+        model=existing,
+        retrain_every=3,
+        step=4,
+        cfg=cfg,
+        retrain_window=10,
+        retrain_min_rows=4,
+    ) is existing
+
+    calls: list[tuple[list[int], int]] = []
+
+    def fake_train(train_rows, *, epochs: int):
+        calls.append((list(train_rows), epochs))
+        return {"trained": True}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.train", fake_train)
+    rebuilt = _build_live_model(
+        rows,
+        model=existing,
+        retrain_every=2,
+        step=4,
+        cfg=cfg,
+        retrain_window=5,
+        retrain_min_rows=4,
+    )
+    assert rebuilt == {"trained": True}
+    assert calls == [(rows[-5:], 40)]
+
+
+def test_build_live_model_returns_existing_when_rows_insufficient(monkeypatch) -> None:
+    cfg = StrategyConfig(training_epochs=50)
+    existing = object()
+    called = {"value": False}
+
+    def fake_train(*_args, **_kwargs):
+        called["value"] = True
+        return {"trained": True}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.train", fake_train)
+    rebuilt = _build_live_model(
+        [1, 2, 3],
+        model=existing,
+        retrain_every=1,
+        step=1,
+        cfg=cfg,
+        retrain_window=10,
+        retrain_min_rows=5,
+    )
+    assert rebuilt is existing
+    assert called["value"] is False
