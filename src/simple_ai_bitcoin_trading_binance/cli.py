@@ -171,58 +171,6 @@ def _build_client(runtime):
     )
 
 
-async def _ui_prompt_int(ui, label: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
-    while True:
-        raw = await ui.prompt(label, str(default))
-        try:
-            value = int(raw)
-        except ValueError:
-            ui.append_log("Enter a whole number.")
-            continue
-        if minimum is not None and value < minimum:
-            ui.append_log(f"Value must be >= {minimum}.")
-            continue
-        if maximum is not None and value > maximum:
-            ui.append_log(f"Value must be <= {maximum}.")
-            continue
-        return value
-
-
-async def _ui_prompt_float(
-    ui,
-    label: str,
-    default: float,
-    *,
-    minimum: float | None = None,
-    maximum: float | None = None,
-) -> float:
-    while True:
-        raw = await ui.prompt(label, str(default))
-        try:
-            value = float(raw)
-        except ValueError:
-            ui.append_log("Enter a numeric value.")
-            continue
-        if minimum is not None and value < minimum:
-            ui.append_log(f"Value must be >= {minimum}.")
-            continue
-        if maximum is not None and value > maximum:
-            ui.append_log(f"Value must be <= {maximum}.")
-            continue
-        return value
-
-
-async def _ui_prompt_bool(ui, label: str, default: bool) -> bool:
-    default_text = "yes" if default else "no"
-    while True:
-        raw = (await ui.prompt(f"{label} [yes/no]", default_text)).strip().lower()
-        if raw in {"y", "yes", "true", "1"}:
-            return True
-        if raw in {"n", "no", "false", "0"}:
-            return False
-        ui.append_log("Enter yes or no.")
-
-
 def _parse_form_bool(raw: str, default: bool) -> bool:
     token = raw.strip().lower()
     if token in {"y", "yes", "true", "1", "on"}:
@@ -257,48 +205,7 @@ def _parse_form_float(
     return value
 
 
-def _parse_feature_selection(raw: str, current: Sequence[str]) -> tuple[str, ...]:
-    candidate = raw.strip().lower()
-    if not candidate:
-        return tuple(current)
-    if candidate == "all":
-        return FEATURE_NAMES
-    selected = list(current)
-    for part in raw.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if token.isdigit():
-            index = int(token) - 1
-            if index < 0 or index >= len(FEATURE_NAMES):
-                raise ValueError(f"Feature index out of range: {token}")
-            name = FEATURE_NAMES[index]
-        else:
-            name = token
-            if name not in FEATURE_NAMES:
-                raise ValueError(f"Unknown feature: {token}")
-        if name in selected:
-            selected = [feature for feature in selected if feature != name]
-        else:
-            selected.append(name)
-    return normalize_enabled_features(selected)
-
-
-async def _ui_prompt_feature_selection(ui, current: Sequence[str]) -> tuple[str, ...]:
-    lines = ["Toggle features by number or name, comma-separated. Use 'all' to enable every feature."]
-    enabled = set(current)
-    for index, name in enumerate(FEATURE_NAMES, start=1):
-        marker = "x" if name in enabled else " "
-        lines.append(f"{index:>2}. [{marker}] {name}")
-    while True:
-        raw = await ui.prompt("\n".join(lines), "")
-        try:
-            return _parse_feature_selection(raw, current)
-        except ValueError as exc:
-            ui.append_log(str(exc))
-
-
-async def _ui_prompt_runtime(ui, current) -> object:
+async def _ui_edit_runtime(ui, current) -> object:
     from .tui import FormField
 
     payload = await ui.form(
@@ -344,10 +251,40 @@ async def _ui_prompt_runtime(ui, current) -> object:
     )
 
 
-async def _ui_prompt_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
+async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
     from .tui import FormField
 
-    enabled_features = await _ui_prompt_feature_selection(ui, cfg.enabled_features)
+    selected_features = await ui.multi_select(
+        "Model feature selection",
+        list(FEATURE_NAMES),
+        list(cfg.enabled_features),
+        help_text="Space toggles a feature. Save commits the selection used during retraining.",
+    )
+    if selected_features is None:
+        return argparse.Namespace(
+            leverage=None,
+            risk=None,
+            max_position=None,
+            stop=None,
+            take=None,
+            cooldown=None,
+            max_open=None,
+            max_trades_per_day=None,
+            signal_threshold=None,
+            max_drawdown=None,
+            taker_fee_bps=None,
+            slippage_bps=None,
+            label_threshold=None,
+            model_lookback=None,
+            training_epochs=None,
+            confidence_beta=None,
+            feature_window_short=None,
+            feature_window_long=None,
+            set_features=None,
+            enable_feature=None,
+            disable_feature=None,
+        )
+    enabled_features = normalize_enabled_features(selected_features)
     payload = await ui.form(
         "Strategy settings",
         [
@@ -427,20 +364,6 @@ async def _ui_prompt_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespac
     )
 
 
-async def _ui_prompt_tune_window(ui) -> tuple[int | None, str | None, str | None]:
-    while True:
-        mode = (await ui.prompt("Tune window [all/lookback/range]", "all")).strip().lower()
-        if mode in {"", "all"}:
-            return None, None, None
-        if mode == "lookback":
-            return await _ui_prompt_int(ui, "Lookback days", 30, minimum=1), None, None
-        if mode == "range":
-            from_date = (await ui.prompt("From date YYYY-MM-DD", "")).strip() or None
-            to_date = (await ui.prompt("To date YYYY-MM-DD", "")).strip() or None
-            return None, from_date, to_date
-        ui.append_log("Choose all, lookback, or range.")
-
-
 def _recent_artifacts(*, base_dir: Path = Path("data"), limit: int = 8) -> list[Path]:
     if not base_dir.exists():
         return []
@@ -511,7 +434,7 @@ def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
         runtime=runtime.public_dict(),
         strategy=strategy.asdict(),
         artifacts=[_artifact_summary(path) for path in _recent_artifacts()],
-        account_lines=_account_overview_lines(runtime) if with_account else ["Account lookup skipped for this refresh cycle."],
+        account_lines=_account_overview_lines(runtime) if with_account else ["Load Account or Connect to fetch balances."],
         notes=notes,
     )
 
@@ -529,6 +452,7 @@ def _tui_actions():
                     "Operator help",
                     "- Start with Runtime settings to enter API credentials securely.",
                     "- Run Connect before any data, training, or live action.",
+                    "- Use Tab and Shift+Tab to move between workspace panels or modal controls.",
                     "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest.",
                     "- Use Paper loop before Testnet loop.",
                     "- Spot roundtrip is the smallest authenticated execution check.",
@@ -541,7 +465,7 @@ def _tui_actions():
     async def _runtime(ui):
         current = load_runtime()
         try:
-            next_runtime = await _ui_prompt_runtime(ui, current)
+            next_runtime = await _ui_edit_runtime(ui, current)
         except ValueError as exc:
             print(f"Runtime settings invalid: {exc}", file=sys.stderr)
             return 2
@@ -560,7 +484,7 @@ def _tui_actions():
 
     async def _strategy(ui):
         try:
-            args = await _ui_prompt_strategy_args(ui, load_strategy())
+            args = await _ui_edit_strategy_args(ui, load_strategy())
         except ValueError as exc:
             print(f"Strategy settings invalid: {exc}", file=sys.stderr)
             return 2
@@ -915,7 +839,20 @@ def _tui_actions():
         if not await ui.confirm("Place a minimal BUY then SELL on spot testnet?"):
             print("Spot test order cancelled.")
             return 0
-        quantity = await _ui_prompt_float(ui, "Roundtrip quantity", 0.00008, minimum=0.00001)
+        payload = await ui.form(
+            "Spot roundtrip",
+            [
+                FormField("quantity", "Order quantity", "0.00008"),
+            ],
+        )
+        if payload is None:
+            print("Spot test order cancelled.")
+            return 0
+        try:
+            quantity = _parse_form_float(payload["quantity"], label="Order quantity", default=0.00008, minimum=0.00001)
+        except ValueError as exc:
+            print(f"Spot roundtrip settings invalid: {exc}", file=sys.stderr)
+            return 2
         runtime = load_runtime()
         if runtime.market_type != "spot":
             print("Spot test order is only available when runtime.market_type=spot.")

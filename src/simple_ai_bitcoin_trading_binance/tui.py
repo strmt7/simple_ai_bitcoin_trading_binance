@@ -13,7 +13,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, OptionList, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import Button, Input, Label, OptionList, RichLog, SelectionList, Static, TabbedContent, TabPane
 
 
 @dataclass(frozen=True)
@@ -32,39 +32,9 @@ class FormField:
     password: bool = False
 
 
-class PromptScreen(ModalScreen[str | None]):
-    def __init__(self, label: str, default: str = "", *, password: bool = False) -> None:
-        super().__init__()
-        self.label = label
-        self.default = default
-        self.password = password
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label(self.label, id="prompt-label"),
-            Input(value=self.default, password=self.password, id="prompt-input"),
-            Horizontal(
-                Button("Submit", variant="primary", id="submit"),
-                Button("Cancel", id="cancel"),
-                id="prompt-buttons",
-            ),
-            id="prompt-dialog",
-        )
-
-    def on_mount(self) -> None:
-        self.query_one("#prompt-input", Input).focus()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "submit":
-            self.dismiss(self.query_one("#prompt-input", Input).value)
-        else:
-            self.dismiss(None)
-
-
 class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [Binding("escape", "dismiss_false", "Cancel", show=False)]
+
     def __init__(self, message: str) -> None:
         super().__init__()
         self.message = message
@@ -83,8 +53,13 @@ class ConfirmScreen(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm")
 
+    def action_dismiss_false(self) -> None:
+        self.dismiss(False)
+
 
 class FormScreen(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [Binding("escape", "dismiss_none", "Cancel", show=False)]
+
     def __init__(self, title: str, fields: list[FormField]) -> None:
         super().__init__()
         self.title_text = title
@@ -139,24 +114,89 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
         else:
             self.dismiss(None)
 
+    def action_dismiss_none(self) -> None:
+        self.dismiss(None)
+
+
+class MultiSelectScreen(ModalScreen[list[str] | None]):
+    BINDINGS = [Binding("escape", "dismiss_none", "Cancel", show=False)]
+
+    def __init__(
+        self,
+        title: str,
+        options: list[str],
+        selected: list[str] | tuple[str, ...],
+        *,
+        help_text: str = "",
+    ) -> None:
+        super().__init__()
+        self.title_text = title
+        self.options = options
+        self.selected = set(selected)
+        self.help_text = help_text
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label(self.title_text, id="feature-title"),
+            Label(
+                self.help_text or "Use space to toggle an item. Save applies the current selection.",
+                id="feature-help",
+            ),
+            SelectionList(
+                *[(option, option, option in self.selected) for option in self.options],
+                id="feature-list",
+            ),
+            Horizontal(
+                Button("All", id="all"),
+                Button("None", id="none"),
+                Button("Save", variant="primary", id="save"),
+                Button("Cancel", id="cancel"),
+                id="feature-buttons",
+            ),
+            id="feature-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#feature-list", SelectionList).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        selection_list = self.query_one("#feature-list", SelectionList)
+        if event.button.id == "all":
+            selection_list.select_all()
+            return
+        if event.button.id == "none":
+            selection_list.deselect_all()
+            return
+        if event.button.id == "save":
+            self.dismiss([str(value) for value in selection_list.selected])
+            return
+        self.dismiss(None)
+
+    def action_dismiss_none(self) -> None:
+        self.dismiss(None)
+
 
 class TerminalUI:
     def __init__(self, app: "OperatorApp") -> None:
         self.app = app
-
-    async def prompt(self, label: str, default: str = "") -> str:
-        value = await self.app.push_screen_wait(PromptScreen(label, default))
-        return default if value is None else str(value).strip() or default
-
-    async def secret(self, label: str, default: str = "") -> str:
-        value = await self.app.push_screen_wait(PromptScreen(label, default, password=True))
-        return default if value is None else str(value).strip()
 
     async def confirm(self, message: str) -> bool:
         return bool(await self.app.push_screen_wait(ConfirmScreen(message)))
 
     async def form(self, title: str, fields: list[FormField]) -> dict[str, str] | None:
         return await self.app.push_screen_wait(FormScreen(title, fields))
+
+    async def multi_select(
+        self,
+        title: str,
+        options: list[str],
+        selected: list[str] | tuple[str, ...],
+        *,
+        help_text: str = "",
+    ) -> list[str] | None:
+        return await self.app.push_screen_wait(
+            MultiSelectScreen(title, options, selected, help_text=help_text)
+        )
 
     def append_log(self, text: str) -> None:
         self.app.append_log(text)
@@ -166,54 +206,110 @@ class OperatorApp(App[int]):
     CSS = """
     Screen {
         layout: vertical;
+        background: #081018;
+        color: #dbe8f2;
+    }
+    #titlebar {
+        dock: top;
+        height: 1;
+        padding: 0 1;
+        background: #0d1822;
+        color: #f4fbff;
+        text-style: bold;
     }
     #body {
         height: 1fr;
+        padding: 1;
     }
     #actions {
         width: 24;
-        min-width: 22;
-        border: tall $primary;
-        background: $surface;
+        min-width: 24;
+        border: tall #193243;
+        background: #0d1822;
+        color: #dbe8f2;
+        padding: 0 1;
+    }
+    #actions > .option-list--option {
+        color: #9fb4c4;
+        padding: 0 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    #actions > .option-list--option-highlighted {
+        background: #153042;
+        color: #f4fbff;
+        text-style: bold;
+    }
+    #actions:focus {
+        border: tall #2ea7a0;
+    }
+    #actions:focus > .option-list--option-highlighted {
+        background: #0f766e;
+        color: #faffff;
+        text-style: bold;
     }
     #right {
         width: 1fr;
+        padding-left: 1;
     }
     #status {
         height: 2;
-        border: solid $secondary;
+        border: tall #193243;
+        background: #0d1822;
         padding: 0 1;
         content-align: left middle;
+        color: #dbe8f2;
     }
     #workspace {
         height: 1fr;
-        border: solid $accent;
+        border: tall #193243;
+        background: #0b141d;
+    }
+    #workspace > ContentTabs {
+        height: 3;
+        background: #0d1822;
+    }
+    #workspace > ContentTabs Tab {
+        padding: 0 2;
+        color: #86a0b4;
+        text-style: bold;
+    }
+    #workspace > ContentTabs Tab.-active {
+        color: #f4fbff;
+        background: #153042;
     }
     #details, #preview, #log {
         height: 1fr;
-        padding: 0 1;
+        padding: 1 2;
+        color: #dbe8f2;
     }
     #log {
         border: none;
+        background: #081018;
     }
-    #prompt-dialog, #confirm-dialog, #form-dialog {
+    #confirm-dialog, #form-dialog, #feature-dialog {
         width: 72;
         height: auto;
         padding: 1 2;
-        border: heavy $primary;
-        background: $panel;
+        border: heavy #2ea7a0;
+        background: #0b141d;
         align: center middle;
     }
-    #prompt-buttons, #confirm-buttons, #form-buttons {
+    #confirm-buttons, #form-buttons, #feature-buttons {
         height: auto;
         align-horizontal: right;
         padding-top: 1;
     }
-    #form-title {
+    #form-title, #feature-title, #confirm-label {
         padding-bottom: 1;
         text-style: bold;
+        color: #f4fbff;
     }
-    #form-fields {
+    #feature-help {
+        padding-bottom: 1;
+        color: #9fb4c4;
+    }
+    #form-fields, #feature-list {
         max-height: 18;
     }
     .form-row {
@@ -221,6 +317,74 @@ class OperatorApp(App[int]):
     }
     .form-label {
         padding-bottom: 0;
+        color: #9fb4c4;
+    }
+    Input {
+        border: tall #29475d;
+        background: #081018;
+        color: #e7f0f7;
+    }
+    Input:focus {
+        border: tall #2ea7a0;
+        background: #0d1822;
+        color: #ffffff;
+    }
+    Button {
+        min-width: 12;
+        background: #142230;
+        color: #e7f0f7;
+        border: tall #29475d;
+        text-style: bold;
+    }
+    Button:hover {
+        background: #193243;
+        border: tall #3a617c;
+    }
+    Button:focus {
+        background: #1f3242;
+        border: tall #2ea7a0;
+        color: #ffffff;
+    }
+    Button.-primary {
+        background: #0f766e;
+        border: tall #2ea7a0;
+        color: #f8fffe;
+    }
+    Button.-error {
+        background: #7f1d1d;
+        border: tall #ef4444;
+        color: #fff7f7;
+    }
+    #feature-list {
+        border: tall #193243;
+        background: #081018;
+        padding: 0 1;
+    }
+    #feature-list:focus {
+        border: tall #2ea7a0;
+    }
+    #feature-list > .selection-list--button {
+        color: #9fb4c4;
+        background: #081018;
+    }
+    #feature-list > .selection-list--button-highlighted {
+        color: #f4fbff;
+        background: #153042;
+    }
+    #feature-list > .selection-list--button-selected {
+        color: #7ce0c9;
+        background: #081018;
+    }
+    #feature-list > .selection-list--button-selected-highlighted {
+        color: #f8fffe;
+        background: #0f766e;
+    }
+    #footerbar {
+        dock: bottom;
+        height: 1;
+        padding: 0 1;
+        background: #0d1822;
+        color: #9fb4c4;
     }
     """
 
@@ -230,6 +394,10 @@ class OperatorApp(App[int]):
         Binding("enter", "run_selected", "Run"),
         Binding("j", "cursor_down", "Down"),
         Binding("k", "cursor_up", "Up"),
+        Binding("tab", "next_workspace", "Panel", show=True, priority=True),
+        Binding("shift+tab", "previous_workspace", "Back", show=False, priority=True),
+        Binding("left", "previous_workspace", "", show=False),
+        Binding("right", "next_workspace", "", show=False),
     ]
 
     def __init__(self, *, title_text: str, actions: list[TUIAction], snapshot_provider: Callable[..., str]) -> None:
@@ -240,7 +408,7 @@ class OperatorApp(App[int]):
         self.controller = TerminalUI(self)
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Static(self.title, id="titlebar")
         with Horizontal(id="body"):
             yield OptionList(*[action.title for action in self.actions_data], id="actions")
             with Vertical(id="right"):
@@ -252,7 +420,7 @@ class OperatorApp(App[int]):
                         yield Static("", id="preview")
                     with TabPane("Activity", id="panel-activity"):
                         yield RichLog(id="log", wrap=True, highlight=True, markup=False)
-        yield Footer()
+        yield Static("Enter run  Tab panel  j/k move  Space toggle  q quit", id="footerbar")
 
     def on_mount(self) -> None:
         self.query_one("#actions", OptionList).highlighted = 0
@@ -275,6 +443,20 @@ class OperatorApp(App[int]):
         except Exception:
             return
 
+    def _modal_open(self) -> bool:
+        return len(self.screen_stack) > 1
+
+    def _workspace_ids(self) -> list[str]:
+        return ["panel-action", "panel-overview", "panel-activity"]
+
+    def _workspace_label(self, panel_id: str) -> str:
+        labels = {
+            "panel-action": "Action",
+            "panel-overview": "Overview",
+            "panel-activity": "Activity",
+        }
+        return labels.get(panel_id, panel_id)
+
     def _update_action_details(self) -> None:
         action = self._current_action()
         details = self.query_one("#details", Static)
@@ -284,7 +466,7 @@ class OperatorApp(App[int]):
             break_long_words=False,
             break_on_hyphens=False,
         ) or [action.description]
-        details.update("\n".join([action.title, "", *wrapped, "", "Press Enter to run."]))
+        details.update("\n".join([action.title, "", *wrapped, "", "Enter runs the action.", "Tab switches the workspace panel."]))
 
     def refresh_preview(self) -> None:
         preview = self.query_one("#preview", Static)
@@ -324,14 +506,20 @@ class OperatorApp(App[int]):
         self.set_status(f"{action.title} complete ({result})")
 
     async def action_run_selected(self) -> None:
+        if self._modal_open():
+            return
         await self._execute_action(self._current_action())
 
     def action_refresh_preview(self) -> None:
+        if self._modal_open():
+            return
         self.refresh_preview()
         self._activate_workspace("panel-overview")
         self.set_status("Refreshed")
 
     def action_cursor_down(self) -> None:
+        if self._modal_open():
+            return
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_down()
         self._update_action_details()
@@ -339,11 +527,35 @@ class OperatorApp(App[int]):
         self.set_status(self._current_action().title)
 
     def action_cursor_up(self) -> None:
+        if self._modal_open():
+            return
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_up()
         self._update_action_details()
         self._activate_workspace("panel-action")
         self.set_status(self._current_action().title)
+
+    def action_next_workspace(self) -> None:
+        if self._modal_open():
+            self.screen.focus_next()
+            return
+        workspace = self.query_one("#workspace", TabbedContent)
+        ids = self._workspace_ids()
+        current = workspace.active or ids[0]
+        next_id = ids[(ids.index(current) + 1) % len(ids)]
+        self._activate_workspace(next_id)
+        self.set_status(f"Panel: {self._workspace_label(next_id)}")
+
+    def action_previous_workspace(self) -> None:
+        if self._modal_open():
+            self.screen.focus_previous()
+            return
+        workspace = self.query_one("#workspace", TabbedContent)
+        ids = self._workspace_ids()
+        current = workspace.active or ids[0]
+        next_id = ids[(ids.index(current) - 1) % len(ids)]
+        self._activate_workspace(next_id)
+        self.set_status(f"Panel: {self._workspace_label(next_id)}")
 
     async def on_option_list_option_selected(self, _event: OptionList.OptionSelected) -> None:
         await self._execute_action(self._current_action())

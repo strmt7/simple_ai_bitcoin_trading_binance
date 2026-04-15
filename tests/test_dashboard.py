@@ -38,11 +38,10 @@ def test_render_dashboard_includes_all_sections() -> None:
         notes=["note a", "note b"],
     )
     text = render_dashboard(snapshot)
-    assert "Runtime" in text
-    assert "Strategy" in text
+    assert "Session" in text
+    assert "Model" in text
     assert "Account" in text
     assert "Recent artifacts" in text
-    assert "Actions" in text
     assert "BTCUSDC" in text
     assert "note a" in text
 
