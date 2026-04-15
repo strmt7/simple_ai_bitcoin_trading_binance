@@ -31,6 +31,10 @@ simple-ai-trading backtest
 simple-ai-trading live --steps 10 --sleep 5
 ```
 
+```bash
+simple-ai-trading evaluate --input data/historical_btcusdc.json --model data/model.json --calibrate-threshold
+```
+
 By default data is stored under `data/historical_btcusdc.json` and `data/model.json`.
 
 If your shell does not source the console entrypoint, run with `PYTHONPATH=src`:
@@ -67,7 +71,15 @@ Builds feature rows from historical candles and trains a pure-stdlib logistic mo
 ### `backtest`
 
 Runs a conservative backtest against cached data with stop-loss / take-profit risk limits, fees, and drawdown tracking.
-- Reports fee totals and max exposure.
+- Reports fee totals, max exposure, and whether the run terminated by drawdown limit.
+- Backtests now track if the run was terminated early by the drawdown cap, allowing strategy tuning to reject unstable parameter sets.
+
+### `evaluate`
+
+Evaluates a saved model against cached candles.
+- `--threshold` forces a custom decision boundary.
+- `--calibrate-threshold` runs an F1 sweep on the validation tail.
+- Prints accuracy, precision, recall, F1, and confusion counts for transparency.
 
 ### `connect`
 
@@ -79,6 +91,22 @@ Checks exchange connectivity, validates BTCUSDC availability on the selected mar
 Runs a real-time loop that continuously re-trains on a rolling window and executes paper or live orders.
 - `--paper` forces dry-run execution even when runtime is set to live.
 - Spot mode always executes at 1x. Futures mode uses configured leverage (clamped by exchange leverage bracket when credentials are present).
+- `--leverage` overrides leverage for the current run in futures mode.
+
+Leverage details:
+- spot mode always runs at 1x.
+- futures mode can use 1x–125x and is capped by exchange bracket values when credentials are available.
+- `paper` mode is paper-only, even on futures.
+
+If you want to test multiple leverage scenarios without changing persisted strategy settings, pass `--leverage` directly to `live` each run.
+
+### `tune`
+
+The tune command runs a constrained grid search over risk and execution parameters and chooses candidates based on:
+- realized PnL minus fees
+- penalties for excessive drawdown
+- hard rejection of runs that hit the drawdown limit
+- trade activity floor (to avoid selecting no-trade candidates)
 
 ### `strategy`
 

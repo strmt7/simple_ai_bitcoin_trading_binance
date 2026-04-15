@@ -20,6 +20,7 @@ class BacktestResult:
     closed_trades: int
     gross_exposure: float
     total_fees: float
+    stopped_by_drawdown: bool
     max_exposure: float
     trades_per_day_cap_hit: int
 
@@ -79,6 +80,7 @@ def run_backtest(
             win_rate=0.0,
             trades=0,
             max_drawdown=0.0,
+            stopped_by_drawdown=False,
             closed_trades=0,
             gross_exposure=0.0,
             total_fees=0.0,
@@ -89,6 +91,7 @@ def run_backtest(
     cash = float(starting_cash)
     equity_peak = cash
     max_drawdown = 0.0
+    stopped_by_drawdown = False
     wins = 0
     closed_trades = 0
     total_fees = 0.0
@@ -96,7 +99,6 @@ def run_backtest(
     cap_hits = 0
 
     position_side = 0
-    open_positions = 0
     notional = 0.0
     qty = 0.0
     entry_price = 0.0
@@ -114,6 +116,8 @@ def run_backtest(
     if max_daily <= 0:
         max_daily = None
 
+    max_open_positions = int(cfg.max_open_positions)
+
     for row in rows:
         score = model.predict_proba(row.features)
         signal = _normalize_market_direction(score, cfg, market_type)
@@ -122,16 +126,10 @@ def run_backtest(
         if day not in daily_trade_count:
             daily_trade_count[day] = 0
         trade_cap_reached = max_daily is not None and daily_trade_count[day] >= max_daily
-        max_open_positions = max(1, int(cfg.max_open_positions))
-
         if position_side == 0 and signal != 0:
             if trade_cap_reached:
                 cap_hits += 1
                 continue
-            if open_positions >= max_open_positions:
-                cap_hits += 1
-                continue
-
             gross = cash * cfg.risk_per_trade * leverage
             if market_type == "spot":
                 gross = min(gross, cash * cfg.max_position_pct)
@@ -142,6 +140,10 @@ def run_backtest(
                 effective_margin = gross / leverage
 
             if gross <= 0 or effective_margin >= cash:
+                continue
+
+            if max_open_positions <= 0:
+                cap_hits += 1
                 continue
 
             side_sign = 1 if signal > 0 else -1
@@ -161,7 +163,6 @@ def run_backtest(
             qty = abs(gross / entry)
             entry_price = entry
             margin_used = effective_margin
-            open_positions = 1
 
             max_exposure = max(max_exposure, abs(notional))
 
@@ -192,13 +193,11 @@ def run_backtest(
                 if realized > 0:
                     wins += 1
 
-                if position_side != 0:
-                    notional = 0.0
-                    qty = 0.0
-                    entry_price = 0.0
-                    margin_used = 0.0
-                    position_side = 0
-                    open_positions = 0
+                position_side = 0
+                notional = 0.0
+                qty = 0.0
+                entry_price = 0.0
+                margin_used = 0.0
 
         if trade_cap_reached and position_side == 0:
             continue
@@ -220,6 +219,7 @@ def run_backtest(
             max_drawdown = dd
 
         if cfg.max_drawdown_limit > 0.0 and dd >= cfg.max_drawdown_limit:
+            stopped_by_drawdown = True
             break
 
     # force close residual position at final mark
@@ -238,13 +238,16 @@ def run_backtest(
         closed_trades += 1
         if final_realized > 0:
             wins += 1
+        position_side = 0
+        notional = 0.0
+        qty = 0.0
+        entry_price = 0.0
+        margin_used = 0.0
 
     realized_pnl = cash - starting_cash
     win_rate = wins / closed_trades if closed_trades else 0.0
 
     trades = closed_trades
-    if position_side != 0:
-        trades += 1
 
     return BacktestResult(
         starting_cash=starting_cash,
@@ -253,8 +256,9 @@ def run_backtest(
         win_rate=win_rate,
         trades=trades,
         max_drawdown=max_drawdown,
+        stopped_by_drawdown=stopped_by_drawdown,
         closed_trades=closed_trades,
-        gross_exposure=abs(notional),
+        gross_exposure=max_exposure,
         total_fees=total_fees,
         max_exposure=max_exposure,
         trades_per_day_cap_hit=cap_hits,
