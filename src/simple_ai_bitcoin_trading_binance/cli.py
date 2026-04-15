@@ -12,7 +12,7 @@ from typing import Iterable, Sequence
 from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
-from .features import make_rows
+from .features import feature_signature, make_rows
 from .api import SymbolConstraints
 from .model import (
     calibrate_threshold,
@@ -52,6 +52,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_train.add_argument("--input", default="data/historical_btcusdc.json")
     parser_train.add_argument("--output", default="data/model.json")
     parser_train.add_argument("--epochs", type=int, default=250)
+    parser_train.add_argument("--seed", type=int, default=7)
     parser_train.add_argument("--walk-forward", action="store_true", help="run walk-forward validation before final training")
     parser_train.add_argument("--walk-forward-train", type=int, default=300)
     parser_train.add_argument("--walk-forward-test", type=int, default=60)
@@ -189,6 +190,17 @@ def _rows_from_json(path: str):
     return rows
 
 
+def _artifact_path(kind: str, *, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{kind}_run_{int(time.time() * 1_000_000)}.json"
+
+
+def _persist_run_artifact(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+    path = _artifact_path(kind, output_dir=output_dir)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
     return make_rows(
         candles,
@@ -230,9 +242,16 @@ def _resolve_symbol_constraints(runtime, client) -> SymbolConstraints | None:
 
 
 def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
+    strategy_signature = feature_signature(
+        strategy.feature_windows[0],
+        strategy.feature_windows[1],
+        strategy.label_threshold,
+        feature_version=strategy.feature_version,
+    )
     return load_model(
         model_path,
         expected_feature_version=strategy.feature_version,
+        expected_feature_signature=strategy_signature,
         expected_feature_dim=None,
     )
 
@@ -532,6 +551,9 @@ def command_train(args: argparse.Namespace) -> int:
         print("No rows produced. Fetch more data or increase lookback.")
         return 2
 
+    wf = None
+    seed = int(getattr(args, "seed", 7))
+
     if args.walk_forward:
         try:
             wf = walk_forward_report(
@@ -551,15 +573,28 @@ def command_train(args: argparse.Namespace) -> int:
                 print(
                     "walk-forward fold scores: "
                     + ", ".join(f"{float(v):.3f}" for v in folds)
-                )
+            )
         except ValueError as exc:
             print(f"walk-forward unavailable: {exc}")
+            wf = None
+
+    model_signature = feature_signature(
+        cfg.feature_windows[0],
+        cfg.feature_windows[1],
+        cfg.label_threshold,
+        feature_version=cfg.feature_version,
+    )
 
     split = max(2, int(len(rows) * 0.8))
     train_rows = rows[:split]
     test_rows = rows[split:]
 
-    model = train(train_rows, epochs=args.epochs)
+    model = train(
+        train_rows,
+        epochs=args.epochs,
+        seed=seed,
+        feature_signature=model_signature,
+    )
     threshold = cfg.signal_threshold
     if args.calibrate_threshold and test_rows:
         threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
@@ -576,8 +611,45 @@ def command_train(args: argparse.Namespace) -> int:
     if args.calibrate_threshold and test_rows:
         print(f"validated threshold: {threshold:.3f}")
         print(f"out-of-sample directional accuracy (calibrated): {tuned_score:.3f}")
+    artifact = {
+        "command": "train",
+        "timestamp": int(time.time()),
+        "seed": int(seed),
+        "runtime": runtime.asdict(),
+        "strategy": cfg.asdict(),
+        "train": {
+            "input": str(args.input),
+            "output": str(args.output),
+            "rows_total": len(rows),
+            "rows_train": len(train_rows),
+            "rows_test": len(test_rows),
+            "epochs": int(args.epochs),
+            "lookback_windows": list(cfg.feature_windows),
+            "label_threshold": float(cfg.label_threshold),
+            "walk_forward": bool(args.walk_forward),
+        },
+        "walk_forward": wf if wf is not None else None,
+        "metrics": {
+            "in_sample_accuracy": float(train_score),
+            "out_of_sample_accuracy": float(test_score),
+            "threshold": float(threshold),
+            "tuned_threshold": float(tuned_score) if args.calibrate_threshold and test_rows else float(test_score),
+            "model_feature_version": model.feature_version,
+            "model_feature_signature": model.feature_signature,
+        },
+        "model": {
+            "path": str(args.output),
+            "feature_dim": int(model.feature_dim),
+            "feature_version": str(model.feature_version),
+            "feature_signature": model.feature_signature,
+        },
+        "market": runtime.market_type,
+        "symbol": runtime.symbol,
+    }
     resolved_leverage = _resolve_futures_leverage(runtime, cfg)
     print(f"market={runtime.market_type} leverage={resolved_leverage:.2f}")
+    artifact_path = _persist_run_artifact("train", Path(args.output).parent, artifact)
+    print(f"saved train artifact to {artifact_path}")
     return 0
 
 
@@ -690,6 +762,33 @@ def command_backtest(args: argparse.Namespace) -> int:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
     result = run_backtest(rows, model, cfg, starting_cash=args.start_cash, market_type=runtime.market_type)
+    artifact = {
+        "command": "backtest",
+        "timestamp": int(time.time()),
+        "runtime": runtime.asdict(),
+        "strategy": cfg.asdict(),
+        "input": str(args.input),
+        "model": str(model_path),
+        "starting_cash": float(args.start_cash),
+        "rows": len(rows),
+        "market": runtime.market_type,
+        "symbol": runtime.symbol,
+        "result": {
+            "trades": int(result.trades),
+            "win_rate": float(result.win_rate),
+            "realized_pnl": float(result.realized_pnl),
+            "fees": float(result.total_fees),
+            "max_exposure": float(result.max_exposure),
+            "ending_cash": float(result.ending_cash),
+            "max_drawdown": float(result.max_drawdown),
+            "stopped_by_drawdown": bool(result.stopped_by_drawdown),
+            "trades_per_day_cap_hit": int(result.trades_per_day_cap_hit),
+            "closed_trades": int(result.closed_trades),
+            "gross_exposure": float(result.gross_exposure),
+        },
+    }
+    _persist_run_artifact("backtest", model_path.parent, artifact)
+
     print(f"backtest BTCUSDC ({runtime.symbol})")
     print(f"market: {runtime.market_type}")
     print(f"trades: {result.trades}")
@@ -721,6 +820,7 @@ def _tune_score(result: object, starting_cash: float = 1000.0) -> float:
 
 def command_evaluate(args: argparse.Namespace) -> int:
     cfg = load_strategy()
+    runtime = load_runtime()
     rows = _build_model_rows(_rows_from_json(args.input), cfg)
     if not rows:
         print("No rows available for evaluation. Fetch more data first.")
@@ -752,6 +852,45 @@ def command_evaluate(args: argparse.Namespace) -> int:
 
     report = evaluate_classification(test_rows if test_rows else rows, model, threshold=threshold)
     train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
+    artifact = {
+        "command": "evaluate",
+        "timestamp": int(time.time()),
+        "runtime": runtime.asdict(),
+        "strategy": cfg.asdict(),
+        "input": str(args.input),
+        "model": str(args.model),
+        "market": runtime.market_type,
+        "symbol": runtime.symbol,
+        "split": {
+            "train_rows": len(train_rows),
+            "test_rows": len(test_rows),
+        },
+        "threshold": float(report.threshold),
+        "calibrated": bool(args.calibrate_threshold),
+        "rows": {
+            "train": {
+                "accuracy": float(train_report.accuracy) if train_report is not None else 0.0,
+                "precision": float(train_report.precision) if train_report is not None else 0.0,
+                "recall": float(train_report.recall) if train_report is not None else 0.0,
+                "f1": float(train_report.f1) if train_report is not None else 0.0,
+                "true_positive": int(train_report.true_positive) if train_report is not None else 0,
+                "false_positive": int(train_report.false_positive) if train_report is not None else 0,
+                "true_negative": int(train_report.true_negative) if train_report is not None else 0,
+                "false_negative": int(train_report.false_negative) if train_report is not None else 0,
+            },
+            "test": {
+                "accuracy": float(report.accuracy),
+                "precision": float(report.precision),
+                "recall": float(report.recall),
+                "f1": float(report.f1),
+                "true_positive": int(report.true_positive),
+                "false_positive": int(report.false_positive),
+                "true_negative": int(report.true_negative),
+                "false_negative": int(report.false_negative),
+            },
+        },
+    }
+    _persist_run_artifact("evaluate", Path(args.model).parent, artifact)
 
     print(f"evaluate model={model_path}")
     print(f"threshold: {report.threshold:.3f}")
@@ -846,19 +985,45 @@ def command_live(args: argparse.Namespace) -> int:
         max_daily_trades = 0
     daily_trade_count: dict[int, int] = {}
     max_open_positions = int(cfg.max_open_positions)
+    live_run = {
+        "command": "live",
+        "timestamp": int(time.time()),
+        "runtime": runtime.asdict(),
+        "strategy": cfg.asdict(),
+        "steps_total": int(args.steps),
+        "market": runtime.market_type,
+        "symbol": runtime.symbol,
+        "model_path": str(model_path),
+        "events": [],
+        "model_signature": None,
+        "starting_cash": float(cash),
+    }
+    drawdown_limit = float(cfg.max_drawdown_limit)
+    halt_reason = "completed"
+    steps_executed = 0
+    entries = 0
+    closes = 0
+    skipped_entries = 0
+    model_loads = 0 if model is None else 1
 
     for i in range(args.steps):
         try:
             candles = client.get_klines(runtime.symbol, runtime.interval, limit=max(cfg.model_lookback, 300))
         except BinanceAPIError as exc:
             print(f"market error: {exc}", file=sys.stderr)
+            halt_reason = "market_error"
             return 2
+
+        steps_executed += 1
 
         rows = _build_model_rows(candles, cfg)
         if not rows:
             print("not enough historical data for live signal")
+            live_run["events"].append({"step": i + 1, "status": "no_rows"})
             time.sleep(args.sleep)
             continue
+
+        live_run["events"].append({"step": i + 1, "status": "rows", "count": len(rows)})
 
         retrain_interval = getattr(args, "retrain_interval", 0)
         retrain_window = getattr(args, "retrain_window", 300)
@@ -870,6 +1035,7 @@ def command_live(args: argparse.Namespace) -> int:
         if retrain_interval < 0:
             retrain_interval = 0
 
+        previous_model = model
         model = _build_live_model(
             rows,
             model=model,
@@ -879,9 +1045,21 @@ def command_live(args: argparse.Namespace) -> int:
             retrain_window=retrain_window,
             retrain_min_rows=retrain_min_rows,
         )
+        if previous_model is None and model is not None:
+            model_loads += 1
+            if model is not None and model.__class__.__name__ != "TrainedModel":
+                model_signature = None
+            else:
+                model_signature = getattr(model, "feature_signature", None)
+                live_run["model_signature"] = str(model_signature) if model_signature else None
+        elif previous_model is not None and model is not None and previous_model is not model:
+            model_loads += 1
+            model_signature = getattr(model, "feature_signature", None)
+            live_run["model_signature"] = str(model_signature) if model_signature else None
 
         if model is None:
             model = train(rows, epochs=40)
+            model_loads += 1
         latest = rows[-1]
         score = model.predict_proba(latest.features)
         direction = _score_to_direction(score, cfg, runtime.market_type)
@@ -898,10 +1076,27 @@ def command_live(args: argparse.Namespace) -> int:
         if position_side == 0 and direction != 0:
             if trade_cap_reached:
                 print(f"step {i + 1:>2}: trade cap reached ({max_daily_trades}/day), skipping entry")
+                skipped_entries += 1
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "skip_trade_cap",
+                        "day": day,
+                        "score": float(score),
+                    }
+                )
                 time.sleep(max(1, args.sleep))
                 continue
             if max_open_positions <= 0:
                 print(f"step {i + 1:>2}: max open positions reached ({max_open_positions}), skipping entry")
+                skipped_entries += 1
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "skip_max_open_positions",
+                        "score": float(score),
+                    }
+                )
                 time.sleep(max(1, args.sleep))
                 continue
 
@@ -916,6 +1111,15 @@ def command_live(args: argparse.Namespace) -> int:
             )
             if notional <= 0:
                 print(f"step {i + 1:>2}: skipped entry due to order constraints")
+                skipped_entries += 1
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "skip_constraints",
+                        "score": float(score),
+                        "notional": float(notional),
+                    }
+                )
                 time.sleep(max(1, args.sleep))
                 continue
 
@@ -928,6 +1132,14 @@ def command_live(args: argparse.Namespace) -> int:
             total = margin + fee
             if total > cash:
                 print(f"step {i + 1:>2}: insufficient cash for leverage-adjusted entry")
+                skipped_entries += 1
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "skip_insufficient_cash_pre_fill",
+                        "score": float(score),
+                    }
+                )
                 time.sleep(max(1, args.sleep))
                 continue
 
@@ -942,6 +1154,15 @@ def command_live(args: argparse.Namespace) -> int:
             total = margin + fee
             if total > cash:
                 print(f"step {i + 1:>2}: insufficient cash after fill adjustment")
+                skipped_entries += 1
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "skip_insufficient_cash_after_fill",
+                        "score": float(score),
+                        "fill": float(fill),
+                    }
+                )
                 time.sleep(max(1, args.sleep))
                 continue
 
@@ -963,6 +1184,19 @@ def command_live(args: argparse.Namespace) -> int:
                 leverage=leverage,
             )
             print(f"step {i + 1:>2}: enter {'long' if position_side > 0 else 'short'} at {fill:.2f} qty={qty:.6f}")
+            entries += 1
+            live_run["events"].append(
+                {
+                    "step": i + 1,
+                    "status": "enter",
+                    "direction": int(position_side),
+                    "score": float(score),
+                    "price": float(fill),
+                    "qty": float(qty),
+                    "notional": float(notional),
+                    "cash_after_entry": float(cash),
+                }
+            )
             cooldown_left = 0
 
         elif position_side != 0:
@@ -993,6 +1227,18 @@ def command_live(args: argparse.Namespace) -> int:
                     f"step {i + 1:>2}: close {'long' if position_side > 0 else 'short'} "
                     f"pnl={pnl:.2f} cash={cash:.2f}"
                 )
+                closes += 1
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "close",
+                        "direction": int(position_side),
+                        "score": float(score),
+                        "price": float(price),
+                        "pnl": float(realized),
+                        "cash_after": float(cash),
+                    }
+                )
                 if realized > 0:
                     print("result: win")
                 position_notional = 0.0
@@ -1005,6 +1251,16 @@ def command_live(args: argparse.Namespace) -> int:
                 unrealized = margin_used + pnl
                 print(f"step {i + 1:>2}: hold {'long' if position_side > 0 else 'short'} pnl={pnl_pct:.2%} cash={cash:.2f}")
                 print(f"         unrealized equity={cash + unrealized:.2f}")
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "hold",
+                        "direction": int(position_side),
+                        "score": float(score),
+                        "price": float(price),
+                        "pnl": float(pnl),
+                    }
+                )
 
                 if direction == 0:
                     cooldown_left = max(0, wait_ticks)
@@ -1045,11 +1301,43 @@ def command_live(args: argparse.Namespace) -> int:
                     qty = 0.0
                     margin_used = 0.0
                     entry_price = 0.0
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "emergency_close",
+                        "score": float(score),
+                        "drawdown": float(drawdown),
+                        "cash_after": float(cash),
+                    }
+                )
                 print(f"step {i + 1:>2}: drawdown limit reached ({cfg.max_drawdown_limit:.1%}), stopping loop")
+                halt_reason = "drawdown_limit"
                 break
 
-        time.sleep(max(1, args.sleep))
+        if position_side == 0 and direction != 0:
+            live_run["events"].append(
+                {
+                    "step": i + 1,
+                    "status": "signal_no_entry",
+                    "score": float(score),
+                    "direction": int(direction),
+                }
+            )
 
+        time.sleep(max(1, args.sleep))
+    live_run["result"] = {
+        "status": halt_reason,
+        "steps_executed": steps_executed,
+        "entries": entries,
+        "closes": closes,
+        "skipped_entries": skipped_entries,
+        "model_loads": model_loads,
+        "drawdown_seen": float(max_drawdown_seen),
+        "ending_cash": float(cash),
+        "equity_peak": float(equity_peak),
+        "drawdown_limit": drawdown_limit,
+    }
+    _persist_run_artifact("live", model_path.parent, live_run)
     if max_drawdown_seen > 0.0:
         print(f"max_drawdown observed: {max_drawdown_seen:.2%}")
     print(f"finished loop market={runtime.market_type} cash={cash:.2f}")
