@@ -359,9 +359,7 @@ def load_model(
     if len(stds) != dim:
         raise ModelLoadError("Model payload feature_dim does not match feature_stds length")
 
-    if expected_feature_dim is None:
-        expected_feature_dim = feature_dimension()
-    if dim != expected_feature_dim:
+    if expected_feature_dim is not None and dim != expected_feature_dim:
         raise ModelFeatureMismatchError(
             f"Feature dimension mismatch: model={dim} expected={expected_feature_dim}"
         )

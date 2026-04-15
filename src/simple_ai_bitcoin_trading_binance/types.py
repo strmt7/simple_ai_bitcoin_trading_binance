@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from .features import FEATURE_VERSION
+from .features import FEATURE_NAMES, FEATURE_VERSION, normalize_enabled_features
 
 
 @dataclass
@@ -58,10 +58,16 @@ class StrategyConfig:
     slippage_bps: float = 5.0
     label_threshold: float = 0.001
     feature_version: str = FEATURE_VERSION
+    enabled_features: tuple[str, ...] = FEATURE_NAMES
+
+    def __post_init__(self) -> None:
+        self.feature_windows = tuple(int(value) for value in self.feature_windows)
+        self.enabled_features = normalize_enabled_features(self.enabled_features)
 
     def asdict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["feature_windows"] = list(self.feature_windows)
+        payload["enabled_features"] = list(self.enabled_features)
         return payload
 
 

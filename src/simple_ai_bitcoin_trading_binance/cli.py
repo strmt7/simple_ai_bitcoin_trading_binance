@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import sys
 import time
@@ -13,7 +14,7 @@ from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
-from .features import feature_signature, make_rows
+from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_enabled_features
 from .api import SymbolConstraints
 from .model import (
     calibrate_threshold,
@@ -82,6 +83,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_tune.add_argument("--max-take", type=float, default=0.06)
     parser_tune.add_argument("--min-stop", type=float, default=0.008)
     parser_tune.add_argument("--max-stop", type=float, default=0.04)
+    parser_tune.add_argument("--lookback-days", type=int, default=None, help="use only the most recent N days of candles for tuning")
+    parser_tune.add_argument("--from-date", default=None, help="inclusive start date for tuning window (YYYY-MM-DD)")
+    parser_tune.add_argument("--to-date", default=None, help="inclusive end date for tuning window (YYYY-MM-DD)")
     parser_tune.set_defaults(func=command_tune)
 
     parser_backtest = subparsers.add_parser("backtest", help="run backtest against cached data")
@@ -148,6 +152,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--taker-fee-bps", type=float, default=None)
     parser_strategy.add_argument("--slippage-bps", type=float, default=None)
     parser_strategy.add_argument("--label-threshold", type=float, default=None)
+    parser_strategy.add_argument("--set-features", default=None, help="comma-separated ordered feature list for retraining")
+    parser_strategy.add_argument("--enable-feature", action="append", default=None, help="enable a feature by name")
+    parser_strategy.add_argument("--disable-feature", action="append", default=None, help="disable a feature by name")
     parser_strategy.set_defaults(func=command_strategy)
 
     return parser.parse_args(argv)
@@ -237,7 +244,40 @@ def _build_strategy_menu_args(cfg: StrategyConfig, *, input_fn: Callable[[str], 
         taker_fee_bps=_menu_prompt_float("Taker fee bps", cfg.taker_fee_bps, minimum=0.0, input_fn=input_fn),
         slippage_bps=_menu_prompt_float("Slippage bps", cfg.slippage_bps, minimum=0.0, input_fn=input_fn),
         label_threshold=_menu_prompt_float("Label threshold", cfg.label_threshold, minimum=0.0001, input_fn=input_fn),
+        set_features=",".join(_menu_feature_selection(cfg.enabled_features, input_fn=input_fn)),
+        enable_feature=None,
+        disable_feature=None,
     )
+
+
+def _menu_feature_selection(current: Sequence[str], *, input_fn: Callable[[str], str] = input) -> tuple[str, ...]:
+    selected = list(normalize_enabled_features(current))
+    print("Model feature selection")
+    for index, name in enumerate(FEATURE_NAMES, start=1):
+        mark = "x" if name in selected else " "
+        print(f"{index:>2}. [{mark}] {name}")
+    raw = _menu_prompt("Toggle feature numbers (comma-separated), 'all', or blank to keep: ", input_fn=input_fn).lower()
+    if not raw:
+        return tuple(selected)
+    if raw == "all":
+        return tuple(FEATURE_NAMES)
+    toggles = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            value = int(chunk)
+        except ValueError:
+            continue
+        if 1 <= value <= len(FEATURE_NAMES):
+            toggles.append(FEATURE_NAMES[value - 1])
+    for name in toggles:
+        if name in selected:
+            selected.remove(name)
+        else:
+            selected.append(name)
+    return normalize_enabled_features(selected)
 
 
 def _menu_data_path(name: str, *, input_fn: Callable[[str], str] = input) -> str:
@@ -424,6 +464,20 @@ def _run_spot_test_order_roundtrip(*, input_fn: Callable[[str], str] = input) ->
     return 0
 
 
+def _menu_tune_window_args(*, input_fn: Callable[[str], str] = input) -> tuple[int | None, str | None, str | None]:
+    mode = _menu_prompt("Tune window mode [all/lookback/range] [all]: ", input_fn=input_fn).lower()
+    if not mode or mode == "all":
+        return None, None, None
+    if mode == "lookback":
+        return _menu_prompt_int("Tune lookback days", 30, minimum=1, input_fn=input_fn), None, None
+    if mode == "range":
+        from_date = _menu_prompt("Tune from date YYYY-MM-DD: ", input_fn=input_fn) or None
+        to_date = _menu_prompt("Tune to date YYYY-MM-DD: ", input_fn=input_fn) or None
+        return None, from_date, to_date
+    print("Unknown tune window mode; using all data.")
+    return None, None, None
+
+
 def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
     while True:
         _print_menu_header()
@@ -482,6 +536,7 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
             )
             command_train(args)
         elif choice == "9":
+            lookback_days, from_date, to_date = _menu_tune_window_args(input_fn=input_fn)
             args = argparse.Namespace(
                 input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
                 save_best=_menu_prompt_bool("Save tuned strategy", False, input_fn=input_fn),
@@ -496,6 +551,9 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 max_take=_menu_prompt_float("Max take profit", 0.06, minimum=0.0, maximum=0.99, input_fn=input_fn),
                 min_stop=_menu_prompt_float("Min stop loss", 0.008, minimum=0.0, maximum=0.99, input_fn=input_fn),
                 max_stop=_menu_prompt_float("Max stop loss", 0.04, minimum=0.0, maximum=0.99, input_fn=input_fn),
+                lookback_days=lookback_days,
+                from_date=from_date,
+                to_date=to_date,
             )
             command_tune(args)
         elif choice == "10":
@@ -607,6 +665,46 @@ def _load_rows_for_command(path: str, *, label: str) -> list | None:
         return None
 
 
+def _parse_date_boundary(raw: str, *, end_of_day: bool) -> int:
+    dt = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    if end_of_day:
+        dt = dt + timedelta(days=1) - timedelta(milliseconds=1)
+    return int(dt.timestamp() * 1000)
+
+
+def _filter_candles_for_time_window(
+    candles: Sequence[object],
+    *,
+    lookback_days: int | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> list[object]:
+    if lookback_days is not None and lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0")
+    if lookback_days is not None and (from_date or to_date):
+        raise ValueError("lookback_days cannot be combined with from_date/to_date")
+
+    start_ms: int | None = None
+    end_ms: int | None = None
+    if from_date:
+        start_ms = _parse_date_boundary(from_date, end_of_day=False)
+    if to_date:
+        end_ms = _parse_date_boundary(to_date, end_of_day=True)
+    if start_ms is not None and end_ms is not None and start_ms > end_ms:
+        raise ValueError("from_date must be <= to_date")
+
+    filtered = list(candles)
+    if lookback_days is not None and filtered:
+        latest_close = max(int(getattr(candle, "close_time")) for candle in filtered)
+        start_ms = latest_close - (lookback_days * 24 * 60 * 60 * 1000)
+
+    if start_ms is not None:
+        filtered = [candle for candle in filtered if int(getattr(candle, "open_time")) >= start_ms]
+    if end_ms is not None:
+        filtered = [candle for candle in filtered if int(getattr(candle, "open_time")) <= end_ms]
+    return filtered
+
+
 def _artifact_path(kind: str, *, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{kind}_run_{int(time.time() * 1_000_000)}.json"
@@ -629,6 +727,7 @@ def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
         strategy.feature_windows[1],
         lookahead=1,
         label_threshold=strategy.label_threshold,
+        enabled_features=strategy.enabled_features,
     )
 
 
@@ -668,6 +767,7 @@ def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
         strategy.feature_windows[1],
         strategy.label_threshold,
         feature_version=strategy.feature_version,
+        enabled_features=strategy.enabled_features,
     )
     return load_model(
         model_path,
@@ -920,6 +1020,23 @@ def command_strategy(args: argparse.Namespace) -> int:
         updates["slippage_bps"] = max(0.0, args.slippage_bps)
     if args.label_threshold is not None:
         updates["label_threshold"] = max(0.0001, args.label_threshold)
+    try:
+        if getattr(args, "set_features", None):
+            updates["enabled_features"] = normalize_enabled_features(
+                [part.strip() for part in str(args.set_features).split(",") if part.strip()]
+            )
+        else:
+            selected_features = list(cfg.enabled_features)
+            for name in getattr(args, "enable_feature", []) or []:
+                if name not in selected_features:
+                    selected_features.append(name)
+            for name in getattr(args, "disable_feature", []) or []:
+                selected_features = [feature for feature in selected_features if feature != name]
+            if getattr(args, "enable_feature", None) or getattr(args, "disable_feature", None):
+                updates["enabled_features"] = normalize_enabled_features(selected_features)
+    except ValueError as exc:
+        print(f"Invalid feature selection: {exc}", file=sys.stderr)
+        return 2
 
     cfg = StrategyConfig(**{**cfg.asdict(), **updates})
     save_strategy(cfg)
@@ -1006,6 +1123,7 @@ def command_train(args: argparse.Namespace) -> int:
         cfg.feature_windows[1],
         cfg.label_threshold,
         feature_version=cfg.feature_version,
+        enabled_features=cfg.enabled_features,
     )
 
     split = max(2, int(len(rows) * 0.8))
@@ -1089,6 +1207,16 @@ def command_tune(args: argparse.Namespace) -> int:
             max_leverage = 125.0
     candles = _load_rows_for_command(args.input, label="Tune data load failed")
     if candles is None:
+        return 2
+    try:
+        candles = _filter_candles_for_time_window(
+            candles,
+            lookback_days=getattr(args, "lookback_days", None),
+            from_date=getattr(args, "from_date", None),
+            to_date=getattr(args, "to_date", None),
+        )
+    except ValueError as exc:
+        print(f"Tune window invalid: {exc}", file=sys.stderr)
         return 2
     rows = _build_model_rows(candles, cfg)
     if len(rows) < 40:

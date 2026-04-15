@@ -90,14 +90,35 @@ def test_load_model_rejects_signature_mismatch(tmp_path: Path) -> None:
         "epochs": 3,
         "feature_means": [1.0] * feature_dimension(),
         "feature_stds": [1.0] * feature_dimension(),
-        "feature_signature": "feature_version=v1|feature_count=13|short_window=6|long_window=24|label_threshold=0.001",
+        "feature_signature": "feature_version=v1|feature_count=13|feature_names=momentum_1,momentum_3,momentum_10,momentum_20,ema_spread,rsi,ema_gap,relative_atr,volatility_20,volume_ratio,trend_acceleration,gap_to_vwap,volume_trend|short_window=6|long_window=24|label_threshold=0.001",
     }
     model_path.write_text(json.dumps(model_payload), encoding="utf-8")
     with pytest.raises(ModelFeatureMismatchError, match="Feature signature mismatch"):
         load_model(
             model_path,
-            expected_feature_signature="feature_version=v1|feature_count=13|short_window=4|long_window=8|label_threshold=0.001",
+            expected_feature_signature="feature_version=v1|feature_count=13|feature_names=momentum_1,momentum_3,momentum_10,momentum_20,ema_spread,rsi,ema_gap,relative_atr,volatility_20,volume_ratio,trend_acceleration,gap_to_vwap,volume_trend|short_window=4|long_window=8|label_threshold=0.001",
         )
+
+
+def test_load_model_allows_subset_feature_dim_when_signature_matches(tmp_path: Path) -> None:
+    model_path = tmp_path / "subset_model.json"
+    model_payload = {
+        "weights": [0.1, 0.2, 0.3],
+        "feature_version": "v1",
+        "bias": 0.01,
+        "feature_dim": 3,
+        "epochs": 3,
+        "feature_means": [1.0, 1.0, 1.0],
+        "feature_stds": [1.0, 1.0, 1.0],
+        "feature_signature": "feature_version=v1|feature_count=3|feature_names=momentum_1,rsi,volume_ratio|short_window=10|long_window=40|label_threshold=0.001",
+    }
+    model_path.write_text(json.dumps(model_payload), encoding="utf-8")
+    model = load_model(
+        model_path,
+        expected_feature_signature="feature_version=v1|feature_count=3|feature_names=momentum_1,rsi,volume_ratio|short_window=10|long_window=40|label_threshold=0.001",
+        expected_feature_dim=None,
+    )
+    assert model.feature_dim == 3
 
 
 def test_evaluate_classification_report() -> None:

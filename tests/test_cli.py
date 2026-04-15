@@ -5,9 +5,12 @@ import argparse
 from simple_ai_bitcoin_trading_binance.cli import (
     _artifact_summary,
     _build_strategy_menu_args,
+    _filter_candles_for_time_window,
     _menu_prompt_bool,
+    _menu_feature_selection,
     _menu_prompt_float,
     _menu_prompt_int,
+    _menu_tune_window_args,
     _recent_artifacts,
     _build_order_notional,
     _build_live_model,
@@ -24,7 +27,7 @@ from simple_ai_bitcoin_trading_binance.cli import (
     main,
 )
 from simple_ai_bitcoin_trading_binance.config import load_strategy
-from simple_ai_bitcoin_trading_binance.api import SymbolConstraints
+from simple_ai_bitcoin_trading_binance.api import Candle, SymbolConstraints
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
 
@@ -129,6 +132,9 @@ def test_command_strategy_updates_risk_and_rate_limits(tmp_path, monkeypatch) ->
         slippage_bps=None,
         label_threshold=None,
         max_trades_per_day=7,
+        set_features="momentum_1,rsi",
+        enable_feature=None,
+        disable_feature=None,
     )
     result = command_strategy(args)
     assert result == 0
@@ -136,6 +142,7 @@ def test_command_strategy_updates_risk_and_rate_limits(tmp_path, monkeypatch) ->
     assert updated.risk_per_trade == 0.003
     assert updated.max_open_positions == 4
     assert updated.max_trades_per_day == 7
+    assert updated.enabled_features == ("momentum_1", "rsi")
 
 
 def test_resolve_live_retrain_rows_handles_short_full_and_tail_windows() -> None:
@@ -230,12 +237,23 @@ def test_build_strategy_menu_args_retries_invalid_numeric_input() -> None:
         "",
         "",
         "",
+        "",
     ])
 
     args = _build_strategy_menu_args(cfg, input_fn=lambda _prompt: next(responses))
     assert args.leverage == 2.0
     assert args.risk == cfg.risk_per_trade
     assert args.max_trades_per_day == cfg.max_trades_per_day
+
+
+def test_menu_feature_selection_toggles_and_preserves() -> None:
+    keep = iter([""])
+    assert _menu_feature_selection(("momentum_1", "rsi"), input_fn=lambda _prompt: next(keep)) == ("momentum_1", "rsi")
+
+    toggle = iter(["2,3"])
+    selected = _menu_feature_selection(("momentum_1", "momentum_3"), input_fn=lambda _prompt: next(toggle))
+    assert "momentum_3" not in selected
+    assert "momentum_10" in selected
 
 
 def test_run_menu_invalid_selection_then_exit(capsys) -> None:
@@ -370,6 +388,7 @@ def test_run_menu_train_and_tune_build_expected_args(monkeypatch) -> None:
         "20",
         "n",
         "9",
+        "all",
         "data/tune.json",
         "y",
         "0.003",
@@ -440,6 +459,7 @@ def test_run_menu_strategy_builds_expected_args(monkeypatch) -> None:
         "2",
         "4",
         "0.002",
+        "",
         "17",
     ])
     assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
@@ -611,3 +631,55 @@ def test_command_live_rejects_conflicting_force_modes(capsys) -> None:
     )
     assert command_live(args) == 2
     assert "Choose either --paper or --live" in capsys.readouterr().out
+
+
+def test_filter_candles_for_time_window_handles_lookback_and_ranges() -> None:
+    candles = [
+        Candle(open_time=1_700_000_000_000, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0, close_time=1_700_000_059_999),
+        Candle(open_time=1_700_086_400_000, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0, close_time=1_700_086_459_999),
+        Candle(open_time=1_700_172_800_000, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0, close_time=1_700_172_859_999),
+    ]
+    lookback = _filter_candles_for_time_window(candles, lookback_days=1)
+    assert len(lookback) == 1
+
+    ranged = _filter_candles_for_time_window(candles, from_date="2023-11-15", to_date="2023-11-15")
+    assert len(ranged) == 1
+
+
+def test_filter_candles_for_time_window_rejects_invalid_inputs() -> None:
+    candles = []
+    try:
+        _filter_candles_for_time_window(candles, lookback_days=0)
+    except ValueError as exc:
+        assert "lookback_days" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+    try:
+        _filter_candles_for_time_window(candles, lookback_days=5, from_date="2024-01-01")
+    except ValueError as exc:
+        assert "cannot be combined" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+    try:
+        _filter_candles_for_time_window(candles, from_date="2024-02-01", to_date="2024-01-01")
+    except ValueError as exc:
+        assert "from_date must be <=" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_menu_tune_window_args_supports_all_modes(capsys) -> None:
+    all_mode = iter([""])
+    assert _menu_tune_window_args(input_fn=lambda _prompt: next(all_mode)) == (None, None, None)
+
+    lookback_mode = iter(["lookback", "14"])
+    assert _menu_tune_window_args(input_fn=lambda _prompt: next(lookback_mode)) == (14, None, None)
+
+    range_mode = iter(["range", "2024-01-01", "2024-02-01"])
+    assert _menu_tune_window_args(input_fn=lambda _prompt: next(range_mode)) == (None, "2024-01-01", "2024-02-01")
+
+    unknown_mode = iter(["weird"])
+    assert _menu_tune_window_args(input_fn=lambda _prompt: next(unknown_mode)) == (None, None, None)
+    assert "Unknown tune window mode" in capsys.readouterr().out
