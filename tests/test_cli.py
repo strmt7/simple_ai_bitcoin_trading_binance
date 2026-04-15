@@ -6,7 +6,6 @@ import asyncio
 from simple_ai_bitcoin_trading_binance.cli import (
     _artifact_summary,
     _filter_candles_for_time_window,
-    _parse_feature_selection,
     _recent_artifacts,
     _build_order_notional,
     _build_live_model,
@@ -32,10 +31,12 @@ class _AsyncUI:
         prompts: list[str] | None = None,
         confirms: list[bool] | None = None,
         forms: list[dict[str, str] | None] | None = None,
+        multiselects: list[list[str] | None] | None = None,
     ) -> None:
         self._prompts = list(prompts or [])
         self._confirms = iter(confirms or [])
         self._forms = list(forms or [])
+        self._multiselects = list(multiselects or [])
         self.logs: list[str] = []
 
     async def prompt(self, _label: str, _default: str = "") -> str:
@@ -51,6 +52,10 @@ class _AsyncUI:
         if self._forms:
             return self._forms.pop(0)
         return {field.key: self._prompts.pop(0) for field in fields}
+
+    async def multi_select(self, _title: str, _options, _selected, *, help_text: str = ""):
+        del help_text
+        return self._multiselects.pop(0)
 
     def append_log(self, text: str) -> None:
         self.logs.append(text)
@@ -291,14 +296,6 @@ def test_command_menu_rejects_without_tty(monkeypatch, capsys) -> None:
     assert "Interactive console requires a real terminal" in capsys.readouterr().err
 
 
-def test_parse_feature_selection_supports_blank_all_indices_and_names() -> None:
-    assert _parse_feature_selection("", ("momentum_1", "rsi")) == ("momentum_1", "rsi")
-    assert _parse_feature_selection("all", ("momentum_1",)) == StrategyConfig().enabled_features
-    toggled = _parse_feature_selection("2,rsi", ("momentum_1", "rsi"))
-    assert "momentum_3" in toggled
-    assert "rsi" not in toggled
-
-
 def test_tui_runtime_action_saves_runtime(monkeypatch) -> None:
     current = type(
         "R",
@@ -356,7 +353,7 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", fake_strategy)
 
     ui = _AsyncUI(
-        prompts=["all"],
+        multiselects=[["momentum_1", "rsi"]],
         forms=[
             {
                 "leverage": "3",
@@ -388,7 +385,7 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
     assert captured["args"].feature_window_long == 48
     assert captured["args"].training_epochs == 500
     assert captured["args"].confidence_beta == 0.9
-    assert "momentum_1" in captured["args"].set_features
+    assert captured["args"].set_features == "momentum_1,rsi"
 
 
 def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypatch) -> None:
@@ -566,8 +563,12 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
             )
         )
     )
-    asyncio.run(_action("Testnet loop").run(_AsyncUI(prompts=[], confirms=[False])))
-    asyncio.run(_action("Spot roundtrip").run(_AsyncUI(prompts=["0.00008"], confirms=[True])))
+    asyncio.run(_action("Testnet loop").run(_AsyncUI(confirms=[False])))
+    asyncio.run(
+        _action("Spot roundtrip").run(
+            _AsyncUI(forms=[{"quantity": "0.00008"}], confirms=[True])
+        )
+    )
 
     assert calls[0].paper is True and calls[0].steps == 3
     assert calls[1].live is True and calls[1].steps == 2

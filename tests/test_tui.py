@@ -6,8 +6,8 @@ from simple_ai_bitcoin_trading_binance.tui import (
     ConfirmScreen,
     FormField,
     FormScreen,
+    MultiSelectScreen,
     OperatorApp,
-    PromptScreen,
     TUIAction,
     TerminalUI,
     launch_tui,
@@ -60,24 +60,6 @@ class _FakeRichLog:
 
     def write(self, text: str) -> None:
         self.lines.append(text)
-
-def test_prompt_screen_behaviors(monkeypatch) -> None:
-    screen = PromptScreen("Prompt", "seed", password=True)
-
-    fake_input = _FakeInput("typed-value")
-    dismissed: list[object] = []
-    monkeypatch.setattr(screen, "query_one", lambda _selector, _cls=None: fake_input)
-    monkeypatch.setattr(screen, "dismiss", lambda value: dismissed.append(value))
-
-    screen.on_mount()
-    assert fake_input.focused is True
-
-    screen.on_input_submitted(type("Evt", (), {"value": "submitted"})())
-    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "submit"})()})())
-    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
-
-    assert dismissed == ["submitted", "typed-value", None]
-
 
 def test_confirm_screen_behaviors(monkeypatch) -> None:
     screen = ConfirmScreen("Confirm?")
@@ -144,12 +126,51 @@ def test_form_screen_handles_empty_and_unknown_submission(monkeypatch) -> None:
     assert dismissed == [{}]
 
 
+def test_multi_select_screen_behaviors(monkeypatch) -> None:
+    class _FakeSelectionList:
+        def __init__(self) -> None:
+            self.selected = ["momentum_1"]
+            self.focused = False
+            self.selected_all = False
+            self.cleared = False
+
+        def focus(self) -> None:
+            self.focused = True
+
+        def select_all(self) -> None:
+            self.selected_all = True
+            self.selected = ["momentum_1", "rsi"]
+
+        def deselect_all(self) -> None:
+            self.cleared = True
+            self.selected = []
+
+    screen = MultiSelectScreen("Features", ["momentum_1", "rsi"], ["momentum_1"], help_text="help")
+    selection_list = _FakeSelectionList()
+    dismissed: list[object] = []
+
+    monkeypatch.setattr(screen, "query_one", lambda _selector, _cls=None: selection_list)
+    monkeypatch.setattr(screen, "dismiss", lambda value: dismissed.append(value))
+
+    screen.on_mount()
+    assert selection_list.focused is True
+
+    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "all"})()})())
+    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "none"})()})())
+    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "save"})()})())
+    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
+
+    assert selection_list.selected_all is True
+    assert selection_list.cleared is True
+    assert dismissed == [[], None]
+
+
 def test_terminal_ui_methods() -> None:
     seen = {"screens": [], "logs": []}
 
     class _FakeApp:
         def __init__(self) -> None:
-            self.results = iter(["  typed  ", "", True, {"api_key": "typed-key"}])
+            self.results = iter([True, {"api_key": "typed-key"}, ["momentum_1", "rsi"]])
 
         async def push_screen_wait(self, screen):
             seen["screens"].append(type(screen).__name__)
@@ -160,12 +181,11 @@ def test_terminal_ui_methods() -> None:
 
     ui = TerminalUI(_FakeApp())
 
-    assert asyncio.run(ui.prompt("Label", "fallback")) == "typed"
-    assert asyncio.run(ui.secret("Secret", "fallback")) == ""
     assert asyncio.run(ui.confirm("Confirm")) is True
     assert asyncio.run(ui.form("Runtime", [FormField("api_key", "API key")])) == {"api_key": "typed-key"}
+    assert asyncio.run(ui.multi_select("Features", ["momentum_1"], ["momentum_1"])) == ["momentum_1", "rsi"]
     ui.append_log("line")
-    assert seen["screens"] == ["PromptScreen", "PromptScreen", "ConfirmScreen", "FormScreen"]
+    assert seen["screens"] == ["ConfirmScreen", "FormScreen", "MultiSelectScreen"]
     assert seen["logs"] == ["line"]
 
 
@@ -225,6 +245,11 @@ def test_operator_app_methods(monkeypatch) -> None:
 
     asyncio.run(app.on_option_list_option_selected(object()))
     assert widgets["#status"].value == "Sync complete (1)"
+
+    app.action_next_workspace()
+    assert widgets["#workspace"].active == "panel-action"
+    app.action_previous_workspace()
+    assert widgets["#workspace"].active == "panel-activity"
 
 
 def test_operator_app_refresh_preview_supports_zero_arg_provider(monkeypatch) -> None:
@@ -291,6 +316,13 @@ def test_operator_app_runs_in_textual_runtime() -> None:
         )
         async with app.run_test() as pilot:
             await pilot.pause()
+            assert app.query_one("#workspace").active == "panel-overview"
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.query_one("#workspace").active == "panel-activity"
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.query_one("#workspace").active == "panel-overview"
             await pilot.press("enter")
             await pilot.pause()
 
@@ -300,11 +332,6 @@ def test_operator_app_runs_in_textual_runtime() -> None:
 
 
 def test_modal_screens_compose_in_textual_runtime() -> None:
-    class _PromptApp(OperatorApp):
-        def on_mount(self) -> None:
-            super().on_mount()
-            self.push_screen(PromptScreen("Prompt", "seed"))
-
     class _ConfirmApp(OperatorApp):
         def on_mount(self) -> None:
             super().on_mount()
@@ -313,18 +340,22 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
     class _FormApp(OperatorApp):
         def on_mount(self) -> None:
             super().on_mount()
-            self.push_screen(FormScreen("Runtime", [FormField("api_key", "API key", "seed", password=True)]))
+            self.push_screen(
+                FormScreen(
+                    "Runtime",
+                    [
+                        FormField("api_key", "API key", "seed", password=True),
+                        FormField("interval", "Interval", "15m"),
+                    ],
+                )
+            )
+
+    class _MultiApp(OperatorApp):
+        def on_mount(self) -> None:
+            super().on_mount()
+            self.push_screen(MultiSelectScreen("Features", ["momentum_1"], ["momentum_1"]))
 
     async def runner() -> None:
-        prompt_app = _PromptApp(
-            title_text="console",
-            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
-            snapshot_provider=lambda _width=70: "snapshot",
-        )
-        async with prompt_app.run_test() as pilot:
-            await pilot.pause()
-            assert isinstance(prompt_app.screen_stack[-1], PromptScreen)
-
         confirm_app = _ConfirmApp(
             title_text="console",
             actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
@@ -342,6 +373,22 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
         async with form_app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(form_app.screen_stack[-1], FormScreen)
+            assert form_app.focused.id == "field-api_key"
+            await pilot.press("tab")
+            await pilot.pause()
+            assert form_app.focused.id == "field-interval"
+
+        multi_app = _MultiApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with multi_app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(multi_app.screen_stack[-1], MultiSelectScreen)
+            await pilot.press("tab")
+            await pilot.pause()
+            assert multi_app.focused.id == "all"
 
     asyncio.run(runner())
 

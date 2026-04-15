@@ -29,9 +29,9 @@ def _section(title: str, lines: list[str], *, width: int) -> str:
 
 def _runtime_lines(runtime: dict[str, Any]) -> list[str]:
     return [
-        f"symbol={runtime.get('symbol', '-')} interval={runtime.get('interval', '-')} market={runtime.get('market_type', '-')}",
-        f"testnet={runtime.get('testnet', '-')} paper_default={runtime.get('dry_run', '-')} validate_account={runtime.get('validate_account', '-')}",
-        f"api_key={'loaded' if runtime.get('api_key') else 'missing'} api_secret={'loaded' if runtime.get('api_secret') else 'missing'}",
+        f"{runtime.get('symbol', '-')}  interval={runtime.get('interval', '-')}  market={runtime.get('market_type', '-')}",
+        f"testnet={runtime.get('testnet', '-')}  paper_default={runtime.get('dry_run', '-')}  validate_account={runtime.get('validate_account', '-')}",
+        f"credentials: api_key={'loaded' if runtime.get('api_key') else 'missing'} api_secret={'loaded' if runtime.get('api_secret') else 'missing'}",
         f"max_rate_calls_per_minute={runtime.get('max_rate_calls_per_minute', '-')}",
     ]
 
@@ -48,7 +48,7 @@ def _strategy_lines(strategy: dict[str, Any]) -> list[str]:
 
 
 def _artifact_lines(artifacts: list[str]) -> list[str]:
-    return artifacts or ["No recent artifacts found under data/."]
+    return (artifacts[:3] if artifacts else []) or ["No recent artifacts found under data/."]
 
 
 def _account_lines(lines: list[str]) -> list[str]:
@@ -57,19 +57,10 @@ def _account_lines(lines: list[str]) -> list[str]:
 
 def render_dashboard(snapshot: DashboardSnapshot, *, width: int = 72) -> str:
     sections = [
-        _section("Runtime", _runtime_lines(snapshot.runtime), width=width),
-        _section("Strategy", _strategy_lines(snapshot.strategy), width=width),
+        _section("Session", [*_runtime_lines(snapshot.runtime), *snapshot.notes[:1]], width=width),
+        _section("Model", _strategy_lines(snapshot.strategy), width=width),
         _section("Account", _account_lines(snapshot.account_lines), width=width),
         _section("Recent artifacts", _artifact_lines(snapshot.artifacts), width=width),
-        _section(
-            "Actions",
-            [
-                "Use the interactive console actions and modal forms for all operator workflows.",
-                "Safe authenticated testnet execution is explicit; secrets stay redacted in visible output.",
-                *snapshot.notes,
-            ],
-            width=width,
-        ),
     ]
     return "\n\n".join(sections)
 
