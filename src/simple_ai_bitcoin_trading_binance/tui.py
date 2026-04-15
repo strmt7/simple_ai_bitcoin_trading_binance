@@ -222,12 +222,12 @@ class OperatorApp(App[int]):
         padding: 1;
     }
     #actions {
-        width: 24;
-        min-width: 24;
-        border: tall #193243;
-        background: #0d1822;
+        width: 22;
+        min-width: 22;
+        border: solid #183140;
+        background: #0b141d;
         color: #dbe8f2;
-        padding: 0 1;
+        padding: 0;
     }
     #actions > .option-list--option {
         color: #9fb4c4;
@@ -236,12 +236,12 @@ class OperatorApp(App[int]):
         text-overflow: ellipsis;
     }
     #actions > .option-list--option-highlighted {
-        background: #153042;
+        background: #173549;
         color: #f4fbff;
         text-style: bold;
     }
     #actions:focus {
-        border: tall #2ea7a0;
+        border: solid #2ea7a0;
     }
     #actions:focus > .option-list--option-highlighted {
         background: #0f766e;
@@ -253,45 +253,45 @@ class OperatorApp(App[int]):
         padding-left: 1;
     }
     #status {
-        height: 2;
-        border: tall #193243;
-        background: #0d1822;
+        height: 1;
+        border: none;
+        background: #0b141d;
         padding: 0 1;
         content-align: left middle;
         color: #dbe8f2;
     }
     #workspace {
         height: 1fr;
-        border: tall #193243;
+        border: solid #183140;
         background: #0b141d;
     }
     #workspace > ContentTabs {
         height: 3;
-        background: #0d1822;
+        background: #0b141d;
     }
     #workspace > ContentTabs Tab {
-        padding: 0 2;
+        padding: 0 1;
         color: #86a0b4;
         text-style: bold;
     }
     #workspace > ContentTabs Tab.-active {
         color: #f4fbff;
-        background: #153042;
+        background: #173549;
     }
     #details, #preview, #log {
         height: 1fr;
-        padding: 1 2;
+        padding: 1;
         color: #dbe8f2;
     }
     #log {
         border: none;
-        background: #081018;
+        background: #0b141d;
     }
     #confirm-dialog, #form-dialog, #feature-dialog {
-        width: 72;
+        width: 68;
         height: auto;
         padding: 1 2;
-        border: heavy #2ea7a0;
+        border: round #2ea7a0;
         background: #0b141d;
         align: center middle;
     }
@@ -320,48 +320,49 @@ class OperatorApp(App[int]):
         color: #9fb4c4;
     }
     Input {
-        border: tall #29475d;
+        border: solid #29475d;
         background: #081018;
         color: #e7f0f7;
     }
     Input:focus {
-        border: tall #2ea7a0;
+        border: solid #2ea7a0;
         background: #0d1822;
         color: #ffffff;
     }
     Button {
-        min-width: 12;
-        background: #142230;
+        min-width: 9;
+        padding: 0 1;
+        background: #0f1822;
         color: #e7f0f7;
-        border: tall #29475d;
+        border: solid #29475d;
         text-style: bold;
     }
     Button:hover {
-        background: #193243;
-        border: tall #3a617c;
+        background: #153042;
+        border: solid #3a617c;
     }
     Button:focus {
-        background: #1f3242;
-        border: tall #2ea7a0;
+        background: #173549;
+        border: solid #2ea7a0;
         color: #ffffff;
     }
     Button.-primary {
-        background: #0f766e;
-        border: tall #2ea7a0;
+        background: #124b59;
+        border: solid #2ea7a0;
         color: #f8fffe;
     }
     Button.-error {
-        background: #7f1d1d;
-        border: tall #ef4444;
+        background: #4d1f1f;
+        border: solid #c95c5c;
         color: #fff7f7;
     }
     #feature-list {
-        border: tall #193243;
+        border: solid #193243;
         background: #081018;
         padding: 0 1;
     }
     #feature-list:focus {
-        border: tall #2ea7a0;
+        border: solid #2ea7a0;
     }
     #feature-list > .selection-list--button {
         color: #9fb4c4;
