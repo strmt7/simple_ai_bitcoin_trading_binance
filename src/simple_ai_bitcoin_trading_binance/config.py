@@ -9,6 +9,8 @@ from typing import Callable, Dict
 
 from .types import RuntimeConfig, StrategyConfig, config_paths
 
+SUPPORTED_SYMBOL = "BTCUSDC"
+
 
 def _read_config_json(path: Path) -> Dict[str, object]:
     try:
@@ -27,6 +29,13 @@ def _write_json(path: Path, payload: Dict[str, object]) -> None:
     path.chmod(0o600)
 
 
+def _normalize_runtime_payload(payload: Dict[str, object]) -> Dict[str, object]:
+    normalized = dict(payload)
+    symbol = str(normalized.get("symbol") or SUPPORTED_SYMBOL).upper()
+    normalized["symbol"] = SUPPORTED_SYMBOL if symbol != SUPPORTED_SYMBOL else symbol
+    return normalized
+
+
 def load_runtime(overrides: Dict[str, object] | None = None) -> RuntimeConfig:
     paths = config_paths()
     payload = {}
@@ -34,6 +43,7 @@ def load_runtime(overrides: Dict[str, object] | None = None) -> RuntimeConfig:
         payload.update(_read_config_json(paths["runtime"]))
     if overrides:
         payload.update(overrides)
+    payload = _normalize_runtime_payload(payload)
     return RuntimeConfig(**{k: v for k, v in payload.items() if hasattr(RuntimeConfig, k)})
 
 
@@ -73,8 +83,12 @@ def prompt_runtime(current: RuntimeConfig, key_getter: Callable[[str], str] = in
     if market not in {"spot", "futures"}:
         market = current.market_type
 
+    symbol = (key_getter(f"Trading symbol [{current.symbol}]: ") or current.symbol).upper()
+    if symbol != SUPPORTED_SYMBOL:
+        symbol = SUPPORTED_SYMBOL
+
     return RuntimeConfig(
-        symbol=(key_getter(f"Trading symbol [{current.symbol}]: ") or current.symbol).upper(),
+        symbol=symbol,
         interval=(key_getter(f"Kline interval [{current.interval}]: ") or current.interval),
         market_type=market,
         testnet=key_getter(f"Use Binance testnet? (y/n) [{'y' if current.testnet else 'n'}]: ").strip().lower() != "n",

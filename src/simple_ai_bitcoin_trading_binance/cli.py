@@ -190,6 +190,14 @@ def _rows_from_json(path: str):
     return rows
 
 
+def _load_rows_for_command(path: str, *, label: str) -> list | None:
+    try:
+        return _rows_from_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"{label}: {exc}", file=sys.stderr)
+        return None
+
+
 def _artifact_path(kind: str, *, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{kind}_run_{int(time.time() * 1_000_000)}.json"
@@ -515,6 +523,9 @@ def command_fetch(args: argparse.Namespace) -> int:
     symbol = (args.symbol or runtime.symbol).upper()
     interval = args.interval or runtime.interval
     output = Path(args.output)
+    if symbol != "BTCUSDC":
+        print("Error: this CLI supports BTCUSDC only", file=sys.stderr)
+        return 2
 
     client = _build_client(runtime)
     try:
@@ -545,7 +556,9 @@ def command_fetch(args: argparse.Namespace) -> int:
 def command_train(args: argparse.Namespace) -> int:
     cfg = load_strategy()
     runtime = load_runtime()
-    candles = _rows_from_json(args.input)
+    candles = _load_rows_for_command(args.input, label="Training data load failed")
+    if candles is None:
+        return 2
     rows = _build_model_rows(candles, cfg)
     if not rows:
         print("No rows produced. Fetch more data or increase lookback.")
@@ -633,7 +646,8 @@ def command_train(args: argparse.Namespace) -> int:
             "in_sample_accuracy": float(train_score),
             "out_of_sample_accuracy": float(test_score),
             "threshold": float(threshold),
-            "tuned_threshold": float(tuned_score) if args.calibrate_threshold and test_rows else float(test_score),
+            "tuned_threshold": float(threshold) if args.calibrate_threshold and test_rows else None,
+            "calibrated_out_of_sample_accuracy": float(tuned_score) if args.calibrate_threshold and test_rows else None,
             "model_feature_version": model.feature_version,
             "model_feature_signature": model.feature_signature,
         },
@@ -663,7 +677,9 @@ def command_tune(args: argparse.Namespace) -> int:
             max_leverage = float(client.get_max_leverage(runtime.symbol))
         except BinanceAPIError:
             max_leverage = 125.0
-    candles = _rows_from_json(args.input)
+    candles = _load_rows_for_command(args.input, label="Tune data load failed")
+    if candles is None:
+        return 2
     rows = _build_model_rows(candles, cfg)
     if len(rows) < 40:
         print("Need more data rows to run tuning")
@@ -755,10 +771,13 @@ def command_backtest(args: argparse.Namespace) -> int:
         print(f"Model file not found: {model_path}")
         return 2
 
-    rows = _build_model_rows(_rows_from_json(args.input), cfg)
+    candles = _load_rows_for_command(args.input, label="Backtest data load failed")
+    if candles is None:
+        return 2
+    rows = _build_model_rows(candles, cfg)
     try:
         model = _load_runtime_model(model_path, cfg)
-    except (ModelLoadError, ModelFeatureMismatchError) as exc:
+    except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
     result = run_backtest(rows, model, cfg, starting_cash=args.start_cash, market_type=runtime.market_type)
@@ -821,7 +840,10 @@ def _tune_score(result: object, starting_cash: float = 1000.0) -> float:
 def command_evaluate(args: argparse.Namespace) -> int:
     cfg = load_strategy()
     runtime = load_runtime()
-    rows = _build_model_rows(_rows_from_json(args.input), cfg)
+    candles = _load_rows_for_command(args.input, label="Evaluation data load failed")
+    if candles is None:
+        return 2
+    rows = _build_model_rows(candles, cfg)
     if not rows:
         print("No rows available for evaluation. Fetch more data first.")
         return 2
@@ -837,7 +859,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
 
     try:
         model = _load_runtime_model(model_path, cfg)
-    except (ModelLoadError, ModelFeatureMismatchError) as exc:
+    except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
     threshold = cfg.signal_threshold

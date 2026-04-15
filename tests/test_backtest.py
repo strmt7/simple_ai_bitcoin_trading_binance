@@ -94,3 +94,40 @@ def test_backtest_unlimited_trades_when_disabled() -> None:
     )
     result = run_backtest(rows, model, cfg, starting_cash=5000.0, market_type="futures")
     assert result.trades_per_day_cap_hit == 0
+
+
+def test_backtest_exit_fee_uses_exit_notional() -> None:
+    rows = [
+        ModelRow(
+            timestamp=0,
+            close=100.0,
+            features=(10.0, *[0.0] * 12),
+            label=1,
+        ),
+        ModelRow(
+            timestamp=60_000,
+            close=120.0,
+            features=(0.0, *[0.0] * 12),
+            label=0,
+        ),
+    ]
+    model = TrainedModel(
+        weights=[1.0] + [0.0] * 12,
+        bias=0.0,
+        feature_dim=13,
+        epochs=1,
+        feature_means=[0.0] * 13,
+        feature_stds=[1.0] * 13,
+    )
+    cfg = StrategyConfig(
+        risk_per_trade=0.1,
+        max_position_pct=0.5,
+        taker_fee_bps=100.0,
+        slippage_bps=0.0,
+        signal_threshold=0.55,
+        take_profit_pct=0.5,
+        stop_loss_pct=0.5,
+    )
+    result = run_backtest(rows, model, cfg, starting_cash=1000.0, market_type="spot")
+    assert result.closed_trades == 1
+    assert result.total_fees == 2.2

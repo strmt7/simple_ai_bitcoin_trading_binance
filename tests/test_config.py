@@ -43,6 +43,25 @@ def test_prompt_runtime_updates(tmp_path: Path, monkeypatch) -> None:
     assert not out.dry_run
 
 
+def test_prompt_runtime_rejects_invalid_market_and_non_btc_symbol(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    current = RuntimeConfig(symbol="BTCUSDC", market_type="futures")
+
+    inputs = iter(["margin", "ETHUSDC", "1h", "y", "y", "y"])
+
+    def fake_input(_prompt: str) -> str:
+        return next(inputs)
+
+    responses = iter(["", ""])
+    out = prompt_runtime(current, key_getter=fake_input, secret_getter=lambda _: next(responses))
+    assert out.market_type == "futures"
+    assert out.symbol == "BTCUSDC"
+    assert out.interval == "1h"
+    assert out.testnet is True
+    assert out.dry_run is True
+    assert out.validate_account is True
+
+
 def test_load_runtime_ignores_invalid_json_payload(tmp_path: Path, monkeypatch) -> None:
     runtime_path = tmp_path / ".simple_ai_trading" / "runtime.json"
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +78,12 @@ def test_load_runtime_supports_payload_overrides(tmp_path: Path, monkeypatch) ->
     assert loaded.api_key == "x"
     assert loaded.api_secret == "y"
     assert loaded.max_rate_calls_per_minute == 5
+
+
+def test_load_runtime_forces_supported_symbol(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    loaded = load_runtime({"symbol": "ETHUSDC"})
+    assert loaded.symbol == "BTCUSDC"
 
 
 def test_load_strategy_coerces_feature_windows(tmp_path: Path, monkeypatch) -> None:
