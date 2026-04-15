@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 data/*.json
 .env
+.coverage
+.coverage.*
+.venv/
+coverage*.json
+src/*.egg-info/
+coverage.xml

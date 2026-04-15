@@ -1,0 +1,21 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0.5%
+    patch:
+      default:
+        target: 0%
+        threshold: 0.2%
+ignore:
+  - "src/simple_ai_bitcoin_trading_binance/__main__.py"
+  - "tests/"
+
+comment:
+  require_changes: true
+  after_n_builds: 1
+
+codecov:
+  notify:
+    after_n_builds: 1

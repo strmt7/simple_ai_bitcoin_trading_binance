@@ -5,6 +5,8 @@ from pathlib import Path
 
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
+    ClassificationReport,
+    evaluate_classification,
     evaluate,
     load_model,
     train,
@@ -50,6 +52,26 @@ def test_load_model_backwards_compatibility(tmp_path: Path) -> None:
     assert model.l2_penalty == 1e-4
     assert model.class_weight_pos == 1.0
     assert model.class_weight_neg == 1.0
+
+
+def test_evaluate_classification_report() -> None:
+    rows = [
+        ModelRow(timestamp=0, close=100.0, features=(1.0, 0.0), label=1),
+        ModelRow(timestamp=1, close=101.0, features=(0.0, 0.0), label=0),
+        ModelRow(timestamp=2, close=102.0, features=(1.0, 0.0), label=1),
+    ]
+    model = TrainedModel(
+        weights=[1.0, 1.0],
+        bias=-0.1,
+        feature_dim=2,
+        epochs=1,
+        feature_means=[0.0, 0.0],
+        feature_stds=[1.0, 1.0],
+    )
+    report = evaluate_classification(rows, model, threshold=0.5)
+    assert isinstance(report, ClassificationReport)
+    assert report.true_positive + report.false_positive + report.true_negative + report.false_negative == len(rows)
+    assert 0.0 <= report.accuracy <= 1.0
 
 
 def test_walk_forward_report_runs() -> None:

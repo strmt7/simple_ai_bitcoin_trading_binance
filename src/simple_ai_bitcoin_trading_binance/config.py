@@ -10,6 +10,16 @@ from typing import Callable, Dict
 from .types import RuntimeConfig, StrategyConfig, config_paths
 
 
+def _read_config_json(path: Path) -> Dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
 def _write_json(path: Path, payload: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -21,7 +31,7 @@ def load_runtime(overrides: Dict[str, object] | None = None) -> RuntimeConfig:
     paths = config_paths()
     payload = {}
     if paths["runtime"].exists():
-        payload.update(json.loads(paths["runtime"].read_text(encoding="utf-8")))
+        payload.update(_read_config_json(paths["runtime"]))
     if overrides:
         payload.update(overrides)
     return RuntimeConfig(**{k: v for k, v in payload.items() if hasattr(RuntimeConfig, k)})
@@ -36,10 +46,16 @@ def load_strategy() -> StrategyConfig:
     paths = config_paths()
     payload = {}
     if paths["strategy"].exists():
-        raw = json.loads(paths["strategy"].read_text(encoding="utf-8"))
+        raw = _read_config_json(paths["strategy"])
         payload.update(raw)
-    if payload.get("feature_windows") and isinstance(payload["feature_windows"], list):
-        payload["feature_windows"] = tuple(payload["feature_windows"])
+    windows = payload.get("feature_windows")
+    if isinstance(windows, (list, tuple)) and len(windows) == 2:
+        try:
+            payload["feature_windows"] = tuple(int(v) for v in windows)
+        except (TypeError, ValueError):
+            payload["feature_windows"] = (10, 40)
+    else:
+        payload["feature_windows"] = (10, 40)
     return StrategyConfig(**{k: v for k, v in payload.items() if hasattr(StrategyConfig, k)})
 
 

@@ -70,6 +70,25 @@ def _collect_feature_stats(rows: Iterable[ModelRow]) -> tuple[List[float], List[
     return means, stds
 
 
+@dataclass(frozen=True)
+class ClassificationReport:
+    accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    threshold: float
+    true_positive: int
+    false_positive: int
+    true_negative: int
+    false_negative: int
+
+
+def _safe_division(numerator: int, denominator: int) -> float:
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
 def _normalize_rows(rows: List[ModelRow], means: List[float], stds: List[float]) -> List[Tuple[float, ...]]:
     return [tuple((x - m) / s for x, m, s in zip(r.features, means, stds)) for r in rows]
 
@@ -207,6 +226,42 @@ def evaluate(rows: List[ModelRow], model: TrainedModel, threshold: float = 0.5) 
 
 def evaluate_confusion(rows: List[ModelRow], model: TrainedModel, threshold: float = 0.5) -> tuple[int, int, int, int]:
     return _confusion(rows, model, threshold)
+
+
+def evaluate_classification(
+    rows: List[ModelRow],
+    model: TrainedModel,
+    threshold: float = 0.5,
+) -> ClassificationReport:
+    if not rows:
+        return ClassificationReport(
+            accuracy=0.0,
+            precision=0.0,
+            recall=0.0,
+            f1=0.0,
+            threshold=_clamp(threshold, 0.0, 1.0),
+            true_positive=0,
+            false_positive=0,
+            true_negative=0,
+            false_negative=0,
+        )
+    tp, fp, tn, fn = _confusion(rows, model, threshold)
+    total = tp + fp + tn + fn
+    precision = _safe_division(tp, tp + fp)
+    recall = _safe_division(tp, tp + fn)
+    f1 = _f1(tp, fp, fn)
+    accuracy = (tp + tn) / total
+    return ClassificationReport(
+        accuracy=accuracy,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        threshold=_clamp(threshold, 0.0, 1.0),
+        true_positive=tp,
+        false_positive=fp,
+        true_negative=tn,
+        false_negative=fn,
+    )
 
 
 def walk_forward_report(
