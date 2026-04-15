@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from simple_ai_bitcoin_trading_binance.features import ModelRow
 from pathlib import Path
 
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
     ClassificationReport,
+    ModelFeatureMismatchError,
+    load_model,
     evaluate_classification,
     evaluate,
-    load_model,
     train,
     walk_forward_report,
 )
@@ -37,6 +40,7 @@ def test_load_model_backwards_compatibility(tmp_path: Path) -> None:
         """
         {
           "weights": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
+          "feature_version": "v1",
           "bias": 0.01,
           "feature_dim": 13,
           "epochs": 10,
@@ -52,6 +56,26 @@ def test_load_model_backwards_compatibility(tmp_path: Path) -> None:
     assert model.l2_penalty == 1e-4
     assert model.class_weight_pos == 1.0
     assert model.class_weight_neg == 1.0
+
+
+def test_load_model_rejects_mismatched_version(tmp_path: Path) -> None:
+    model_path = tmp_path / "bad_model.json"
+    model_path.write_text(
+        """
+        {
+          "weights": [0.1, 0.2, 0.3],
+          "feature_version": "v0",
+          "bias": 0.01,
+          "feature_dim": 3,
+          "epochs": 10,
+          "feature_means": [1.0, 1.0, 1.0],
+          "feature_stds": [1.0, 1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelFeatureMismatchError, match="Feature version mismatch"):
+        load_model(model_path)
 
 
 def test_evaluate_classification_report() -> None:

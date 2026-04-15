@@ -18,6 +18,8 @@ from .model import (
     calibrate_threshold,
     evaluate_classification,
     evaluate,
+    ModelFeatureMismatchError,
+    ModelLoadError,
     load_model,
     serialize_model,
     train,
@@ -225,6 +227,14 @@ def _resolve_symbol_constraints(runtime, client) -> SymbolConstraints | None:
         return client.get_symbol_constraints(runtime.symbol)
     except BinanceAPIError:
         return None
+
+
+def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
+    return load_model(
+        model_path,
+        expected_feature_version=strategy.feature_version,
+        expected_feature_dim=None,
+    )
 
 
 def _target_notional(
@@ -674,7 +684,11 @@ def command_backtest(args: argparse.Namespace) -> int:
         return 2
 
     rows = _build_model_rows(_rows_from_json(args.input), cfg)
-    model = load_model(model_path)
+    try:
+        model = _load_runtime_model(model_path, cfg)
+    except (ModelLoadError, ModelFeatureMismatchError) as exc:
+        print(f"Model load failed: {exc}", file=sys.stderr)
+        return 2
     result = run_backtest(rows, model, cfg, starting_cash=args.start_cash, market_type=runtime.market_type)
     print(f"backtest BTCUSDC ({runtime.symbol})")
     print(f"market: {runtime.market_type}")
@@ -721,7 +735,11 @@ def command_evaluate(args: argparse.Namespace) -> int:
     train_rows = rows[:split]
     test_rows = rows[split:]
 
-    model = load_model(model_path)
+    try:
+        model = _load_runtime_model(model_path, cfg)
+    except (ModelLoadError, ModelFeatureMismatchError) as exc:
+        print(f"Model load failed: {exc}", file=sys.stderr)
+        return 2
     threshold = cfg.signal_threshold
     if args.threshold is not None:
         threshold = float(args.threshold)
@@ -806,7 +824,10 @@ def command_live(args: argparse.Namespace) -> int:
 
     if model_path.exists():
         try:
-            model = load_model(model_path)
+            model = _load_runtime_model(model_path, cfg)
+        except (ModelLoadError, ModelFeatureMismatchError) as exc:
+            print(f"Model load failed; regenerating: {exc}", file=sys.stderr)
+            model = None
         except Exception:
             model = None
     else:

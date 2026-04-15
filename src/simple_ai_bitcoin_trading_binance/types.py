@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+from .features import FEATURE_VERSION
+
 
 @dataclass
 class RuntimeConfig:
@@ -48,6 +50,7 @@ class StrategyConfig:
     taker_fee_bps: float = 1.0
     slippage_bps: float = 5.0
     label_threshold: float = 0.001
+    feature_version: str = FEATURE_VERSION
 
     def asdict(self) -> Dict[str, Any]:
         payload = asdict(self)

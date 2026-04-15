@@ -9,12 +9,36 @@ from typing import List, Sequence, Tuple
 from .api import Candle
 
 
+FEATURE_VERSION = "v1"
+
+# Ordered feature names and count used by persistence checks.
+FEATURE_NAMES = (
+    "momentum_1",
+    "momentum_3",
+    "momentum_10",
+    "momentum_20",
+    "ema_spread",
+    "rsi",
+    "ema_gap",
+    "relative_atr",
+    "volatility_20",
+    "volume_ratio",
+    "trend_acceleration",
+    "gap_to_vwap",
+    "volume_trend",
+)
+
+
 @dataclass(frozen=True)
 class ModelRow:
     timestamp: int
     close: float
     features: Tuple[float, ...]
     label: int
+
+
+def feature_dimension() -> int:
+    return len(FEATURE_NAMES)
 
 
 def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -159,4 +183,3 @@ def make_rows_legacy(candles: Sequence[Candle], short_window: int, long_window: 
                      lookahead: int = 1) -> List[ModelRow]:
     """Compatibility helper for existing integrations expecting 5-feature rows."""
     return make_rows(candles, short_window, long_window, lookahead=lookahead, label_threshold=0.001)
-
