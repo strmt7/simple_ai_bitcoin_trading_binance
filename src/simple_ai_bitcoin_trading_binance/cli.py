@@ -16,6 +16,7 @@ from .features import make_rows
 from .api import SymbolConstraints
 from .model import (
     calibrate_threshold,
+    evaluate_classification,
     evaluate,
     load_model,
     serialize_model,
@@ -78,9 +79,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_backtest.add_argument("--start-cash", type=float, default=1000.0)
     parser_backtest.set_defaults(func=command_backtest)
 
+    parser_evaluate = subparsers.add_parser("evaluate", help="evaluate saved model against cached candles")
+    parser_evaluate.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_evaluate.add_argument("--model", default="data/model.json")
+    parser_evaluate.add_argument("--threshold", type=float, default=None)
+    parser_evaluate.add_argument("--calibrate-threshold", action="store_true")
+    parser_evaluate.set_defaults(func=command_evaluate)
+
     parser_live = subparsers.add_parser("live", help="run a conservative live loop on testnet or paper mode")
     parser_live.add_argument("--steps", type=int, default=20)
     parser_live.add_argument("--sleep", type=int, default=5)
+    parser_live.add_argument("--leverage", type=float, default=None, help="override leverage for this run (futures only)")
     parser_live.add_argument(
         "--paper",
         action="store_true",
@@ -143,17 +152,20 @@ def _rows_from_json(path: str):
     for item in candles_raw:
         if not isinstance(item, dict):
             continue
-        rows.append(
-            Candle(
-                open_time=int(item["open_time"]),
-                open=float(item["open"]),
-                high=float(item["high"]),
-                low=float(item["low"]),
-                close=float(item["close"]),
-                volume=float(item["volume"]),
-                close_time=int(item["close_time"]),
+        try:
+            rows.append(
+                Candle(
+                    open_time=int(item["open_time"]),
+                    open=float(item["open"]),
+                    high=float(item["high"]),
+                    low=float(item["low"]),
+                    close=float(item["close"]),
+                    volume=float(item["volume"]),
+                    close_time=int(item["close_time"]),
+                )
             )
-        )
+        except (TypeError, ValueError, KeyError):
+            continue
     return rows
 
 
@@ -391,7 +403,7 @@ def command_strategy(args: argparse.Namespace) -> int:
     if args.take is not None:
         updates["take_profit_pct"] = max(0.0, min(0.99, args.take))
     if args.max_open is not None:
-        updates["max_open_positions"] = max(1, args.max_open)
+        updates["max_open_positions"] = max(0, args.max_open)
     if args.max_trades_per_day is not None:
         updates["max_trades_per_day"] = max(0, args.max_trades_per_day)
     if args.cooldown is not None:
@@ -563,7 +575,9 @@ def command_tune(args: argparse.Namespace) -> int:
                             market_type=runtime.market_type,
                             starting_cash=1000.0,
                         )
-                        score = candidate_result.realized_pnl - candidate_result.total_fees
+                        score = _tune_score(candidate_result, starting_cash=1000.0)
+                        if getattr(candidate_result, "stopped_by_drawdown", False):
+                            continue
                         if score > best_score:
                             best_score = score
                             best = candidate
@@ -600,12 +614,88 @@ def command_backtest(args: argparse.Namespace) -> int:
     print(f"starting_cash: {result.starting_cash:.2f}")
     print(f"ending_cash: {result.ending_cash:.2f}")
     print(f"max_drawdown: {result.max_drawdown:.2%}")
+    print(f"stopped_by_drawdown: {result.stopped_by_drawdown}")
+    return 0
+
+
+def _tune_score(result: object, starting_cash: float = 1000.0) -> float:
+    realized = float(getattr(result, "realized_pnl", 0.0))
+    total_fees = float(getattr(result, "total_fees", 0.0))
+    max_drawdown = float(getattr(result, "max_drawdown", 0.0))
+    closed_trades = int(getattr(result, "closed_trades", 0))
+    stopped_by_drawdown = bool(getattr(result, "stopped_by_drawdown", False))
+    score = realized - total_fees
+    score -= max_drawdown * starting_cash
+    if stopped_by_drawdown:
+        score -= starting_cash * 0.5
+    if closed_trades <= 0:
+        score -= 50.0
+    return score
+
+
+def command_evaluate(args: argparse.Namespace) -> int:
+    cfg = load_strategy()
+    rows = _build_model_rows(_rows_from_json(args.input), cfg)
+    if not rows:
+        print("No rows available for evaluation. Fetch more data first.")
+        return 2
+
+    model_path = Path(args.model)
+    if not model_path.exists():
+        print(f"Model file not found: {model_path}")
+        return 2
+
+    split = max(1, int(len(rows) * 0.8))
+    train_rows = rows[:split]
+    test_rows = rows[split:]
+
+    model = load_model(model_path)
+    threshold = cfg.signal_threshold
+    if args.threshold is not None:
+        threshold = float(args.threshold)
+    elif test_rows:
+        # make default threshold robust against short samples and class imbalance
+        threshold = cfg.signal_threshold
+
+    if args.calibrate_threshold and test_rows:
+        threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
+
+    report = evaluate_classification(test_rows if test_rows else rows, model, threshold=threshold)
+    train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
+
+    print(f"evaluate model={model_path}")
+    print(f"threshold: {report.threshold:.3f}")
+    if train_report is None:
+        print("train_size: 0")
+    else:
+        print(
+            "train_accuracy: "
+            f"{train_report.accuracy:.3f} precision={train_report.precision:.3f} "
+            f"recall={train_report.recall:.3f} f1={train_report.f1:.3f}"
+        )
+    print(
+        "test_accuracy: "
+        f"{report.accuracy:.3f} precision={report.precision:.3f} "
+        f"recall={report.recall:.3f} f1={report.f1:.3f}"
+    )
+    print(
+        "confusion tp={tp} fp={fp} tn={tn} fn={fn}".format(
+            tp=report.true_positive, fp=report.false_positive, tn=report.true_negative, fn=report.false_negative
+        )
+    )
     return 0
 
 
 def command_live(args: argparse.Namespace) -> int:
     runtime = load_runtime()
     cfg = load_strategy()
+    leverage_override = getattr(args, "leverage", None)
+    if leverage_override is not None:
+        requested = max(1.0, leverage_override)
+        if runtime.market_type == "futures":
+            cfg = StrategyConfig(**{**cfg.asdict(), "leverage": requested})
+        else:
+            print("Leverage override is spot-inactive; spot runs at 1x.")
     client = _build_client(runtime)
     model_path = Path("data/model.json")
 
@@ -635,7 +725,12 @@ def command_live(args: argparse.Namespace) -> int:
     qty = 0.0
     wait_ticks = cfg.cooldown_minutes
     cooldown_left = 0
-    leverage = _resolve_futures_leverage(runtime, cfg)
+    if leverage > 125.0:
+        leverage = 125.0
+    elif leverage < 1.0:
+        leverage = 1.0
+    equity_peak = cash
+    max_drawdown_seen = 0.0
 
     if model_path.exists():
         try:
@@ -657,7 +752,7 @@ def command_live(args: argparse.Namespace) -> int:
     if max_daily_trades <= 0:
         max_daily_trades = 0
     daily_trade_count: dict[int, int] = {}
-    max_open_positions = max(1, int(cfg.max_open_positions))
+    max_open_positions = int(cfg.max_open_positions)
 
     for i in range(args.steps):
         try:
@@ -686,14 +781,13 @@ def command_live(args: argparse.Namespace) -> int:
 
         price = latest.close
         day = _safe_day_ms(latest.timestamp)
-        open_positions = 1 if position_side != 0 else 0
         trade_cap_reached = max_daily_trades > 0 and daily_trade_count.get(day, 0) >= max_daily_trades
         if position_side == 0 and direction != 0:
             if trade_cap_reached:
                 print(f"step {i + 1:>2}: trade cap reached ({max_daily_trades}/day), skipping entry")
                 time.sleep(max(1, args.sleep))
                 continue
-            if open_positions >= max_open_positions:
+            if max_open_positions <= 0:
                 print(f"step {i + 1:>2}: max open positions reached ({max_open_positions}), skipping entry")
                 time.sleep(max(1, args.sleep))
                 continue
@@ -802,8 +896,49 @@ def command_live(args: argparse.Namespace) -> int:
                 if direction == 0:
                     cooldown_left = max(0, wait_ticks)
 
+            # safety stop: drop out if drawdown exceeds configured cap
+            if position_side != 0:
+                equity = cash + margin_used + pnl
+            else:
+                equity = cash
+            if equity > equity_peak:
+                equity_peak = equity
+            drawdown = (equity_peak - equity) / equity_peak if equity_peak else 0.0
+            if drawdown > max_drawdown_seen:
+                max_drawdown_seen = drawdown
+            if cfg.max_drawdown_limit > 0.0 and drawdown >= cfg.max_drawdown_limit:
+                if position_side != 0:
+                    fill = price * (1.0 - position_side * slippage)
+                    realized = position_side * (fill - entry_price) * qty
+                    exit_fee = abs(position_notional) * fee_rate
+                    cash += margin_used + realized - exit_fee
+
+                    side_to_close = "SELL" if position_side > 0 else "BUY"
+                    _paper_or_live_order(
+                        client,
+                        runtime,
+                        cfg,
+                        side=side_to_close,
+                        size=abs(qty),
+                        dry_run=effective_dry_run,
+                        leverage=leverage,
+                    )
+                    print(
+                        f"step {i + 1:>2}: emergency close from drawdown "
+                        f"{drawdown:.2%}; cash={cash:.2f}"
+                    )
+                    position_notional = 0.0
+                    position_side = 0
+                    qty = 0.0
+                    margin_used = 0.0
+                    entry_price = 0.0
+                print(f"step {i + 1:>2}: drawdown limit reached ({cfg.max_drawdown_limit:.1%}), stopping loop")
+                break
+
         time.sleep(max(1, args.sleep))
 
+    if max_drawdown_seen > 0.0:
+        print(f"max_drawdown observed: {max_drawdown_seen:.2%}")
     print(f"finished loop market={runtime.market_type} cash={cash:.2f}")
     return 0
 
