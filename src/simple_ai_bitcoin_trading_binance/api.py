@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import re
+import time
 import hashlib
 import hmac
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-import json
-import time
-import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -28,7 +28,7 @@ _RETRY_BAPI_CODES = {-1003, -1007}
 def _extract_retry_after(value: str | None) -> float | None:
     if not value:
         return None
-    if not re.fullmatch(r"\d+", value.strip()):
+    if not re.fullmatch(r"\d+(\.\d+)?", value.strip()):
         return None
     try:
         return max(0.0, float(value.strip()))
@@ -107,6 +107,25 @@ class BinanceClient:
             "path": None,
         }
 
+    def _record_request(
+        self,
+        attempt: int,
+        response_status: int | None,
+        method: str,
+        path: str,
+        url: str,
+        last_error: str | None,
+    ) -> None:
+        self.last_request_info = {
+            "attempts": attempt,
+            "status": response_status,
+            "retries": max(0, attempt - 1),
+            "method": method,
+            "path": path,
+            "last_error": last_error,
+            "url": url,
+        }
+
     def _throttle(self) -> None:
         now = datetime.now(timezone.utc)
         min_interval = timedelta(seconds=self._call_delay)
@@ -139,6 +158,7 @@ class BinanceClient:
         max_attempts = self.max_retries + 1
         last_error = None
         response_status: int | None = None
+        last_url: str | None = None
 
         for attempt in range(max_attempts):
             self._throttle()
@@ -157,6 +177,7 @@ class BinanceClient:
             else:
                 payload = dict(params)
                 url = f"{self.base_url}{path}"
+            last_url = url
 
             try:
                 response = self.session.request(method, url, params=payload, timeout=self.timeout)
@@ -166,6 +187,7 @@ class BinanceClient:
                     delay = self._retry_delay(attempt, response_status=response_status)
                     time.sleep(delay)
                     continue
+                self._record_request(attempt + 1, response_status, method, path, url, last_error)
                 raise BinanceAPIError(f"Binance request failed: {err}") from err
 
             response_status = response.status_code
@@ -176,6 +198,7 @@ class BinanceClient:
                     delay = self._retry_delay(attempt, response_status=response_status, retry_after=retry_after)
                     time.sleep(delay)
                     continue
+                self._record_request(attempt + 1, response_status, method, path, url, last_error)
                 raise BinanceAPIError(f"Binance returned {response.status_code}: {response.text}")
 
             try:
@@ -186,6 +209,7 @@ class BinanceClient:
                     delay = self._retry_delay(attempt, response_status=response_status)
                     time.sleep(delay)
                     continue
+                self._record_request(attempt + 1, response_status, method, path, url, last_error)
                 raise BinanceAPIError("Malformed response from Binance") from err
 
             if isinstance(data, dict) and data.get("code") and data.get("msg"):
@@ -195,27 +219,20 @@ class BinanceClient:
                     delay = self._retry_delay(attempt, response_status=response_status)
                     time.sleep(delay)
                     continue
+                self._record_request(
+                    attempt + 1,
+                    response_status,
+                    method,
+                    path,
+                    url,
+                    f"Binance API error {data['code']}: {data['msg']}",
+                )
                 raise BinanceAPIError(f"Binance API error {data['code']}: {data['msg']}")
 
-            self.last_request_info = {
-                "attempts": attempt + 1,
-                "status": response_status,
-                "retries": attempt,
-                "method": method,
-                "path": path,
-                "last_error": None,
-                "url": url,
-            }
+            self._record_request(attempt + 1, response_status, method, path, url, None)
             return data
 
-        self.last_request_info = {
-            "attempts": max_attempts,
-            "status": response_status,
-            "retries": max_attempts - 1,
-            "method": method,
-            "path": path,
-            "last_error": last_error,
-        }
+        self._record_request(max_attempts, response_status, method, path, last_url or path, last_error)
         raise BinanceAPIError(last_error or "Binance request failed")
 
     def ping(self) -> Dict[str, object] | None:

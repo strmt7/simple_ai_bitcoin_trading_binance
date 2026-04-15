@@ -13,6 +13,7 @@ from simple_ai_bitcoin_trading_binance.api import (
     BinanceClient,
     SymbolConstraints,
     _default_base_url,
+    _extract_retry_after,
 )
 
 
@@ -57,6 +58,92 @@ def test_request_parses_json_and_raises_http_errors(monkeypatch) -> None:
     monkeypatch.setattr(client.session, "request", request)
     with pytest.raises(BinanceAPIError, match="Binance returned 429"):
         client.ping()
+
+
+def test_extract_retry_after_validates_input() -> None:
+    assert _extract_retry_after(None) is None
+    assert _extract_retry_after("12.5") == 12.5
+    assert _extract_retry_after("  7 ") == 7.0
+    assert _extract_retry_after("bad") is None
+    assert _extract_retry_after("12.7s") is None
+    assert _extract_retry_after("1e3") is None
+
+
+def test_retryable_code_validator_handles_non_numeric_codes() -> None:
+    assert BinanceClient._is_retryable_code("-1003") is True
+    assert BinanceClient._is_retryable_code(-1007) is True
+    assert BinanceClient._is_retryable_code("bad") is False
+    assert BinanceClient._is_retryable_code(None) is False
+
+
+def test_request_retries_when_params_are_non_dict(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", max_retries=0)
+    observed: list[dict] = []
+
+    def request(_method: str, _url: str, params=None, timeout=None):
+        observed.append(params if isinstance(params, dict) else {})
+        return _FakeResponse(200, {"ok": True})
+
+    monkeypatch.setattr(client.session, "request", request)
+    assert client._request("GET", "/api/v3/ping", params=["not", "a", "dict"]) == {"ok": True}
+    assert observed == [dict()]
+
+
+def test_request_retries_transport_error_then_succeeds(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", max_retries=1)
+    client._call_delay = 0.0
+    calls: list[float] = []
+    seq: list[object] = [requests.Timeout("timeout"), _FakeResponse(200, {"ok": True})]
+
+    def request(_method: str, _url: str, params=None, timeout=None):
+        next_value = seq.pop(0)
+        if isinstance(next_value, Exception):
+            raise next_value
+        return next_value
+
+    monkeypatch.setattr(client.session, "request", request)
+    monkeypatch.setattr(time, "sleep", lambda seconds: calls.append(seconds))
+    assert client._request("GET", "/api/v3/ping") == {"ok": True}
+    assert calls == [0.5]
+
+
+def test_request_retries_on_malformed_json_then_succeeds(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", max_retries=1)
+    client._call_delay = 0.0
+    responses = [
+        _FakeResponse(200, payload=JSONDecodeError("bad json", "{}", 0), text="bad"),
+        _FakeResponse(200, payload={"ok": True}),
+    ]
+    sleeps: list[float] = []
+
+    def request(method: str, url: str, params=None, timeout=None):
+        return responses.pop(0)
+
+    monkeypatch.setattr(client.session, "request", request)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    assert client._request("GET", "/api/v3/ping") == {"ok": True}
+    assert sleeps == [0.5]
+
+
+def test_request_retry_status_stops_after_exhaustion(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", max_retries=1)
+    client._call_delay = 0.0
+    responses = [_FakeResponse(500, text="server down"), _FakeResponse(500, text="server down")]
+
+    def request(method: str, url: str, params=None, timeout=None):
+        return responses.pop(0)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(client.session, "request", request)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(BinanceAPIError, match="Binance returned 500"):
+        client._request("GET", "/api/v3/ping")
+    assert len(sleeps) == 1
+    assert client.last_request_info["attempts"] == 2
+    assert client.last_request_info["retries"] == 1
+    assert client.last_request_info["status"] == 500
+    assert client.last_request_info["method"] == "GET"
+    assert client.last_request_info["path"] == "/api/v3/ping"
 
 
 def test_request_retries_on_rate_limits(monkeypatch) -> None:
