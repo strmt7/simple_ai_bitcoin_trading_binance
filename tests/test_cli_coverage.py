@@ -84,6 +84,12 @@ def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     assert cli.main(["status"]) == 9
     assert marker == ["status"]
 
+    live = cli._parse_args(["live", "--steps", "3"])
+    assert live.retrain_interval == 0
+    assert live.retrain_window == 300
+    assert live.retrain_min_rows == 240
+    assert live.paper is False
+
 
 def test_clamp_and_direction_helpers() -> None:
     assert cli._clamp(1.2, 0.0, 1.0) == 1.0
@@ -424,6 +430,64 @@ def test_resolve_symbol_constraints_error_returns_none() -> None:
             raise BinanceAPIError("boom")
 
     assert cli._resolve_symbol_constraints(runtime, _ErrorClient()) is None
+
+
+def test_resolve_live_retrain_rows() -> None:
+    rows = list(range(5))
+    assert cli._resolve_live_retrain_rows(rows, retrain_window=10, retrain_min_rows=10) == []
+    assert cli._resolve_live_retrain_rows(rows, retrain_window=10, retrain_min_rows=3) == rows
+    assert cli._resolve_live_retrain_rows(list(range(15)), retrain_window=10, retrain_min_rows=3) == list(range(5, 15))
+
+
+def test_build_live_model_retrain_interval(monkeypatch) -> None:
+    cfg = StrategyConfig(training_epochs=100)
+
+    calls: list[tuple[int, int]] = []
+
+    def fake_train(rows, epochs: int = 100):
+        calls.append((len(rows), epochs))
+        return f"model-{len(calls)}"
+
+    monkeypatch.setattr(cli, "train", fake_train)
+
+    base_rows = list(range(200))
+    model = cli._build_live_model(
+        base_rows,
+        model=None,
+        retrain_every=2,
+        step=1,
+        cfg=cfg,
+        retrain_window=50,
+        retrain_min_rows=40,
+    )
+    assert model == "model-1"
+    assert len(calls) == 1
+    assert calls[-1][0] == 50
+
+    model = cli._build_live_model(
+        base_rows,
+        model=model,
+        retrain_every=2,
+        step=3,
+        cfg=cfg,
+        retrain_window=50,
+        retrain_min_rows=40,
+    )
+    assert model == "model-1"
+    assert len(calls) == 1
+
+    model = cli._build_live_model(
+        base_rows,
+        model=model,
+        retrain_every=2,
+        step=4,
+        cfg=cfg,
+        retrain_window=50,
+        retrain_min_rows=40,
+    )
+    assert model == "model-2"
+    assert len(calls) == 2
+    assert calls[-1][0] == 50
 
 
 def test_command_configure_save_and_validation_paths(tmp_path, monkeypatch, capsys) -> None:
@@ -849,6 +913,8 @@ def test_command_live_skips_entry_when_cash_is_insufficient_after_fees(tmp_path,
     monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
     monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
     assert cli.command_live(argparse.Namespace(steps=1, sleep=5, paper=False)) == 0
+
+
 def test_command_tune_data_insufficient(tmp_path) -> None:
     save_runtime(RuntimeConfig())
     save_strategy(StrategyConfig())
@@ -871,6 +937,67 @@ def test_command_tune_data_insufficient(tmp_path) -> None:
         max_stop=0.04,
     )
     assert cli.command_tune(args) == 2
+
+
+def test_command_live_retrain_interval_rebuilds_model_in_loop(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    class _FlowClient:
+        def get_klines(self, symbol: str, interval: str, limit: int = 500, start_time=None, end_time=None):
+            return _simple_candles(limit)
+
+        def get_symbol_constraints(self, symbol: str):
+            return SimpleNamespace(
+                symbol=symbol,
+                min_qty=0.0001,
+                max_qty=100.0,
+                step_size=0.0001,
+                min_notional=1.0,
+                max_notional=0.0,
+            )
+
+        def normalize_quantity(self, symbol: str, quantity: float):
+            constraints = self.get_symbol_constraints(symbol)
+            return max(constraints.min_qty, round(quantity, 4)), constraints
+
+        def place_order(self, symbol: str, side: str, size: float, *, dry_run: bool, leverage: float = 1.0):
+            return {"symbol": symbol, "side": side, "size": size, "dry_run": dry_run}
+
+    class _AlwaysLongModel:
+        def __init__(self):
+            self.calls = 0
+
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            self.calls += 1
+            return 0.99
+
+    train_calls = []
+
+    def fake_train(rows, epochs: int):
+        train_calls.append(len(rows))
+        return _AlwaysLongModel()
+
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2))
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FlowClient())
+    monkeypatch.setattr(cli, "train", fake_train)
+
+    assert cli.command_live(
+        argparse.Namespace(
+            steps=3,
+            sleep=5,
+            paper=False,
+            retrain_interval=2,
+            retrain_window=120,
+            retrain_min_rows=100,
+        )
+    ) == 0
+
+    # initial build at step 1 + rebuild at step 2 (interval=2), no rebuild at step 3
+    assert train_calls == [120, 120]
+
 
 
 def test_command_live_rejects_live_when_not_testnet(tmp_path, monkeypatch) -> None:

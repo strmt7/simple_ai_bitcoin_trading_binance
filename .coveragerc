@@ -1,0 +1,16 @@
+[run]
+branch = True
+source = src/simple_ai_bitcoin_trading_binance
+omit =
+    src/simple_ai_bitcoin_trading_binance/__main__.py
+
+[report]
+skip_empty = True
+show_missing = True
+fail_under = 80
+
+[xml]
+output = coverage.xml
+
+[html]
+directory = htmlcov

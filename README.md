@@ -92,6 +92,9 @@ Runs a real-time loop that continuously re-trains on a rolling window and execut
 - `--paper` forces dry-run execution even when runtime is set to live.
 - Spot mode always executes at 1x. Futures mode uses configured leverage (clamped by exchange leverage bracket when credentials are present).
 - `--leverage` overrides leverage for the current run in futures mode.
+- `--retrain-interval` controls how often the in-loop model is rebuilt from recent history (`0` disables periodic rebuild).
+- `--retrain-window` sets how many latest feature rows are used per rebuild.
+- `--retrain-min-rows` sets the minimum rows required before any periodic rebuild is attempted.
 
 Leverage details:
 - spot mode always runs at 1x.

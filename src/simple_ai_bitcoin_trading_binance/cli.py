@@ -91,6 +91,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_live.add_argument("--sleep", type=int, default=5)
     parser_live.add_argument("--leverage", type=float, default=None, help="override leverage for this run (futures only)")
     parser_live.add_argument(
+        "--retrain-interval",
+        type=int,
+        default=0,
+        help="retrain model every N steps (0 disables, for adaptive paper/live behavior)",
+    )
+    parser_live.add_argument(
+        "--retrain-window",
+        type=int,
+        default=300,
+        help="number of recent rows used for each live retrain",
+    )
+    parser_live.add_argument(
+        "--retrain-min-rows",
+        type=int,
+        default=240,
+        help="minimum rows required before a retrain is attempted",
+    )
+    parser_live.add_argument(
         "--paper",
         action="store_true",
         help="force paper mode for this run even when runtime.dry_run is false",
@@ -276,6 +294,43 @@ def _build_order_notional(
 
 def _safe_day_ms(timestamp_ms: int) -> int:
     return int(timestamp_ms // (24 * 60 * 60 * 1000))
+
+
+def _resolve_live_retrain_rows(
+    rows: list,
+    *,
+    retrain_window: int,
+    retrain_min_rows: int,
+) -> list:
+    if len(rows) < retrain_min_rows:
+        return []
+    if len(rows) <= retrain_window:
+        return rows
+    return rows[-retrain_window:]
+
+
+def _build_live_model(
+    rows: list,
+    *,
+    model: object | None = None,
+    retrain_every: int,
+    step: int,
+    cfg: StrategyConfig,
+    retrain_window: int,
+    retrain_min_rows: int,
+) -> object | None:
+    if model is not None:
+        if retrain_every <= 0:
+            return model
+        if retrain_every > 0 and step % retrain_every != 0:
+            return model
+
+    train_rows = _resolve_live_retrain_rows(rows, retrain_window=retrain_window, retrain_min_rows=retrain_min_rows)
+    if not train_rows:
+        return model
+
+    epochs = max(20, int(cfg.training_epochs * 0.4))
+    return train(train_rows, epochs=epochs)
 
 
 def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> int:
@@ -783,6 +838,26 @@ def command_live(args: argparse.Namespace) -> int:
             print("not enough historical data for live signal")
             time.sleep(args.sleep)
             continue
+
+        retrain_interval = getattr(args, "retrain_interval", 0)
+        retrain_window = getattr(args, "retrain_window", 300)
+        retrain_min_rows = getattr(args, "retrain_min_rows", 240)
+        if retrain_min_rows <= 0:
+            retrain_min_rows = max(1, 240)
+        if retrain_window <= 0:
+            retrain_window = max(1, 300)
+        if retrain_interval < 0:
+            retrain_interval = 0
+
+        model = _build_live_model(
+            rows,
+            model=model,
+            retrain_every=retrain_interval,
+            step=i + 1,
+            cfg=cfg,
+            retrain_window=retrain_window,
+            retrain_min_rows=retrain_min_rows,
+        )
 
         if model is None:
             model = train(rows, epochs=40)

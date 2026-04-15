@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from simple_ai_bitcoin_trading_binance.config import load_runtime, prompt_runtime, save_runtime
+from simple_ai_bitcoin_trading_binance.config import (
+    _read_config_json,
+    load_runtime,
+    load_strategy,
+    prompt_runtime,
+    save_runtime,
+    save_strategy,
+)
+from simple_ai_bitcoin_trading_binance.config import (
+    config_paths,
+)
 from simple_ai_bitcoin_trading_binance.types import RuntimeConfig
 
 
@@ -31,3 +41,64 @@ def test_prompt_runtime_updates(tmp_path: Path, monkeypatch) -> None:
     assert out.api_key == "api_key"
     assert out.api_secret == "api_secret"
     assert not out.dry_run
+
+
+def test_load_runtime_ignores_invalid_json_payload(tmp_path: Path, monkeypatch) -> None:
+    runtime_path = tmp_path / ".simple_ai_trading" / "runtime.json"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text("{bad json", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    loaded = load_runtime()
+    assert loaded == RuntimeConfig()
+
+
+def test_load_runtime_supports_payload_overrides(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    loaded = load_runtime({"api_key": "x", "api_secret": "y", "max_rate_calls_per_minute": 5})
+    assert loaded.api_key == "x"
+    assert loaded.api_secret == "y"
+    assert loaded.max_rate_calls_per_minute == 5
+
+
+def test_load_strategy_coerces_feature_windows(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["strategy"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text('{"feature_windows": [6, 18], "risk_per_trade": 0.001}', encoding="utf-8")
+    loaded = load_strategy()
+    assert loaded.feature_windows == (6, 18)
+
+
+def test_load_strategy_coerces_invalid_feature_windows(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["strategy"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text('{"feature_windows": [12], "risk_per_trade": 0.002}', encoding="utf-8")
+    loaded = load_strategy()
+    assert loaded.feature_windows == (10, 40)
+    assert loaded.risk_per_trade == 0.002
+
+
+def test_load_strategy_feature_windows_conversion_fails_and_falls_back(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["strategy"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text('{"feature_windows": ["bad", "worse"], "risk_per_trade": 0.004}', encoding="utf-8")
+    loaded = load_strategy()
+    assert loaded.feature_windows == (10, 40)
+    assert loaded.risk_per_trade == 0.004
+
+
+def test_read_config_json_rejects_non_dict_payload(tmp_path: Path) -> None:
+    path = tmp_path / "payload.json"
+    path.write_text("[1, 2, 3]", encoding="utf-8")
+    assert _read_config_json(path) == {}
+    assert _read_config_json(tmp_path / "missing.json") == {}
+
+
+def test_save_strategy_and_read_back(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_strategy(load_strategy())
+    loaded = load_strategy()
+    assert loaded == load_strategy()

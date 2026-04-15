@@ -7,6 +7,7 @@ import hmac
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import json
 import time
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -20,6 +21,19 @@ BINANCE_SPOT_LIVE = "https://api.binance.com"
 BINANCE_FUTURES_TESTNET = "https://testnet.binancefuture.com"
 BINANCE_FUTURES_LIVE = "https://fapi.binance.com"
 _MAX_FUTURES_LEVERAGE = 125
+_RETRY_HTTP_STATUSES = {418, 429, 500, 502, 503, 504}
+_RETRY_BAPI_CODES = {-1003, -1007}
+
+
+def _extract_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    if not re.fullmatch(r"\d+", value.strip()):
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        return None
 
 
 def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
@@ -56,8 +70,17 @@ class SymbolConstraints:
 class BinanceClient:
     """Small HTTP client wrapping only the endpoints required by this tool."""
 
-    def __init__(self, api_key: str, api_secret: str, *, testnet: bool = True,
-                 market_type: str = "spot", timeout: int = 10, max_calls_per_minute: int = 1200):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        *,
+        testnet: bool = True,
+        market_type: str = "spot",
+        timeout: int = 10,
+        max_calls_per_minute: int = 1200,
+        max_retries: int = 4,
+    ):
         if market_type not in {"spot", "futures"}:
             raise ValueError("market_type must be 'spot' or 'futures'")
 
@@ -75,6 +98,14 @@ class BinanceClient:
             max_calls_per_minute = 2000
         self._call_delay = 60.0 / max_calls_per_minute
         self._rate_limit_at: datetime = datetime.now(timezone.utc)
+        self.max_retries = max(0, max_retries)
+        self.last_request_info: Dict[str, object] = {
+            "attempts": 0,
+            "status": None,
+            "retries": 0,
+            "method": None,
+            "path": None,
+        }
 
     def _throttle(self) -> None:
         now = datetime.now(timezone.utc)
@@ -84,38 +115,108 @@ class BinanceClient:
             time.sleep(delay)
         self._rate_limit_at = datetime.now(timezone.utc) + min_interval
 
+    @staticmethod
+    def _is_retryable_code(raw_code: object) -> bool:
+        try:
+            value = int(raw_code)
+        except (TypeError, ValueError):
+            return False
+        return value in _RETRY_BAPI_CODES
+
+    def _retry_delay(self, attempt: int, response_status: int | None, *, retry_after: float | None = None) -> float:
+        if retry_after is not None:
+            return min(60.0, max(0.0, retry_after))
+        base = 0.5
+        return min(30.0, base * (2 ** max(0, attempt)))
+
     def _request(self, method: str, path: str, params: Dict[str, object] | None = None,
                  signed: bool = False) -> Dict[str, object] | List[Dict[str, object]]:
-        self._throttle()
         if params is None:
             params = {}
+        if not isinstance(params, dict):
+            params = {}
 
-        if signed:
-            if not self.api_key or not self.api_secret:
-                raise BinanceAPIError("signed endpoint requires api_key/api_secret")
-            params = dict(params)
-            params.setdefault("timestamp", int(time.time() * 1000))
-            params.setdefault("recvWindow", 5000)
-            query = urlencode(sorted((k, v) for k, v in params.items()))
-            signature = hmac.new(self.api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()
-            query += f"&signature={signature}"
-            url = f"{self.base_url}{path}?{query}"
-            payload = None
-        else:
-            payload = params or {}
-            url = f"{self.base_url}{path}"
+        max_attempts = self.max_retries + 1
+        last_error = None
+        response_status: int | None = None
 
-        response = self.session.request(method, url, params=payload, timeout=self.timeout)
-        if response.status_code >= 400:
-            raise BinanceAPIError(f"Binance returned {response.status_code}: {response.text}")
-        try:
-            data = response.json()
-        except json.JSONDecodeError as err:
-            raise BinanceAPIError("Malformed response from Binance") from err
+        for attempt in range(max_attempts):
+            self._throttle()
 
-        if isinstance(data, dict) and data.get("code") and data.get("msg"):
-            raise BinanceAPIError(f"Binance API error {data['code']}: {data['msg']}")
-        return data
+            if signed:
+                if not self.api_key or not self.api_secret:
+                    raise BinanceAPIError("signed endpoint requires api_key/api_secret")
+                request_params = dict(params)
+                request_params["timestamp"] = int(time.time() * 1000)
+                request_params.setdefault("recvWindow", 5000)
+                query = urlencode(sorted((k, v) for k, v in request_params.items()))
+                signature = hmac.new(self.api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()
+                query += f"&signature={signature}"
+                url = f"{self.base_url}{path}?{query}"
+                payload = None
+            else:
+                payload = dict(params)
+                url = f"{self.base_url}{path}"
+
+            try:
+                response = self.session.request(method, url, params=payload, timeout=self.timeout)
+            except requests.RequestException as err:
+                last_error = str(err)
+                if attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, response_status=response_status)
+                    time.sleep(delay)
+                    continue
+                raise BinanceAPIError(f"Binance request failed: {err}") from err
+
+            response_status = response.status_code
+            if response_status >= 400:
+                retry_after = _extract_retry_after(response.headers.get("Retry-After"))
+                last_error = f"HTTP {response_status}: {response.text}"
+                if response_status in _RETRY_HTTP_STATUSES and attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, response_status=response_status, retry_after=retry_after)
+                    time.sleep(delay)
+                    continue
+                raise BinanceAPIError(f"Binance returned {response.status_code}: {response.text}")
+
+            try:
+                data = response.json()
+            except json.JSONDecodeError as err:
+                last_error = "Malformed response from Binance"
+                if attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, response_status=response_status)
+                    time.sleep(delay)
+                    continue
+                raise BinanceAPIError("Malformed response from Binance") from err
+
+            if isinstance(data, dict) and data.get("code") and data.get("msg"):
+                if self._is_retryable_code(data.get("code")) and attempt < self.max_retries:
+                    code = data.get("code")
+                    last_error = f"Binance API error {code}: {data['msg']}"
+                    delay = self._retry_delay(attempt, response_status=response_status)
+                    time.sleep(delay)
+                    continue
+                raise BinanceAPIError(f"Binance API error {data['code']}: {data['msg']}")
+
+            self.last_request_info = {
+                "attempts": attempt + 1,
+                "status": response_status,
+                "retries": attempt,
+                "method": method,
+                "path": path,
+                "last_error": None,
+                "url": url,
+            }
+            return data
+
+        self.last_request_info = {
+            "attempts": max_attempts,
+            "status": response_status,
+            "retries": max_attempts - 1,
+            "method": method,
+            "path": path,
+            "last_error": last_error,
+        }
+        raise BinanceAPIError(last_error or "Binance request failed")
 
     def ping(self) -> Dict[str, object] | None:
         endpoint = "/api/v3/ping" if self.market_type == "spot" else "/fapi/v1/ping"
@@ -145,16 +246,26 @@ class BinanceClient:
 
     @staticmethod
     def _quantize_to_step(value: float, step_size: float) -> float:
-        if value <= 0:
+        try:
+            value_dec = Decimal(str(value))
+            if not value_dec.is_finite():
+                return 0.0
+            if value_dec <= 0:
+                return 0.0
+        except (InvalidOperation, ValueError, TypeError):
             return 0.0
-        if step_size <= 0:
-            return float(value)
+
         try:
             step = Decimal(str(step_size))
-            if step <= 0:
-                return float(value)
-            v = Decimal(str(value))
-            normalized = (v // step) * step
+        except (InvalidOperation, ValueError, TypeError):
+            return 0.0
+        if not step.is_finite():
+            return 0.0
+        if step <= 0:
+            return float(value_dec)
+
+        normalized = (value_dec // step) * step
+        try:
             return float(normalized.quantize(step, rounding=ROUND_DOWN))
         except (InvalidOperation, ValueError):
             return 0.0
@@ -201,6 +312,8 @@ class BinanceClient:
 
         if min_notional <= 0:
             min_notional = 0.0
+        if max_notional <= 0:
+            max_notional = 0.0
 
         return SymbolConstraints(
             symbol=symbol,
