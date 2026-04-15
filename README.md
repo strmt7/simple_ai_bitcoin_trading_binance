@@ -34,8 +34,18 @@ PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli
 
 This opens the interactive console inside the current terminal window. The console is the primary operator workflow.
 
+The layout is intentionally simple:
+
+- a left action list in operational order
+- one focused work area with `Action`, `Overview`, and `Activity` tabs
+- modal forms for editing runtime, strategy, tuning, and execution parameters
+- password-masked API key and secret fields inside `Runtime settings`
+- footer key hints for navigation and refresh
+
 Use the left action list to:
 
+- read `Help` for the recommended operator sequence
+- update `Runtime settings`, then run `Connect`
 - edit runtime settings
 - edit strategy and feature selection
 - fetch candles
@@ -66,7 +76,7 @@ The console edits:
 - interval
 - market type
 - testnet flag
-- API key and secret
+- API key and secret through password-masked fields
 - paper/live default
 - startup validation
 - max REST calls per minute
