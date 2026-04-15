@@ -28,6 +28,13 @@ class RuntimeConfig:
     def asdict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    def public_dict(self) -> Dict[str, Any]:
+        payload = self.asdict()
+        for field_name in ("api_key", "api_secret"):
+            if payload.get(field_name):
+                payload[field_name] = "<redacted>"
+        return payload
+
 
 @dataclass
 class StrategyConfig:

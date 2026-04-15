@@ -10,6 +10,7 @@ This repository is a compact, testnet-first trading assistant that keeps scope i
 - Supports Binance paper/trade flows on testnet using `/api`, `/api/v3`, `/fapi` testnet hosts.
 - Supports model training, tuning, backtesting, and live loop execution.
 - Stores credentials locally in a user config file with restrictive permissions (`600`).
+- Redacts credential fields from CLI status output and generated JSON run artifacts.
 
 ## Safety defaults
 
@@ -36,6 +37,14 @@ simple-ai-trading evaluate --input data/historical_btcusdc.json --model data/mod
 ```
 
 By default data is stored under `data/historical_btcusdc.json` and `data/model.json`.
+
+If you need to point the client at a different compatible host without changing code, use environment overrides:
+
+```bash
+BINANCE_BASE_URL=https://example-proxy.local simple-ai-trading connect
+BINANCE_SPOT_BASE_URL=https://spot-proxy.local simple-ai-trading connect
+BINANCE_FUTURES_BASE_URL=https://futures-proxy.local simple-ai-trading connect
+```
 
 If your shell does not source the console entrypoint, run with `PYTHONPATH=src`:
 
@@ -134,3 +143,4 @@ python3 -m pytest
 - No deep-learning frameworks are used currently to keep bootstrap dependencies minimal.
 - This is not production trading software; behavior is intentionally conservative and constrained to test-phase workflows.
 - API key security depends on file-system permissions and host security; do not commit secrets to version control.
+- Host selection is configurable via environment overrides, but execution scope remains BTCUSDC-only and testnet-first.

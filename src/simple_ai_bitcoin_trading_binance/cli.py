@@ -209,6 +209,10 @@ def _persist_run_artifact(kind: str, output_dir: Path, payload: dict[str, object
     return path
 
 
+def _public_runtime_payload(runtime) -> dict[str, object]:
+    return runtime.public_dict()
+
+
 def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
     return make_rows(
         candles,
@@ -462,10 +466,7 @@ def command_connect(_: argparse.Namespace) -> int:
 def command_status(_: argparse.Namespace) -> int:
     runtime = load_runtime()
     strategy = load_strategy()
-    payload = runtime.asdict()
-    if payload.get("api_secret"):
-        payload["api_secret"] = "*" * min(4, len(payload["api_secret"]))
-    print(json.dumps({"runtime": payload, "strategy": strategy.asdict()}, indent=2))
+    print(json.dumps({"runtime": _public_runtime_payload(runtime), "strategy": strategy.asdict()}, indent=2))
     return 0
 
 
@@ -628,7 +629,7 @@ def command_train(args: argparse.Namespace) -> int:
         "command": "train",
         "timestamp": int(time.time()),
         "seed": int(seed),
-        "runtime": runtime.asdict(),
+        "runtime": _public_runtime_payload(runtime),
         "strategy": cfg.asdict(),
         "train": {
             "input": str(args.input),
@@ -784,7 +785,7 @@ def command_backtest(args: argparse.Namespace) -> int:
     artifact = {
         "command": "backtest",
         "timestamp": int(time.time()),
-        "runtime": runtime.asdict(),
+        "runtime": _public_runtime_payload(runtime),
         "strategy": cfg.asdict(),
         "input": str(args.input),
         "model": str(model_path),
@@ -877,7 +878,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
     artifact = {
         "command": "evaluate",
         "timestamp": int(time.time()),
-        "runtime": runtime.asdict(),
+        "runtime": _public_runtime_payload(runtime),
         "strategy": cfg.asdict(),
         "input": str(args.input),
         "model": str(args.model),
@@ -1010,7 +1011,7 @@ def command_live(args: argparse.Namespace) -> int:
     live_run = {
         "command": "live",
         "timestamp": int(time.time()),
-        "runtime": runtime.asdict(),
+        "runtime": _public_runtime_payload(runtime),
         "strategy": cfg.asdict(),
         "steps_total": int(args.steps),
         "market": runtime.market_type,
@@ -1194,6 +1195,7 @@ def command_live(args: argparse.Namespace) -> int:
             qty = abs(qty)
             entry_price = fill
             margin_used = margin
+            daily_trade_count[day] = daily_trade_count.get(day, 0) + 1
 
             side = "BUY" if side_sign > 0 else "SELL"
             _paper_or_live_order(
@@ -1231,7 +1233,7 @@ def command_live(args: argparse.Namespace) -> int:
             if should_close:
                 fill = price * (1.0 - position_side * slippage)
                 realized = position_side * (fill - entry_price) * qty
-                exit_fee = abs(position_notional) * fee_rate
+                exit_fee = abs(fill * qty) * fee_rate
                 cash += margin_used + realized - exit_fee
 
                 side_to_close = "SELL" if position_side > 0 else "BUY"
@@ -1244,7 +1246,6 @@ def command_live(args: argparse.Namespace) -> int:
                     dry_run=effective_dry_run,
                     leverage=leverage,
                 )
-                daily_trade_count[day] = daily_trade_count.get(day, 0) + 1
                 print(
                     f"step {i + 1:>2}: close {'long' if position_side > 0 else 'short'} "
                     f"pnl={pnl:.2f} cash={cash:.2f}"
@@ -1301,7 +1302,7 @@ def command_live(args: argparse.Namespace) -> int:
                 if position_side != 0:
                     fill = price * (1.0 - position_side * slippage)
                     realized = position_side * (fill - entry_price) * qty
-                    exit_fee = abs(position_notional) * fee_rate
+                    exit_fee = abs(fill * qty) * fee_rate
                     cash += margin_used + realized - exit_fee
 
                     side_to_close = "SELL" if position_side > 0 else "BUY"

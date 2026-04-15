@@ -42,6 +42,17 @@ def test_default_base_url_matches_market_and_environment() -> None:
     assert _default_base_url(False, "futures") == ("https://fapi.binance.com", "fapi")
 
 
+def test_default_base_url_honors_host_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("BINANCE_BASE_URL", "https://common.example")
+    assert _default_base_url(True, "spot") == ("https://common.example", "api")
+    assert _default_base_url(True, "futures") == ("https://common.example", "fapi")
+
+    monkeypatch.setenv("BINANCE_SPOT_BASE_URL", "https://spot.example")
+    monkeypatch.setenv("BINANCE_FUTURES_BASE_URL", "https://futures.example")
+    assert _default_base_url(True, "spot") == ("https://spot.example", "api")
+    assert _default_base_url(True, "futures") == ("https://futures.example", "fapi")
+
+
 def test_client_rejects_unknown_market_type() -> None:
     with pytest.raises(ValueError, match="market_type must be 'spot' or 'futures'"):
         BinanceClient("k", "s", market_type="swap")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import hashlib
@@ -37,6 +38,19 @@ def _extract_retry_after(value: str | None) -> float | None:
 
 
 def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
+    common_override = os.getenv("BINANCE_BASE_URL", "").strip()
+    if market_type == "futures":
+        futures_override = os.getenv("BINANCE_FUTURES_BASE_URL", "").strip()
+        if futures_override:
+            return futures_override, "fapi"
+        if common_override:
+            return common_override, "fapi"
+        return (BINANCE_FUTURES_TESTNET if testnet else BINANCE_FUTURES_LIVE, "fapi")
+    spot_override = os.getenv("BINANCE_SPOT_BASE_URL", "").strip()
+    if spot_override:
+        return spot_override, "api"
+    if common_override:
+        return common_override, "api"
     if market_type == "futures":
         return (BINANCE_FUTURES_TESTNET if testnet else BINANCE_FUTURES_LIVE, "fapi")
     return (BINANCE_SPOT_TESTNET if testnet else BINANCE_SPOT_LIVE, "api")

@@ -18,6 +18,7 @@ This runbook is for the next iteration, when the app will be exercised interacti
 3. Binance testnet credentials exist and are valid.
 4. Runtime config is explicitly checked before any live step.
 5. Cached historical data and a model artifact can be regenerated locally if needed.
+6. No command output or artifact should contain raw API keys or secrets.
 
 ## Required runtime settings
 
@@ -30,6 +31,11 @@ Run `simple-ai-trading status` and verify:
 - `strategy.max_drawdown_limit` is conservative
 - `strategy.max_trades_per_day` is not unintentionally disabled
 - `strategy.max_open_positions >= 1`
+
+Optional host override checks:
+
+- if a proxy or alternate host is required, set `BINANCE_BASE_URL`, `BINANCE_SPOT_BASE_URL`, or `BINANCE_FUTURES_BASE_URL` explicitly
+- confirm the chosen host is still a testnet-compatible environment before any run
 
 ## Session order
 
