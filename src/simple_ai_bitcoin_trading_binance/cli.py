@@ -550,6 +550,9 @@ def command_tune(args: argparse.Namespace) -> int:
     stops: Iterable[float] = [args.min_stop + (args.max_stop - args.min_stop) * i / max(args.steps - 1, 1)
                               for i in range(args.steps)]
     best: StrategyConfig = cfg
+    fallback: StrategyConfig | None = None
+    fallback_score = float("-inf")
+    tuned = False
     best_score = float("-inf")
 
     for risk in risks:
@@ -576,11 +579,25 @@ def command_tune(args: argparse.Namespace) -> int:
                             starting_cash=1000.0,
                         )
                         score = _tune_score(candidate_result, starting_cash=1000.0)
-                        if getattr(candidate_result, "stopped_by_drawdown", False):
+                        candidate_stopped = bool(getattr(candidate_result, "stopped_by_drawdown", False))
+                        if candidate_stopped:
+                            if score > fallback_score:
+                                fallback_score = score
+                                fallback = candidate
                             continue
                         if score > best_score:
                             best_score = score
                             best = candidate
+                            tuned = True
+        # no valid candidate should silently keep -inf
+    if not tuned:
+        if fallback is not None:
+            best = fallback
+            best_score = fallback_score
+            print("Warning: all tune candidates hit drawdown limit; using best fallback score by risk-adjusted metric.")
+        else:
+            print("No valid candidates evaluated.")
+            return 2
 
     print(f"tune best score: {best_score:.4f}")
     print(

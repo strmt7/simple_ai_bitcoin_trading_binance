@@ -704,6 +704,61 @@ def test_tune_score_penalizes_drawdown_stops() -> None:
     assert cli._tune_score(bad, starting_cash=1000.0) < cli._tune_score(good, starting_cash=1000.0)
 
 
+def test_command_tune_falls_back_to_drawdown_fallback(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig(training_epochs=80))
+
+    candles = []
+    for i in range(240):
+        candles.append(
+            {
+                "open_time": i * 60_000,
+                "open": 100.0 + i,
+                "high": 101.0 + i,
+                "low": 99.0 + i,
+                "close": 100.0 + i,
+                "volume": 1.0,
+                "close_time": (i + 1) * 60_000,
+            },
+        )
+    history = tmp_path / "history.json"
+    history.write_text(json.dumps(candles), encoding="utf-8")
+
+    class _Model:
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            return 0.6
+
+    calls = []
+
+    def _mock_run_backtest(*_args, **_kwargs):
+        calls.append(1)
+        return SimpleNamespace(realized_pnl=float(len(calls)), total_fees=0.0, max_drawdown=0.9, stopped_by_drawdown=True, closed_trades=1)
+
+    monkeypatch.setattr(cli, "train", lambda *_a, **_k: _Model())
+    monkeypatch.setattr(cli, "run_backtest", _mock_run_backtest)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    args = argparse.Namespace(
+        input=str(history),
+        save_best=False,
+        min_risk=0.002,
+        max_risk=0.004,
+        steps=2,
+        min_leverage=2.0,
+        max_leverage=3.0,
+        min_threshold=0.52,
+        max_threshold=0.53,
+        min_take=0.01,
+        max_take=0.02,
+        min_stop=0.01,
+        max_stop=0.02,
+    )
+    assert cli.command_tune(args) == 0
+    assert len(calls) > 0
+    assert "all tune candidates hit drawdown limit" in capsys.readouterr().out
+
+
 def test_command_live_uses_generated_model_when_saved_model_is_invalid(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
