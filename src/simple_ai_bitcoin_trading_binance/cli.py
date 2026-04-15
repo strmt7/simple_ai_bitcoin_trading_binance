@@ -119,6 +119,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="force paper mode for this run even when runtime.dry_run is false",
     )
+    parser_live.add_argument(
+        "--live",
+        action="store_true",
+        help="force authenticated testnet execution even when runtime.dry_run is true",
+    )
     parser_live.set_defaults(func=command_live)
 
     parser_status = subparsers.add_parser("status", help="show persisted runtime and strategy config")
@@ -230,21 +235,192 @@ def _build_strategy_menu_args(cfg: StrategyConfig, *, input_fn: Callable[[str], 
     )
 
 
+def _menu_data_path(name: str, *, input_fn: Callable[[str], str] = input) -> str:
+    default = f"data/{name}"
+    return _menu_prompt_default(f"{name} path", default, input_fn=input_fn)
+
+
+def _recent_artifacts(*, base_dir: Path = Path("data"), limit: int = 8) -> list[Path]:
+    if not base_dir.exists():
+        return []
+    paths = [path for path in base_dir.glob("*.json") if path.is_file()]
+    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return paths[:limit]
+
+
+def _artifact_summary(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return f"{path.name} [unreadable]"
+    if not isinstance(payload, dict):
+        return f"{path.name} [non-object]"
+    command = payload.get("command", "json")
+    timestamp = payload.get("timestamp", "-")
+    symbol = payload.get("symbol") or payload.get("runtime", {}).get("symbol", "-")
+    market = payload.get("market") or payload.get("runtime", {}).get("market_type", "-")
+    return f"{path.name} command={command} symbol={symbol} market={market} ts={timestamp}"
+
+
+def _print_menu_header() -> None:
+    runtime = load_runtime()
+    strategy = load_strategy()
+    print("\nOperator console")
+    print(
+        "runtime: "
+        f"symbol={runtime.symbol} interval={runtime.interval} market={runtime.market_type} "
+        f"testnet={runtime.testnet} paper_default={runtime.dry_run}"
+    )
+    print(
+        "strategy: "
+        f"threshold={strategy.signal_threshold:.3f} risk={strategy.risk_per_trade:.4f} "
+        f"stop={strategy.stop_loss_pct:.4f} take={strategy.take_profit_pct:.4f} "
+        f"cooldown={strategy.cooldown_minutes}m max_trades={strategy.max_trades_per_day}"
+    )
+
+
+def _show_recent_artifacts() -> int:
+    artifacts = _recent_artifacts()
+    if not artifacts:
+        print("No recent artifacts under data/.")
+        return 0
+    print("Recent artifacts:")
+    for path in artifacts:
+        print(f"- {_artifact_summary(path)}")
+    return 0
+
+
+def _show_account_overview() -> int:
+    runtime = load_runtime()
+    if not runtime.api_key or not runtime.api_secret:
+        print("No API credentials configured.")
+        return 2
+    client = _build_client(runtime)
+    try:
+        account = client.get_account()
+    except BinanceAPIError as exc:
+        print(f"Account overview failed: {exc}", file=sys.stderr)
+        return 2
+    balances = account.get("balances", []) if isinstance(account, dict) else []
+    interesting = []
+    for item in balances:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset", ""))
+        free = str(item.get("free", "0"))
+        locked = str(item.get("locked", "0"))
+        if asset in {"BTC", "USDC"} or free not in {"0", "0.0", "0.00000000"} or locked not in {"0", "0.0", "0.00000000"}:
+            interesting.append((asset, free, locked))
+    print("Account overview")
+    print(f"market={runtime.market_type} testnet={runtime.testnet}")
+    if not interesting:
+        print("No non-zero balances found.")
+        return 0
+    for asset, free, locked in interesting[:20]:
+        print(f"- {asset}: free={free} locked={locked}")
+    return 0
+
+
+def _run_offline_pipeline(*, input_fn: Callable[[str], str] = input) -> int:
+    historical = _menu_data_path("historical_btcusdc.json", input_fn=input_fn)
+    model = _menu_data_path("model.json", input_fn=input_fn)
+    fetch_args = argparse.Namespace(
+        symbol=load_runtime().symbol,
+        interval=load_runtime().interval,
+        limit=_menu_prompt_int("Fetch limit", 500, minimum=1, input_fn=input_fn),
+        output=historical,
+    )
+    train_args = argparse.Namespace(
+        input=historical,
+        output=model,
+        epochs=_menu_prompt_int("Training epochs", 120, minimum=1, input_fn=input_fn),
+        seed=_menu_prompt_int("Training seed", 7, minimum=0, input_fn=input_fn),
+        walk_forward=_menu_prompt_bool("Run walk-forward validation", True, input_fn=input_fn),
+        walk_forward_train=_menu_prompt_int("Walk-forward train window", 300, minimum=2, input_fn=input_fn),
+        walk_forward_test=_menu_prompt_int("Walk-forward test window", 60, minimum=1, input_fn=input_fn),
+        walk_forward_step=_menu_prompt_int("Walk-forward step", 30, minimum=1, input_fn=input_fn),
+        calibrate_threshold=_menu_prompt_bool("Calibrate threshold", True, input_fn=input_fn),
+    )
+    backtest_args = argparse.Namespace(
+        input=historical,
+        model=model,
+        start_cash=_menu_prompt_float("Backtest starting cash", 1000.0, minimum=1.0, input_fn=input_fn),
+    )
+    evaluate_args = argparse.Namespace(
+        input=historical,
+        model=model,
+        threshold=None,
+        calibrate_threshold=True,
+    )
+    for fn, args in (
+        (command_fetch, fetch_args),
+        (command_train, train_args),
+        (command_backtest, backtest_args),
+        (command_evaluate, evaluate_args),
+    ):
+        result = fn(args)
+        if result != 0:
+            return result
+    return 0
+
+
+def _run_spot_test_order_roundtrip(*, input_fn: Callable[[str], str] = input) -> int:
+    runtime = load_runtime()
+    if runtime.market_type != "spot":
+        print("Spot test order is only available when runtime.market_type=spot.")
+        return 2
+    if not runtime.testnet:
+        print("Spot test order requires testnet=true.")
+        return 2
+    if not runtime.api_key or not runtime.api_secret:
+        print("Spot test order requires configured API credentials.")
+        return 2
+    confirm = _menu_prompt("Type ROUNDTRIP to place a minimal BUY then SELL on spot testnet: ", input_fn=input_fn)
+    if confirm != "ROUNDTRIP":
+        print("Spot test order cancelled.")
+        return 0
+    quantity = _menu_prompt_float("Order quantity", 0.00008, minimum=0.00001, input_fn=input_fn)
+    client = _build_client(runtime)
+    try:
+        buy = client.place_order(runtime.symbol, "BUY", quantity, dry_run=False)
+        sell = client.place_order(runtime.symbol, "SELL", quantity, dry_run=False)
+    except BinanceAPIError as exc:
+        print(f"Spot test order failed: {exc}", file=sys.stderr)
+        return 2
+    print("Spot test roundtrip complete.")
+    print(json.dumps(
+        {
+            "buy_status": buy.get("status"),
+            "buy_orderId": buy.get("orderId"),
+            "buy_executedQty": buy.get("executedQty"),
+            "sell_status": sell.get("status"),
+            "sell_orderId": sell.get("orderId"),
+            "sell_executedQty": sell.get("executedQty"),
+        },
+        indent=2,
+    ))
+    return 0
+
+
 def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
     while True:
-        print("\nInteractive menu")
+        _print_menu_header()
         print("1. Status")
         print("2. Configure runtime")
         print("3. Configure strategy")
         print("4. Test connectivity")
-        print("5. Fetch market data")
-        print("6. Train model")
-        print("7. Tune strategy")
-        print("8. Run backtest")
-        print("9. Evaluate model")
-        print("10. Run paper session")
-        print("11. Run spot/futures testnet session")
-        print("12. Exit")
+        print("5. Account overview")
+        print("6. Fetch market data")
+        print("7. Train model")
+        print("8. Tune strategy")
+        print("9. Run backtest")
+        print("10. Evaluate model")
+        print("11. Run paper session")
+        print("12. Run spot/futures testnet session")
+        print("13. Run full offline pipeline")
+        print("14. View recent artifacts")
+        print("15. Spot testnet BUY+SELL roundtrip")
+        print("16. Exit")
 
         choice = _menu_prompt("Select option: ", input_fn=input_fn)
         if choice == "1":
@@ -257,18 +433,20 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
         elif choice == "4":
             command_connect(argparse.Namespace())
         elif choice == "5":
+            _show_account_overview()
+        elif choice == "6":
             runtime = load_runtime()
             args = argparse.Namespace(
                 symbol=runtime.symbol,
                 interval=runtime.interval,
                 limit=_menu_prompt_int("Fetch limit", 500, minimum=1, input_fn=input_fn),
-                output=_menu_prompt_default("Fetch output", "data/historical_btcusdc.json", input_fn=input_fn),
+                output=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
             )
             command_fetch(args)
-        elif choice == "6":
+        elif choice == "7":
             args = argparse.Namespace(
-                input=_menu_prompt_default("Training input", "data/historical_btcusdc.json", input_fn=input_fn),
-                output=_menu_prompt_default("Model output", "data/model.json", input_fn=input_fn),
+                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
+                output=_menu_data_path("model.json", input_fn=input_fn),
                 epochs=_menu_prompt_int("Training epochs", 250, minimum=1, input_fn=input_fn),
                 seed=_menu_prompt_int("Training seed", 7, minimum=0, input_fn=input_fn),
                 walk_forward=_menu_prompt_bool("Run walk-forward validation", False, input_fn=input_fn),
@@ -278,9 +456,9 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 calibrate_threshold=_menu_prompt_bool("Calibrate threshold", True, input_fn=input_fn),
             )
             command_train(args)
-        elif choice == "7":
+        elif choice == "8":
             args = argparse.Namespace(
-                input=_menu_prompt_default("Tune input", "data/historical_btcusdc.json", input_fn=input_fn),
+                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
                 save_best=_menu_prompt_bool("Save tuned strategy", False, input_fn=input_fn),
                 min_risk=_menu_prompt_float("Min risk", 0.002, minimum=0.0001, input_fn=input_fn),
                 max_risk=_menu_prompt_float("Max risk", 0.02, minimum=0.0001, input_fn=input_fn),
@@ -295,23 +473,23 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 max_stop=_menu_prompt_float("Max stop loss", 0.04, minimum=0.0, maximum=0.99, input_fn=input_fn),
             )
             command_tune(args)
-        elif choice == "8":
+        elif choice == "9":
             args = argparse.Namespace(
-                input=_menu_prompt_default("Backtest input", "data/historical_btcusdc.json", input_fn=input_fn),
-                model=_menu_prompt_default("Backtest model", "data/model.json", input_fn=input_fn),
+                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
+                model=_menu_data_path("model.json", input_fn=input_fn),
                 start_cash=_menu_prompt_float("Starting cash", 1000.0, minimum=1.0, input_fn=input_fn),
             )
             command_backtest(args)
-        elif choice == "9":
+        elif choice == "10":
             threshold_raw = _menu_prompt("Evaluation threshold [strategy default]: ", input_fn=input_fn)
             args = argparse.Namespace(
-                input=_menu_prompt_default("Evaluation input", "data/historical_btcusdc.json", input_fn=input_fn),
-                model=_menu_prompt_default("Evaluation model", "data/model.json", input_fn=input_fn),
+                input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
+                model=_menu_data_path("model.json", input_fn=input_fn),
                 threshold=float(threshold_raw) if threshold_raw else None,
                 calibrate_threshold=_menu_prompt_bool("Calibrate threshold", False, input_fn=input_fn),
             )
             command_evaluate(args)
-        elif choice == "10":
+        elif choice == "11":
             args = argparse.Namespace(
                 steps=_menu_prompt_int("Paper steps", 20, minimum=1, input_fn=input_fn),
                 sleep=_menu_prompt_int("Paper sleep seconds", 5, minimum=0, input_fn=input_fn),
@@ -320,9 +498,10 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 retrain_window=_menu_prompt_int("Retrain window", 300, minimum=1, input_fn=input_fn),
                 retrain_min_rows=_menu_prompt_int("Retrain minimum rows", 240, minimum=1, input_fn=input_fn),
                 paper=True,
+                live=False,
             )
             command_live(args)
-        elif choice == "11":
+        elif choice == "12":
             confirm = _menu_prompt("Type TESTNET to allow authenticated testnet execution: ", input_fn=input_fn)
             if confirm != "TESTNET":
                 print("Testnet execution cancelled.")
@@ -335,9 +514,16 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 retrain_window=_menu_prompt_int("Retrain window", 300, minimum=1, input_fn=input_fn),
                 retrain_min_rows=_menu_prompt_int("Retrain minimum rows", 240, minimum=1, input_fn=input_fn),
                 paper=False,
+                live=True,
             )
             command_live(args)
-        elif choice in {"12", "q", "quit", "exit"}:
+        elif choice == "13":
+            _run_offline_pipeline(input_fn=input_fn)
+        elif choice == "14":
+            _show_recent_artifacts()
+        elif choice == "15":
+            _run_spot_test_order_roundtrip(input_fn=input_fn)
+        elif choice in {"16", "q", "quit", "exit"}:
             print("Exiting menu.")
             return 0
         else:
@@ -1139,6 +1325,9 @@ def command_evaluate(args: argparse.Namespace) -> int:
 def command_live(args: argparse.Namespace) -> int:
     runtime = load_runtime()
     cfg = load_strategy()
+    if getattr(args, "paper", False) and getattr(args, "live", False):
+        print("Choose either --paper or --live, not both.")
+        return 2
     leverage_override = getattr(args, "leverage", None)
     if leverage_override is not None:
         requested = max(1.0, leverage_override)
@@ -1149,7 +1338,10 @@ def command_live(args: argparse.Namespace) -> int:
     client = _build_client(runtime)
     model_path = Path("data/model.json")
 
-    effective_dry_run = runtime.dry_run or args.paper
+    if getattr(args, "live", False):
+        effective_dry_run = False
+    else:
+        effective_dry_run = runtime.dry_run or args.paper
     if not runtime.testnet:
         print("Real-money execution is disabled in this phase. Set testnet=true to run.")
         return 2
