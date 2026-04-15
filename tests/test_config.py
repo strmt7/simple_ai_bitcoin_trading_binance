@@ -62,6 +62,21 @@ def test_prompt_runtime_rejects_invalid_market_and_non_btc_symbol(tmp_path: Path
     assert out.validate_account is True
 
 
+def test_prompt_runtime_preserves_existing_credentials_on_blank_or_whitespace(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    current = RuntimeConfig(api_key="persisted-key", api_secret="persisted-secret")
+
+    inputs = iter(["", "", "", "y", "y", "y"])
+
+    def fake_input(_prompt: str) -> str:
+        return next(inputs)
+
+    responses = iter(["   ", "\t"])
+    out = prompt_runtime(current, key_getter=fake_input, secret_getter=lambda _: next(responses))
+    assert out.api_key == "persisted-key"
+    assert out.api_secret == "persisted-secret"
+
+
 def test_load_runtime_ignores_invalid_json_payload(tmp_path: Path, monkeypatch) -> None:
     runtime_path = tmp_path / ".simple_ai_trading" / "runtime.json"
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
