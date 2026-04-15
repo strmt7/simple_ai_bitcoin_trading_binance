@@ -211,3 +211,95 @@ def test_walk_forward_report_validates_inputs() -> None:
             ModelRow(timestamp=1, close=2.0, features=(0.0, 0.0), label=0),
         ] * 200
         walk_forward_report(rows, train_window=10, test_window=10, step=0, epochs=1)
+
+
+def test_load_model_rejects_missing_feature_stats_and_bad_lengths(tmp_path) -> None:
+    missing_means = tmp_path / "missing_means.json"
+    missing_means.write_text(
+        """
+        {
+          "weights": [0.1, 0.2],
+          "feature_version": "v1",
+          "bias": 0.0,
+          "feature_dim": 2,
+          "epochs": 5,
+          "feature_stds": [1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelLoadError, match="missing feature_means"):
+        load_model(missing_means)
+
+    bad_means_length = tmp_path / "bad_means_length.json"
+    bad_means_length.write_text(
+        """
+        {
+          "weights": [0.1, 0.2],
+          "feature_version": "v1",
+          "bias": 0.0,
+          "feature_dim": 2,
+          "epochs": 5,
+          "feature_means": [1.0],
+          "feature_stds": [1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelLoadError, match="feature_dim does not match feature_means"):
+        load_model(bad_means_length)
+
+    bad_weights_length = tmp_path / "bad_weights_length.json"
+    bad_weights_length.write_text(
+        """
+        {
+          "weights": [0.1],
+          "feature_version": "v1",
+          "bias": 0.0,
+          "feature_dim": 2,
+          "epochs": 5,
+          "feature_means": [1.0, 1.0],
+          "feature_stds": [1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelLoadError, match="weights length does not match feature_dim"):
+        load_model(bad_weights_length, expected_feature_dim=2)
+
+
+def test_load_model_rejects_non_array_weights_and_feature_stats(tmp_path) -> None:
+    payload = tmp_path / "bad_arrays.json"
+    payload.write_text(
+        """
+        {
+          "weights": "bad",
+          "feature_version": "v1",
+          "bias": 0.0,
+          "feature_dim": 2,
+          "epochs": 5,
+          "feature_means": "bad",
+          "feature_stds": [1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelLoadError, match="feature stats must be arrays"):
+        load_model(payload)
+
+    payload.write_text(
+        """
+        {
+          "weights": "bad",
+          "feature_version": "v1",
+          "bias": 0.0,
+          "feature_dim": 2,
+          "epochs": 5,
+          "feature_means": [1.0, 1.0],
+          "feature_stds": [1.0, 1.0]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelLoadError, match="missing weights"):
+        load_model(payload, expected_feature_dim=2)

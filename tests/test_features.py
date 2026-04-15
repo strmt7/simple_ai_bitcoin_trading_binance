@@ -6,6 +6,7 @@ from simple_ai_bitcoin_trading_binance.api import Candle
 from simple_ai_bitcoin_trading_binance.features import (
     feature_signature,
     make_rows,
+    make_rows_legacy,
     _safe_div,
     _sma,
     _ema,
@@ -125,3 +126,21 @@ def test_valid_ohlcv_rejects_invalid_shapes() -> None:
     assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 102.0, 100.5, 1.0, 60_000))
     assert not _valid_ohlcv(Candle(0, -1.0, 101.0, 99.0, 100.0, 1.0, 60_000))
     assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 99.0, 100.0, -1.0, 60_000))
+
+
+def test_make_rows_sorts_input_and_applies_label_threshold() -> None:
+    candles = list(reversed(_fake_candles()))
+    rows_low_threshold = make_rows(candles, short_window=10, long_window=30, label_threshold=0.0)
+    rows_high_threshold = make_rows(candles, short_window=10, long_window=30, label_threshold=0.5)
+    assert rows_low_threshold
+    assert rows_low_threshold == sorted(rows_low_threshold, key=lambda row: row.timestamp)
+    assert sum(row.label for row in rows_low_threshold) >= sum(row.label for row in rows_high_threshold)
+
+
+def test_make_rows_legacy_matches_default_feature_shape() -> None:
+    candles = _fake_candles()
+    legacy_rows = make_rows_legacy(candles, short_window=10, long_window=30)
+    default_rows = make_rows(candles, short_window=10, long_window=30, label_threshold=0.001)
+    assert len(legacy_rows) == len(default_rows)
+    assert legacy_rows[0].features == default_rows[0].features
+    assert legacy_rows[0].label == default_rows[0].label
