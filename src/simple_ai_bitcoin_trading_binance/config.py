@@ -74,26 +74,45 @@ def save_strategy(cfg: StrategyConfig) -> StrategyConfig:
     return cfg
 
 
+def _coalesce_prompt(value: str, current: str) -> str:
+    candidate = value.strip()
+    return candidate or current
+
+
 def prompt_runtime(current: RuntimeConfig, key_getter: Callable[[str], str] = input,
                   secret_getter: Callable[[str], str] = getpass) -> RuntimeConfig:
     """Collect Binance testnet credentials and safety defaults from stdin."""
 
-    market = key_getter(f"Market type [spot/futures] [{current.market_type}]: ") or current.market_type
-    market = market.strip().lower()
+    market = _coalesce_prompt(
+        key_getter(f"Market type [spot/futures] [{current.market_type}]: "),
+        current.market_type,
+    ).lower()
     if market not in {"spot", "futures"}:
         market = current.market_type
 
-    symbol = (key_getter(f"Trading symbol [{current.symbol}]: ") or current.symbol).upper()
+    symbol = _coalesce_prompt(
+        key_getter(f"Trading symbol [{current.symbol}]: "),
+        current.symbol,
+    ).upper()
     if symbol != SUPPORTED_SYMBOL:
         symbol = SUPPORTED_SYMBOL
 
     return RuntimeConfig(
         symbol=symbol,
-        interval=(key_getter(f"Kline interval [{current.interval}]: ") or current.interval),
+        interval=_coalesce_prompt(
+            key_getter(f"Kline interval [{current.interval}]: "),
+            current.interval,
+        ),
         market_type=market,
         testnet=key_getter(f"Use Binance testnet? (y/n) [{'y' if current.testnet else 'n'}]: ").strip().lower() != "n",
-        api_key=secret_getter("Binance API key (blank to keep): ") or current.api_key,
-        api_secret=secret_getter("Binance API secret (blank to keep): ") or current.api_secret,
+        api_key=_coalesce_prompt(
+            secret_getter("Binance API key (blank to keep): "),
+            current.api_key,
+        ),
+        api_secret=_coalesce_prompt(
+            secret_getter("Binance API secret (blank to keep): "),
+            current.api_secret,
+        ),
         dry_run=key_getter(f"Paper-trading mode? (y/n) [{'y' if current.dry_run else 'n'}]: ").strip().lower() != "n",
         validate_account=key_getter(f"Validate API credentials at startup? (y/n) [{'y' if current.validate_account else 'n'}]: ").strip().lower() != "n",
     )
