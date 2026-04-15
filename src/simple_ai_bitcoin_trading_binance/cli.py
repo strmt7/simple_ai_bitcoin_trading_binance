@@ -7,7 +7,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
@@ -40,6 +40,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser_connect = subparsers.add_parser("connect", help="validate credentials and connectivity")
     parser_connect.set_defaults(func=command_connect)
+
+    parser_menu = subparsers.add_parser("menu", help="launch interactive operator menu")
+    parser_menu.set_defaults(func=command_menu)
 
     parser_fetch = subparsers.add_parser("fetch", help="download BTCUSDC klines")
     parser_fetch.add_argument("--symbol", default=None)
@@ -148,6 +151,201 @@ def _build_client(runtime):
         market_type=runtime.market_type,
         max_calls_per_minute=runtime.max_rate_calls_per_minute,
     )
+
+
+def _menu_prompt(text: str, *, input_fn: Callable[[str], str] = input) -> str:
+    return input_fn(text).strip()
+
+
+def _menu_prompt_default(text: str, current: str, *, input_fn: Callable[[str], str] = input) -> str:
+    value = _menu_prompt(f"{text} [{current}]: ", input_fn=input_fn)
+    return value or current
+
+
+def _menu_prompt_int(text: str, current: int, *, minimum: int | None = None,
+                     input_fn: Callable[[str], str] = input) -> int:
+    while True:
+        raw = _menu_prompt(f"{text} [{current}]: ", input_fn=input_fn)
+        if not raw:
+            return current
+        try:
+            value = int(raw)
+        except ValueError:
+            print("Enter a whole number.")
+            continue
+        if minimum is not None and value < minimum:
+            print(f"Value must be >= {minimum}.")
+            continue
+        return value
+
+
+def _menu_prompt_float(text: str, current: float, *, minimum: float | None = None,
+                       maximum: float | None = None, input_fn: Callable[[str], str] = input) -> float:
+    while True:
+        raw = _menu_prompt(f"{text} [{current}]: ", input_fn=input_fn)
+        if not raw:
+            return current
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Enter a numeric value.")
+            continue
+        if minimum is not None and value < minimum:
+            print(f"Value must be >= {minimum}.")
+            continue
+        if maximum is not None and value > maximum:
+            print(f"Value must be <= {maximum}.")
+            continue
+        return value
+
+
+def _menu_prompt_bool(text: str, current: bool, *, input_fn: Callable[[str], str] = input) -> bool:
+    default = "y" if current else "n"
+    while True:
+        raw = _menu_prompt(f"{text} (y/n) [{default}]: ", input_fn=input_fn).lower()
+        if not raw:
+            return current
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Enter y or n.")
+
+
+def _build_strategy_menu_args(cfg: StrategyConfig, *, input_fn: Callable[[str], str] = input) -> argparse.Namespace:
+    return argparse.Namespace(
+        leverage=_menu_prompt_float("Leverage", cfg.leverage, minimum=1.0, input_fn=input_fn),
+        risk=_menu_prompt_float("Risk per trade", cfg.risk_per_trade, minimum=0.0001, input_fn=input_fn),
+        max_position=_menu_prompt_float("Max position pct", cfg.max_position_pct, minimum=0.0, maximum=1.0, input_fn=input_fn),
+        stop=_menu_prompt_float("Stop loss pct", cfg.stop_loss_pct, minimum=0.0, maximum=0.99, input_fn=input_fn),
+        take=_menu_prompt_float("Take profit pct", cfg.take_profit_pct, minimum=0.0, maximum=0.99, input_fn=input_fn),
+        cooldown=_menu_prompt_int("Cooldown minutes", cfg.cooldown_minutes, minimum=0, input_fn=input_fn),
+        max_open=_menu_prompt_int("Max open positions", cfg.max_open_positions, minimum=0, input_fn=input_fn),
+        max_trades_per_day=_menu_prompt_int("Max trades per day", cfg.max_trades_per_day, minimum=0, input_fn=input_fn),
+        signal_threshold=_menu_prompt_float("Signal threshold", cfg.signal_threshold, minimum=0.01, maximum=0.99, input_fn=input_fn),
+        max_drawdown=_menu_prompt_float("Max drawdown limit", cfg.max_drawdown_limit, minimum=0.0, input_fn=input_fn),
+        taker_fee_bps=_menu_prompt_float("Taker fee bps", cfg.taker_fee_bps, minimum=0.0, input_fn=input_fn),
+        slippage_bps=_menu_prompt_float("Slippage bps", cfg.slippage_bps, minimum=0.0, input_fn=input_fn),
+        label_threshold=_menu_prompt_float("Label threshold", cfg.label_threshold, minimum=0.0001, input_fn=input_fn),
+    )
+
+
+def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
+    while True:
+        print("\nInteractive menu")
+        print("1. Status")
+        print("2. Configure runtime")
+        print("3. Configure strategy")
+        print("4. Test connectivity")
+        print("5. Fetch market data")
+        print("6. Train model")
+        print("7. Tune strategy")
+        print("8. Run backtest")
+        print("9. Evaluate model")
+        print("10. Run paper session")
+        print("11. Run spot/futures testnet session")
+        print("12. Exit")
+
+        choice = _menu_prompt("Select option: ", input_fn=input_fn)
+        if choice == "1":
+            command_status(argparse.Namespace())
+        elif choice == "2":
+            command_configure(argparse.Namespace())
+        elif choice == "3":
+            cfg = load_strategy()
+            command_strategy(_build_strategy_menu_args(cfg, input_fn=input_fn))
+        elif choice == "4":
+            command_connect(argparse.Namespace())
+        elif choice == "5":
+            runtime = load_runtime()
+            args = argparse.Namespace(
+                symbol=runtime.symbol,
+                interval=runtime.interval,
+                limit=_menu_prompt_int("Fetch limit", 500, minimum=1, input_fn=input_fn),
+                output=_menu_prompt_default("Fetch output", "data/historical_btcusdc.json", input_fn=input_fn),
+            )
+            command_fetch(args)
+        elif choice == "6":
+            args = argparse.Namespace(
+                input=_menu_prompt_default("Training input", "data/historical_btcusdc.json", input_fn=input_fn),
+                output=_menu_prompt_default("Model output", "data/model.json", input_fn=input_fn),
+                epochs=_menu_prompt_int("Training epochs", 250, minimum=1, input_fn=input_fn),
+                seed=_menu_prompt_int("Training seed", 7, minimum=0, input_fn=input_fn),
+                walk_forward=_menu_prompt_bool("Run walk-forward validation", False, input_fn=input_fn),
+                walk_forward_train=_menu_prompt_int("Walk-forward train window", 300, minimum=2, input_fn=input_fn),
+                walk_forward_test=_menu_prompt_int("Walk-forward test window", 60, minimum=1, input_fn=input_fn),
+                walk_forward_step=_menu_prompt_int("Walk-forward step", 30, minimum=1, input_fn=input_fn),
+                calibrate_threshold=_menu_prompt_bool("Calibrate threshold", True, input_fn=input_fn),
+            )
+            command_train(args)
+        elif choice == "7":
+            args = argparse.Namespace(
+                input=_menu_prompt_default("Tune input", "data/historical_btcusdc.json", input_fn=input_fn),
+                save_best=_menu_prompt_bool("Save tuned strategy", False, input_fn=input_fn),
+                min_risk=_menu_prompt_float("Min risk", 0.002, minimum=0.0001, input_fn=input_fn),
+                max_risk=_menu_prompt_float("Max risk", 0.02, minimum=0.0001, input_fn=input_fn),
+                steps=_menu_prompt_int("Tune steps", 5, minimum=1, input_fn=input_fn),
+                min_leverage=_menu_prompt_float("Min leverage", 1.0, minimum=1.0, input_fn=input_fn),
+                max_leverage=_menu_prompt_float("Max leverage", 20.0, minimum=1.0, input_fn=input_fn),
+                min_threshold=_menu_prompt_float("Min threshold", 0.52, minimum=0.01, maximum=0.99, input_fn=input_fn),
+                max_threshold=_menu_prompt_float("Max threshold", 0.88, minimum=0.01, maximum=0.99, input_fn=input_fn),
+                min_take=_menu_prompt_float("Min take profit", 0.01, minimum=0.0, maximum=0.99, input_fn=input_fn),
+                max_take=_menu_prompt_float("Max take profit", 0.06, minimum=0.0, maximum=0.99, input_fn=input_fn),
+                min_stop=_menu_prompt_float("Min stop loss", 0.008, minimum=0.0, maximum=0.99, input_fn=input_fn),
+                max_stop=_menu_prompt_float("Max stop loss", 0.04, minimum=0.0, maximum=0.99, input_fn=input_fn),
+            )
+            command_tune(args)
+        elif choice == "8":
+            args = argparse.Namespace(
+                input=_menu_prompt_default("Backtest input", "data/historical_btcusdc.json", input_fn=input_fn),
+                model=_menu_prompt_default("Backtest model", "data/model.json", input_fn=input_fn),
+                start_cash=_menu_prompt_float("Starting cash", 1000.0, minimum=1.0, input_fn=input_fn),
+            )
+            command_backtest(args)
+        elif choice == "9":
+            threshold_raw = _menu_prompt("Evaluation threshold [strategy default]: ", input_fn=input_fn)
+            args = argparse.Namespace(
+                input=_menu_prompt_default("Evaluation input", "data/historical_btcusdc.json", input_fn=input_fn),
+                model=_menu_prompt_default("Evaluation model", "data/model.json", input_fn=input_fn),
+                threshold=float(threshold_raw) if threshold_raw else None,
+                calibrate_threshold=_menu_prompt_bool("Calibrate threshold", False, input_fn=input_fn),
+            )
+            command_evaluate(args)
+        elif choice == "10":
+            args = argparse.Namespace(
+                steps=_menu_prompt_int("Paper steps", 20, minimum=1, input_fn=input_fn),
+                sleep=_menu_prompt_int("Paper sleep seconds", 5, minimum=0, input_fn=input_fn),
+                leverage=None,
+                retrain_interval=_menu_prompt_int("Retrain interval", 0, minimum=0, input_fn=input_fn),
+                retrain_window=_menu_prompt_int("Retrain window", 300, minimum=1, input_fn=input_fn),
+                retrain_min_rows=_menu_prompt_int("Retrain minimum rows", 240, minimum=1, input_fn=input_fn),
+                paper=True,
+            )
+            command_live(args)
+        elif choice == "11":
+            confirm = _menu_prompt("Type TESTNET to allow authenticated testnet execution: ", input_fn=input_fn)
+            if confirm != "TESTNET":
+                print("Testnet execution cancelled.")
+                continue
+            args = argparse.Namespace(
+                steps=_menu_prompt_int("Live testnet steps", 1, minimum=1, input_fn=input_fn),
+                sleep=_menu_prompt_int("Live testnet sleep seconds", 5, minimum=0, input_fn=input_fn),
+                leverage=None,
+                retrain_interval=_menu_prompt_int("Retrain interval", 0, minimum=0, input_fn=input_fn),
+                retrain_window=_menu_prompt_int("Retrain window", 300, minimum=1, input_fn=input_fn),
+                retrain_min_rows=_menu_prompt_int("Retrain minimum rows", 240, minimum=1, input_fn=input_fn),
+                paper=False,
+            )
+            command_live(args)
+        elif choice in {"12", "q", "quit", "exit"}:
+            print("Exiting menu.")
+            return 0
+        else:
+            print("Invalid selection.")
+
+
+def command_menu(_: argparse.Namespace) -> int:
+    return _run_menu()
 
 
 def _load_json_candles(path: str) -> list[dict[str, object]]:
@@ -1368,6 +1566,10 @@ def command_live(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        return command_menu(argparse.Namespace())
     args = _parse_args(argv)
     return int(args.func(args))
 

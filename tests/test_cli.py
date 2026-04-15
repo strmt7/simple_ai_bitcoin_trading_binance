@@ -3,12 +3,18 @@ from __future__ import annotations
 import argparse
 
 from simple_ai_bitcoin_trading_binance.cli import (
+    _build_strategy_menu_args,
+    _menu_prompt_bool,
+    _menu_prompt_float,
+    _menu_prompt_int,
     _build_order_notional,
     _build_live_model,
     _effective_leverage,
     _resolve_live_retrain_rows,
+    _run_menu,
     _target_notional,
     command_strategy,
+    main,
 )
 from simple_ai_bitcoin_trading_binance.config import load_strategy
 from simple_ai_bitcoin_trading_binance.api import SymbolConstraints
@@ -198,3 +204,263 @@ def test_build_live_model_returns_existing_when_rows_insufficient(monkeypatch) -
     )
     assert rebuilt is existing
     assert called["value"] is False
+
+
+def test_build_strategy_menu_args_retries_invalid_numeric_input() -> None:
+    cfg = StrategyConfig()
+    responses = iter([
+        "abc",
+        "2",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ])
+
+    args = _build_strategy_menu_args(cfg, input_fn=lambda _prompt: next(responses))
+    assert args.leverage == 2.0
+    assert args.risk == cfg.risk_per_trade
+    assert args.max_trades_per_day == cfg.max_trades_per_day
+
+
+def test_run_menu_invalid_selection_then_exit(capsys) -> None:
+    responses = iter(["99", "12"])
+    result = _run_menu(input_fn=lambda _prompt: next(responses))
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "Invalid selection." in output
+    assert "Exiting menu." in output
+
+
+def test_run_menu_live_testnet_requires_explicit_confirmation(monkeypatch, capsys) -> None:
+    called = {"live": False}
+
+    def fake_live(_args):
+        called["live"] = True
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_live", fake_live)
+    responses = iter(["11", "nope", "12"])
+    result = _run_menu(input_fn=lambda _prompt: next(responses))
+    output = capsys.readouterr().out
+    assert result == 0
+    assert called["live"] is False
+    assert "Testnet execution cancelled." in output
+
+
+def test_main_without_args_routes_to_menu(monkeypatch) -> None:
+    called = {"menu": False}
+
+    def fake_menu(_args):
+        called["menu"] = True
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_menu", fake_menu)
+    assert main([]) == 0
+    assert called["menu"] is True
+
+
+def test_menu_prompt_int_and_float_retry_until_valid(capsys) -> None:
+    int_answers = iter(["bad", "-1", "4"])
+    float_answers = iter(["bad", "2.5"])
+    assert _menu_prompt_int("Value", 1, minimum=0, input_fn=lambda _prompt: next(int_answers)) == 4
+    assert _menu_prompt_float("Float", 1.0, minimum=0.0, maximum=3.0, input_fn=lambda _prompt: next(float_answers)) == 2.5
+    output = capsys.readouterr().out
+    assert "Enter a whole number." in output
+    assert "Value must be >= 0." in output
+    assert "Enter a numeric value." in output
+
+
+def test_menu_prompt_bool_retries_invalid_answer(capsys) -> None:
+    answers = iter(["maybe", "y"])
+    assert _menu_prompt_bool("Proceed", False, input_fn=lambda _prompt: next(answers)) is True
+    assert "Enter y or n." in capsys.readouterr().out
+
+
+def test_run_menu_status_then_exit(monkeypatch) -> None:
+    called = {"status": 0}
+
+    def fake_status(_args):
+        called["status"] += 1
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_status", fake_status)
+    responses = iter(["1", "12"])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert called["status"] == 1
+
+
+def test_run_menu_configure_and_connect_then_exit(monkeypatch) -> None:
+    called = {"configure": 0, "connect": 0}
+
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.command_configure",
+        lambda _args: called.__setitem__("configure", called["configure"] + 1) or 0,
+    )
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.command_connect",
+        lambda _args: called.__setitem__("connect", called["connect"] + 1) or 0,
+    )
+    responses = iter(["2", "4", "12"])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert called == {"configure": 1, "connect": 1}
+
+
+def test_run_menu_fetch_builds_expected_args(monkeypatch) -> None:
+    captured = {}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m"})())
+
+    def fake_fetch(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", fake_fetch)
+    responses = iter(["5", "400", "tmp/fetch.json", "12"])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert captured["args"].limit == 400
+    assert captured["args"].output == "tmp/fetch.json"
+    assert captured["args"].symbol == "BTCUSDC"
+
+
+def test_run_menu_train_and_tune_build_expected_args(monkeypatch) -> None:
+    captured = {}
+
+    def fake_train(args):
+        captured["train"] = args
+        return 0
+
+    def fake_tune(args):
+        captured["tune"] = args
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", fake_train)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_tune", fake_tune)
+    responses = iter([
+        "6",
+        "data/in.json",
+        "data/out.json",
+        "99",
+        "11",
+        "y",
+        "310",
+        "70",
+        "20",
+        "n",
+        "7",
+        "data/tune.json",
+        "y",
+        "0.003",
+        "0.03",
+        "4",
+        "1",
+        "10",
+        "0.5",
+        "0.8",
+        "0.01",
+        "0.04",
+        "0.01",
+        "0.03",
+        "12",
+    ])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert captured["train"].input == "data/in.json"
+    assert captured["train"].output == "data/out.json"
+    assert captured["train"].epochs == 99
+    assert captured["train"].seed == 11
+    assert captured["train"].walk_forward is True
+    assert captured["train"].calibrate_threshold is False
+    assert captured["tune"].input == "data/tune.json"
+    assert captured["tune"].save_best is True
+    assert captured["tune"].steps == 4
+
+
+def test_run_menu_backtest_and_evaluate_build_expected_args(monkeypatch) -> None:
+    captured = {}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured.setdefault("backtest", args) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured.setdefault("evaluate", args) or 0)
+    responses = iter([
+        "8",
+        "data/back.json",
+        "data/model.json",
+        "1500",
+        "9",
+        "0.61",
+        "data/eval.json",
+        "data/eval-model.json",
+        "y",
+        "12",
+    ])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert captured["backtest"].start_cash == 1500.0
+    assert captured["evaluate"].threshold == 0.61
+    assert captured["evaluate"].calibrate_threshold is True
+
+
+def test_run_menu_strategy_builds_expected_args(monkeypatch) -> None:
+    captured = {}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", lambda: StrategyConfig())
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", lambda args: captured.setdefault("strategy", args) or 0)
+    responses = iter([
+        "3",
+        "2",
+        "0.02",
+        "0.3",
+        "0.01",
+        "0.05",
+        "1",
+        "2",
+        "7",
+        "0.6",
+        "0.2",
+        "2",
+        "4",
+        "0.002",
+        "12",
+    ])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert captured["strategy"].leverage == 2.0
+    assert captured["strategy"].max_trades_per_day == 7
+    assert captured["strategy"].label_threshold == 0.002
+
+
+def test_run_menu_live_variants_build_expected_args(monkeypatch) -> None:
+    calls = []
+
+    def fake_live(args):
+        calls.append(args)
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_live", fake_live)
+    responses = iter([
+        "10",
+        "3",
+        "0",
+        "1",
+        "120",
+        "100",
+        "11",
+        "TESTNET",
+        "2",
+        "0",
+        "0",
+        "240",
+        "120",
+        "12",
+    ])
+    assert _run_menu(input_fn=lambda _prompt: next(responses)) == 0
+    assert len(calls) == 2
+    assert calls[0].paper is True
+    assert calls[0].steps == 3
+    assert calls[1].paper is False
+    assert calls[1].steps == 2
