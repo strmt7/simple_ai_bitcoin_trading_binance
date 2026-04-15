@@ -33,6 +33,7 @@ class TrainedModel:
     feature_means: List[float]
     feature_stds: List[float]
     feature_version: str = FEATURE_VERSION
+    feature_signature: str | None = None
     learning_rate: float = 0.05
     l2_penalty: float = 1e-4
     seed: int = 7
@@ -171,7 +172,8 @@ def calibrate_threshold(rows: List[ModelRow], model: TrainedModel, *, start: flo
 
 
 def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.05,
-          seed: int = 7, l2_penalty: float = 1e-4) -> TrainedModel:
+          seed: int = 7, l2_penalty: float = 1e-4,
+          feature_signature: str | None = None) -> TrainedModel:
     if not rows:
         raise ValueError("No training rows available")
     feature_dim = len(rows[0].features)
@@ -213,6 +215,7 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
         epochs=epochs,
         feature_means=means,
         feature_stds=stds,
+        feature_signature=feature_signature,
         learning_rate=float(learning_rate),
         l2_penalty=float(l2_penalty),
         seed=int(seed),
@@ -320,6 +323,7 @@ def load_model(
     *,
     expected_feature_version: str | None = FEATURE_VERSION,
     expected_feature_dim: int | None = None,
+    expected_feature_signature: str | None = None,
 ) -> TrainedModel:
     payload = json.loads(path.read_text(encoding="utf-8"))
     model_version = payload.get("feature_version")
@@ -329,6 +333,15 @@ def load_model(
     if expected_feature_version is not None and model_version != expected_feature_version:
         raise ModelFeatureMismatchError(
             f"Feature version mismatch: model={model_version} runtime={expected_feature_version}"
+        )
+    payload_signature = payload.get("feature_signature")
+    if (
+        expected_feature_signature is not None
+        and payload_signature is not None
+        and str(payload_signature) != expected_feature_signature
+    ):
+        raise ModelFeatureMismatchError(
+            f"Feature signature mismatch: model={payload_signature} runtime={expected_feature_signature}"
         )
 
     dim = int(payload["feature_dim"])
@@ -365,6 +378,7 @@ def load_model(
         feature_dim=dim,
         epochs=int(payload["epochs"]),
         feature_version=str(model_version),
+        feature_signature=str(payload_signature) if payload_signature is not None else None,
         feature_means=list(float(x) for x in means),
         feature_stds=list(float(x) for x in stds),
         learning_rate=float(payload.get("learning_rate", 0.05)),

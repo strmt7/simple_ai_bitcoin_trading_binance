@@ -28,6 +28,45 @@ FEATURE_NAMES = (
     "volume_trend",
 )
 
+def feature_signature(
+    short_window: int,
+    long_window: int,
+    label_threshold: float,
+    *,
+    feature_version: str = FEATURE_VERSION,
+) -> str:
+    """Return a deterministic signature for a feature configuration."""
+    short_window = int(short_window)
+    long_window = int(long_window)
+    threshold = float(label_threshold)
+    return "|".join(
+        [
+            f"feature_version={feature_version}",
+            f"feature_count={len(FEATURE_NAMES)}",
+            f"short_window={short_window}",
+            f"long_window={long_window}",
+            f"label_threshold={threshold:.10g}",
+        ]
+    )
+
+
+def _valid_ohlcv(candle: Candle) -> bool:
+    if not math.isfinite(candle.open) or not math.isfinite(candle.high) or not math.isfinite(candle.low) or not math.isfinite(candle.close):
+        return False
+    if candle.open <= 0.0 or candle.high <= 0.0 or candle.low <= 0.0 or candle.close <= 0.0:
+        return False
+    if candle.volume < 0.0 or candle.open_time < 0 or candle.close_time < 0:
+        return False
+    if candle.low > candle.high:
+        return False
+    if not (candle.low <= candle.open <= candle.high):
+        return False
+    if not (candle.low <= candle.close <= candle.high):
+        return False
+    if candle.close_time < candle.open_time:
+        return False
+    return True
+
 
 @dataclass(frozen=True)
 class ModelRow:
@@ -105,6 +144,13 @@ def make_rows(
     lookahead: int = 1,
     label_threshold: float = 0.001,
 ) -> List[ModelRow]:
+    if short_window <= 0 or long_window <= 0 or lookahead <= 0:
+        raise ValueError("short_window, long_window, and lookahead must be positive")
+    if long_window < short_window:
+        raise ValueError("long_window must be greater than or equal to short_window")
+
+    candles = [c for c in candles if _valid_ohlcv(c)]
+    candles = sorted(candles, key=lambda c: c.open_time)
     closes = [c.close for c in candles]
     rows: List[ModelRow] = []
     min_window = max(long_window, short_window, lookahead + 2, 2 * long_window)

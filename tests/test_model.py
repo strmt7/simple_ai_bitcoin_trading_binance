@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pytest
 
 from simple_ai_bitcoin_trading_binance.features import ModelRow
@@ -8,6 +9,7 @@ from pathlib import Path
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
     ClassificationReport,
+    feature_dimension,
     ModelFeatureMismatchError,
     load_model,
     evaluate_classification,
@@ -76,6 +78,26 @@ def test_load_model_rejects_mismatched_version(tmp_path: Path) -> None:
     )
     with pytest.raises(ModelFeatureMismatchError, match="Feature version mismatch"):
         load_model(model_path)
+
+
+def test_load_model_rejects_signature_mismatch(tmp_path: Path) -> None:
+    model_path = tmp_path / "sig_mismatch.json"
+    model_payload = {
+        "weights": [0.1] * feature_dimension(),
+        "feature_version": "v1",
+        "bias": 0.01,
+        "feature_dim": feature_dimension(),
+        "epochs": 3,
+        "feature_means": [1.0] * feature_dimension(),
+        "feature_stds": [1.0] * feature_dimension(),
+        "feature_signature": "feature_version=v1|feature_count=13|short_window=6|long_window=24|label_threshold=0.001",
+    }
+    model_path.write_text(json.dumps(model_payload), encoding="utf-8")
+    with pytest.raises(ModelFeatureMismatchError, match="Feature signature mismatch"):
+        load_model(
+            model_path,
+            expected_feature_signature="feature_version=v1|feature_count=13|short_window=4|long_window=8|label_threshold=0.001",
+        )
 
 
 def test_evaluate_classification_report() -> None:

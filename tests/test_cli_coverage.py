@@ -12,6 +12,7 @@ from simple_ai_bitcoin_trading_binance import cli
 from simple_ai_bitcoin_trading_binance.api import BinanceAPIError, Candle
 from simple_ai_bitcoin_trading_binance.config import RuntimeConfig, load_strategy, save_runtime, save_strategy
 from simple_ai_bitcoin_trading_binance.model import TrainedModel
+from simple_ai_bitcoin_trading_binance.features import feature_signature
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
 
@@ -245,6 +246,62 @@ def test_command_train_workflow(tmp_path, monkeypatch) -> None:
     ) == 0
 
 
+def test_command_train_artifact_includes_signature(tmp_path, monkeypatch) -> None:
+    strategy = StrategyConfig(feature_windows=(4, 20), label_threshold=0.002, training_epochs=7)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(strategy)
+
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(300)
+    ]
+    history = tmp_path / "history.json"
+    model_file = tmp_path / "model.json"
+    history.write_text(json.dumps(candles), encoding="utf-8")
+
+    captured: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        captured.append((kind, str(output_dir), payload))
+        return output_dir / "artifact.json"
+
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+
+    assert cli.command_train(
+        argparse.Namespace(
+            input=str(history),
+            output=str(model_file),
+            epochs=11,
+            walk_forward=False,
+            walk_forward_train=10,
+            walk_forward_test=5,
+            walk_forward_step=1,
+            calibrate_threshold=False,
+        )
+    ) == 0
+
+    assert len(captured) == 1
+    kind, _output_dir, payload = captured[0]
+    assert kind == "train"
+    assert payload["seed"] == 7
+    expected_signature = feature_signature(
+        strategy.feature_windows[0],
+        strategy.feature_windows[1],
+        strategy.label_threshold,
+        feature_version=strategy.feature_version,
+    )
+    assert payload["model"]["feature_signature"] == expected_signature
+
+
 def test_command_evaluate_runs_with_model_file(tmp_path, monkeypatch) -> None:
     save_runtime(RuntimeConfig())
     save_strategy(StrategyConfig())
@@ -288,6 +345,119 @@ def test_command_evaluate_runs_with_model_file(tmp_path, monkeypatch) -> None:
             calibrate_threshold=False,
         )
     ) == 0
+
+
+def test_command_evaluate_artifact_is_emitted(tmp_path, monkeypatch) -> None:
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    captured: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        captured.append((kind, str(output_dir), payload))
+        return output_dir / "evaluate.json"
+
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(240)
+    ]
+    data_file = tmp_path / "history.json"
+    model_file = tmp_path / "model.json"
+    data_file.write_text(json.dumps(candles), encoding="utf-8")
+    model_file.write_text(
+        json.dumps(
+            {
+                "weights": [0.1] + [0.0] * 12,
+                "bias": 0.01,
+                "feature_version": "v1",
+                "feature_dim": 13,
+                "epochs": 5,
+                "feature_means": [1.0] * 13,
+                "feature_stds": [1.0] * 13,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        cli.command_evaluate(
+            argparse.Namespace(
+                input=str(data_file),
+                model=str(model_file),
+                threshold=None,
+                calibrate_threshold=False,
+            )
+        )
+        == 0
+    )
+
+    assert len(captured) == 1
+    kind, _output_dir, payload = captured[0]
+    assert kind == "evaluate"
+    assert payload["command"] == "evaluate"
+
+
+def test_command_backtest_artifact_is_emitted(tmp_path, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance.model import serialize_model
+
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    captured: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        captured.append((kind, str(output_dir), payload))
+        return output_dir / "backtest.json"
+
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(220)
+    ]
+    input_file = tmp_path / "hist.json"
+    model_file = tmp_path / "model.json"
+    input_file.write_text(json.dumps(candles), encoding="utf-8")
+    serialize_model(
+        TrainedModel(
+            weights=[0.0] * 13,
+            bias=0.0,
+            feature_dim=13,
+            epochs=5,
+            feature_means=[0.0] * 13,
+            feature_stds=[1.0] * 13,
+        ),
+        model_file,
+    )
+
+    assert (
+        cli.command_backtest(argparse.Namespace(input=str(input_file), model=str(model_file), start_cash=1000.0))
+        == 0
+    )
+
+    assert len(captured) == 1
+    kind, _output_dir, payload = captured[0]
+    assert kind == "backtest"
+    assert payload["command"] == "backtest"
 
 
 def test_command_live_paper_path_runs_a_tick(tmp_path, monkeypatch) -> None:
@@ -338,6 +508,68 @@ def test_command_live_paper_path_runs_a_tick(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
     monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
     assert cli.command_live(argparse.Namespace(steps=1, sleep=5, paper=False)) == 0
+
+
+def test_command_live_artifact_is_emitted(tmp_path, monkeypatch) -> None:
+    captured: list[tuple[str, str, dict[str, object]]] = []
+
+    class _LiveClient:
+        def __init__(self) -> None:
+            self.orders: list[tuple[str, str, float]] = []
+
+        def get_klines(self, symbol: str, interval: str, limit: int = 500, start_time=None, end_time=None):
+            return [
+                Candle(
+                    open_time=i * 60_000,
+                    open=100.0 + i,
+                    high=101.0 + i,
+                    low=99.0 + i,
+                    close=100.0 + i,
+                    volume=1.0,
+                    close_time=(i + 1) * 60_000,
+                )
+                for i in range(limit)
+            ]
+
+        def get_symbol_constraints(self, symbol: str):
+            return SimpleNamespace(
+                symbol=symbol,
+                min_qty=0.0001,
+                max_qty=100.0,
+                step_size=0.0001,
+                min_notional=1.0,
+                max_notional=0.0,
+            )
+
+        def normalize_quantity(self, symbol: str, quantity: float):
+            return max(0.0001, round(quantity, 4)), self.get_symbol_constraints(symbol)
+
+        def place_order(self, symbol: str, side: str, size: float, *, dry_run: bool, leverage: float = 1.0):
+            self.orders.append((symbol, side, size))
+            return {"symbol": symbol, "side": side, "size": size, "dry_run": dry_run}
+
+    class _AlwaysLongModel:
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            return 0.95
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        captured.append((kind, str(output_dir), payload))
+        return output_dir / "live.json"
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2))
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
+    monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=5, paper=False)) == 0
+    assert len(captured) == 1
+    kind, _output_dir, payload = captured[0]
+    assert kind == "live"
+    assert payload["command"] == "live"
+    assert payload["result"]["steps_executed"] == 1
 
 
 def test_command_tune_saves_candidate(monkeypatch, tmp_path) -> None:

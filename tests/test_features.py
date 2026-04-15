@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import math
+import pytest
 from simple_ai_bitcoin_trading_binance.api import Candle
-from simple_ai_bitcoin_trading_binance.features import make_rows, _safe_div, _sma, _ema, _rsi, _true_range
+from simple_ai_bitcoin_trading_binance.features import (
+    feature_signature,
+    make_rows,
+    _safe_div,
+    _sma,
+    _ema,
+    _rsi,
+    _true_range,
+    _valid_ohlcv,
+)
 from simple_ai_bitcoin_trading_binance.features import _safe_features
 
 
@@ -48,6 +58,40 @@ def test_make_rows_returns_empty_without_data() -> None:
     assert make_rows([], short_window=5, long_window=10) == []
 
 
+def test_make_rows_filters_invalid_candles_and_stable_signature() -> None:
+    candles = [
+        Candle(
+            open_time=0,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0,
+            volume=1.0,
+            close_time=60_000,
+        ),
+        Candle(
+            open_time=60_000,
+            open=100.0,
+            high=0.0,
+            low=99.0,
+            close=100.0,
+            volume=1.0,
+            close_time=120_000,
+        ),
+    ]
+    rows = make_rows(candles, short_window=5, long_window=10)
+    assert rows == []
+    assert feature_signature(10, 20, 0.001) == "feature_version=v1|feature_count=13|short_window=10|long_window=20|label_threshold=0.001"
+
+
+def test_make_rows_rejects_invalid_windows() -> None:
+    candle = Candle(open_time=0, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0, close_time=60_000)
+    with pytest.raises(ValueError, match="short_window"):
+        make_rows([candle], short_window=0, long_window=10)
+    with pytest.raises(ValueError, match="long_window"):
+        make_rows([candle], short_window=20, long_window=10)
+
+
 def test_true_range_with_non_positive_prev_close() -> None:
     candles = [
         Candle(
@@ -75,3 +119,9 @@ def test_true_range_with_non_positive_prev_close() -> None:
 def test_feature_edge_helpers_cover_short_and_nonfinite_inputs() -> None:
     assert math.isnan(_ema([1.0], 3))
     assert _safe_features([1.0, float("nan"), float("inf"), 2.0]) == [1.0, 0.0, 0.0, 2.0]
+
+
+def test_valid_ohlcv_rejects_invalid_shapes() -> None:
+    assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 102.0, 100.5, 1.0, 60_000))
+    assert not _valid_ohlcv(Candle(0, -1.0, 101.0, 99.0, 100.0, 1.0, 60_000))
+    assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 99.0, 100.0, -1.0, 60_000))
