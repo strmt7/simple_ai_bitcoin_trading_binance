@@ -184,6 +184,25 @@ def test_command_status_prints_masked_secret(tmp_path, monkeypatch, capsys) -> N
     assert "***" in output
 
 
+def test_command_configure_validation_failure_returns_nonzero(tmp_path, monkeypatch, capsys) -> None:
+    class _BadClient(_FakeClient):
+        def ensure_btcusdc(self):
+            raise BinanceAPIError("no symbol")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "prompt_runtime", lambda _current: RuntimeConfig(api_key="k", api_secret="s", validate_account=True))
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _BadClient())
+    assert cli.command_configure(argparse.Namespace()) == 2
+    assert "validation failed" in capsys.readouterr().err
+
+
+def test_command_configure_futures_prints_mode_line(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "prompt_runtime", lambda _current: RuntimeConfig(market_type="futures", validate_account=False))
+    assert cli.command_configure(argparse.Namespace()) == 0
+    assert "futures-mode enabled" in capsys.readouterr().out
+
+
 def test_command_connect_spot_and_futures(tmp_path, monkeypatch, capsys) -> None:
     fake = _FakeClient()
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -194,6 +213,18 @@ def test_command_connect_spot_and_futures(tmp_path, monkeypatch, capsys) -> None
     text = capsys.readouterr().out
     assert "exchange: connected" in text
     assert "max leverage on BTCUSDC: 10x" in text
+
+
+def test_command_connect_failure_returns_nonzero(tmp_path, monkeypatch, capsys) -> None:
+    class _BadClient(_FakeClient):
+        def get_exchange_time(self):
+            raise BinanceAPIError("offline")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _BadClient())
+    assert cli.command_connect(argparse.Namespace()) == 2
+    assert "Connection failed" in capsys.readouterr().err
 
 
 def test_command_fetch_handles_binar_errors(tmp_path, monkeypatch) -> None:
@@ -209,6 +240,12 @@ def test_command_fetch_handles_binar_errors(tmp_path, monkeypatch) -> None:
     save_runtime(runtime)
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _ErrorClient())
     assert cli.command_fetch(argparse.Namespace(symbol=None, interval=None, limit=10, output=str(output))) == 2
+
+
+def test_command_fetch_rejects_non_btcusdc_symbol(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    assert cli.command_fetch(argparse.Namespace(symbol="ETHUSDC", interval=None, limit=10, output=str(tmp_path / "candles.json"))) == 2
 
 
 def test_command_train_workflow(tmp_path, monkeypatch) -> None:
@@ -244,6 +281,60 @@ def test_command_train_workflow(tmp_path, monkeypatch) -> None:
             calibrate_threshold=False,
         )
     ) == 0
+
+
+def test_command_train_rejects_bad_json_input(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    bad_input = tmp_path / "bad.json"
+    bad_input.write_text("{", encoding="utf-8")
+    assert cli.command_train(
+        argparse.Namespace(
+            input=str(bad_input),
+            output=str(tmp_path / "model.json"),
+            epochs=12,
+            walk_forward=False,
+            walk_forward_train=10,
+            walk_forward_test=5,
+            walk_forward_step=1,
+            calibrate_threshold=False,
+        )
+    ) == 2
+
+
+def test_command_train_walk_forward_unavailable_still_succeeds(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(260)
+    ]
+    data_file = tmp_path / "history.json"
+    data_file.write_text(json.dumps(candles), encoding="utf-8")
+    monkeypatch.setattr(cli, "walk_forward_report", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("not enough rows")))
+    assert cli.command_train(
+        argparse.Namespace(
+            input=str(data_file),
+            output=str(tmp_path / "model.json"),
+            epochs=12,
+            walk_forward=True,
+            walk_forward_train=1000,
+            walk_forward_test=1000,
+            walk_forward_step=10,
+            calibrate_threshold=False,
+        )
+    ) == 0
+    assert "walk-forward unavailable" in capsys.readouterr().out
 
 
 def test_command_train_artifact_includes_signature(tmp_path, monkeypatch) -> None:
@@ -406,6 +497,177 @@ def test_command_evaluate_artifact_is_emitted(tmp_path, monkeypatch) -> None:
     kind, _output_dir, payload = captured[0]
     assert kind == "evaluate"
     assert payload["command"] == "evaluate"
+
+
+def test_command_evaluate_rejects_bad_json_input(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    bad_input = tmp_path / "history.json"
+    bad_input.write_text("{", encoding="utf-8")
+    assert cli.command_evaluate(
+        argparse.Namespace(
+            input=str(bad_input),
+            model=str(tmp_path / "model.json"),
+            threshold=None,
+            calibrate_threshold=False,
+        )
+    ) == 2
+
+
+def test_command_evaluate_rejects_invalid_model_payload(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(240)
+    ]
+    data_file = tmp_path / "history.json"
+    data_file.write_text(json.dumps(candles), encoding="utf-8")
+    model_file = tmp_path / "model.json"
+    model_file.write_text("{", encoding="utf-8")
+    assert cli.command_evaluate(
+        argparse.Namespace(
+            input=str(data_file),
+            model=str(model_file),
+            threshold=None,
+            calibrate_threshold=False,
+        )
+    ) == 2
+
+
+def test_command_backtest_rejects_invalid_model_payload(tmp_path, monkeypatch) -> None:
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(220)
+    ]
+    input_file = tmp_path / "hist.json"
+    model_file = tmp_path / "model.json"
+    input_file.write_text(json.dumps(candles), encoding="utf-8")
+    model_file.write_text("{", encoding="utf-8")
+    assert cli.command_backtest(argparse.Namespace(input=str(input_file), model=str(model_file), start_cash=1000.0)) == 2
+
+
+def test_command_backtest_rejects_bad_json_input(tmp_path, monkeypatch) -> None:
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    input_file = tmp_path / "hist.json"
+    model_file = tmp_path / "model.json"
+    input_file.write_text("{", encoding="utf-8")
+    model_file.write_text("{}", encoding="utf-8")
+    assert cli.command_backtest(argparse.Namespace(input=str(input_file), model=str(model_file), start_cash=1000.0)) == 2
+
+
+def test_command_tune_needs_more_rows(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(80)
+    ]
+    data_file = tmp_path / "history.json"
+    data_file.write_text(json.dumps(candles), encoding="utf-8")
+    assert cli.command_tune(
+        argparse.Namespace(
+            input=str(data_file),
+            save_best=False,
+            min_risk=0.002,
+            max_risk=0.02,
+            steps=2,
+            min_leverage=1.0,
+            max_leverage=2.0,
+            min_threshold=0.52,
+            max_threshold=0.6,
+            min_take=0.01,
+            max_take=0.02,
+            min_stop=0.008,
+            max_stop=0.02,
+        )
+    ) == 2
+    assert "Need more data rows" in capsys.readouterr().out
+
+
+def test_command_tune_uses_fallback_and_can_save_best(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(320)
+    ]
+    data_file = tmp_path / "history.json"
+    data_file.write_text(json.dumps(candles), encoding="utf-8")
+
+    monkeypatch.setattr(
+        cli,
+        "run_backtest",
+        lambda *_a, **_k: SimpleNamespace(
+            realized_pnl=-5.0,
+            total_fees=1.0,
+            max_drawdown=0.1,
+            closed_trades=1,
+            stopped_by_drawdown=True,
+        ),
+    )
+
+    assert cli.command_tune(
+        argparse.Namespace(
+            input=str(data_file),
+            save_best=True,
+            min_risk=0.002,
+            max_risk=0.003,
+            steps=1,
+            min_leverage=1.0,
+            max_leverage=1.0,
+            min_threshold=0.52,
+            max_threshold=0.52,
+            min_take=0.01,
+            max_take=0.01,
+            min_stop=0.008,
+            max_stop=0.008,
+        )
+    ) == 0
+    output = capsys.readouterr().out
+    assert "all tune candidates hit drawdown limit" in output
+    assert "Saved tuned strategy." in output
 
 
 def test_command_backtest_artifact_is_emitted(tmp_path, monkeypatch) -> None:

@@ -304,3 +304,50 @@ def test_backtest_zero_daily_cap_blocks_all_entries() -> None:
     result = run_backtest(rows, _simple_model(10.0), cfg, starting_cash=1000.0, market_type="spot")
     assert result.trades == 1
     assert result.closed_trades == 1
+
+
+def test_backtest_daily_cap_counts_entries_not_closures() -> None:
+    class _StepModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            scores = [0.99, 0.0, 0.99, 0.0]
+            score = scores[min(self.calls, len(scores) - 1)]
+            self.calls += 1
+            return score
+
+    rows = [
+        _flat_row(0, 100.0, 10.0, 1),
+        _flat_row(24 * 60 * 60 * 1000, 110.0, 0.0, 0),
+        _flat_row(24 * 60 * 60 * 1000 + 60_000, 110.0, 10.0, 1),
+        _flat_row(24 * 60 * 60 * 1000 + 120_000, 120.0, 0.0, 0),
+    ]
+    cfg = StrategyConfig(
+        risk_per_trade=0.1,
+        max_position_pct=0.5,
+        max_trades_per_day=1,
+        signal_threshold=0.55,
+        take_profit_pct=0.5,
+        stop_loss_pct=0.5,
+    )
+    result = run_backtest(rows, _StepModel(), cfg, starting_cash=1000.0, market_type="spot")
+    assert result.closed_trades == 2
+    assert result.trades_per_day_cap_hit == 0
+
+
+def test_backtest_futures_neutral_signal_does_not_open_position() -> None:
+    rows = [
+        _flat_row(0, 100.0, 0.0, 0),
+        _flat_row(60_000, 100.0, 0.0, 0),
+    ]
+    cfg = StrategyConfig(
+        leverage=5.0,
+        risk_per_trade=0.2,
+        max_position_pct=0.5,
+        signal_threshold=0.55,
+    )
+    result = run_backtest(rows, _simple_model(0.0), cfg, starting_cash=1000.0, market_type="futures")
+    assert result.trades == 0
+    assert result.closed_trades == 0
+    assert result.max_exposure == 0.0

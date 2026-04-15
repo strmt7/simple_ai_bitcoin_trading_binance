@@ -56,7 +56,7 @@ def _close_position(
     fee_rate = _bps_to_rate(cfg.taker_fee_bps)
     exit_price = _fill_price(price, -position_side, cfg.slippage_bps)
     realized = position_side * (exit_price - entry_price) * qty
-    exit_fee = abs(notional) * fee_rate
+    exit_fee = abs(exit_price * qty) * fee_rate
     return margin_used + realized - exit_fee, realized, exit_fee
 
 
@@ -163,6 +163,7 @@ def run_backtest(
             qty = abs(gross / entry)
             entry_price = entry
             margin_used = effective_margin
+            daily_trade_count[day] = daily_trade_count.get(day, 0) + 1
 
             max_exposure = max(max_exposure, abs(notional))
 
@@ -189,7 +190,6 @@ def run_backtest(
                 cash += cash_delta
                 total_fees += exit_fee
                 closed_trades += 1
-                daily_trade_count[day] = daily_trade_count.get(day, 0) + 1
                 if realized > 0:
                     wins += 1
 
