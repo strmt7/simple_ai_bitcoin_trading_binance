@@ -12,6 +12,7 @@ from typing import Callable, Iterable, Sequence
 from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
+from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
 from .features import feature_signature, make_rows
 from .api import SymbolConstraints
 from .model import (
@@ -40,6 +41,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser_connect = subparsers.add_parser("connect", help="validate credentials and connectivity")
     parser_connect.set_defaults(func=command_connect)
+
+    parser_dashboard = subparsers.add_parser("dashboard", help="render operator dashboard snapshot")
+    parser_dashboard.add_argument("--with-account", action="store_true", help="include authenticated account balances when credentials are present")
+    parser_dashboard.set_defaults(func=command_dashboard)
 
     parser_menu = subparsers.add_parser("menu", help="launch interactive operator menu")
     parser_menu.set_defaults(func=command_menu)
@@ -249,17 +254,7 @@ def _recent_artifacts(*, base_dir: Path = Path("data"), limit: int = 8) -> list[
 
 
 def _artifact_summary(path: Path) -> str:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return f"{path.name} [unreadable]"
-    if not isinstance(payload, dict):
-        return f"{path.name} [non-object]"
-    command = payload.get("command", "json")
-    timestamp = payload.get("timestamp", "-")
-    symbol = payload.get("symbol") or payload.get("runtime", {}).get("symbol", "-")
-    market = payload.get("market") or payload.get("runtime", {}).get("market_type", "-")
-    return f"{path.name} command={command} symbol={symbol} market={market} ts={timestamp}"
+    return load_artifact_preview(path)
 
 
 def _print_menu_header() -> None:
@@ -290,17 +285,14 @@ def _show_recent_artifacts() -> int:
     return 0
 
 
-def _show_account_overview() -> int:
-    runtime = load_runtime()
+def _account_overview_lines(runtime) -> list[str]:
     if not runtime.api_key or not runtime.api_secret:
-        print("No API credentials configured.")
-        return 2
+        return ["No API credentials configured."]
     client = _build_client(runtime)
     try:
         account = client.get_account()
     except BinanceAPIError as exc:
-        print(f"Account overview failed: {exc}", file=sys.stderr)
-        return 2
+        return [f"Account overview failed: {exc}"]
     balances = account.get("balances", []) if isinstance(account, dict) else []
     interesting = []
     for item in balances:
@@ -310,14 +302,44 @@ def _show_account_overview() -> int:
         free = str(item.get("free", "0"))
         locked = str(item.get("locked", "0"))
         if asset in {"BTC", "USDC"} or free not in {"0", "0.0", "0.00000000"} or locked not in {"0", "0.0", "0.00000000"}:
-            interesting.append((asset, free, locked))
-    print("Account overview")
-    print(f"market={runtime.market_type} testnet={runtime.testnet}")
+            interesting.append(f"{asset}: free={free} locked={locked}")
     if not interesting:
-        print("No non-zero balances found.")
-        return 0
-    for asset, free, locked in interesting[:20]:
-        print(f"- {asset}: free={free} locked={locked}")
+        return [f"market={runtime.market_type} testnet={runtime.testnet}", "No non-zero balances found."]
+    return [f"market={runtime.market_type} testnet={runtime.testnet}", *interesting[:20]]
+
+
+def _show_account_overview() -> int:
+    runtime = load_runtime()
+    lines = _account_overview_lines(runtime)
+    print("Account overview")
+    for line in lines:
+        print(f"- {line}" if ":" in line and not line.startswith("market=") else line)
+    if lines == ["No API credentials configured."]:
+        return 2
+    if lines and lines[0].startswith("Account overview failed:"):
+        return 2
+    return 0
+
+
+def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
+    runtime = load_runtime()
+    strategy = load_strategy()
+    notes = [
+        "Primary entrypoints: menu for guided operation, dashboard for overview, subcommands for scripting.",
+        "Use the explicit spot roundtrip or --live path only on testnet.",
+    ]
+    return DashboardSnapshot(
+        runtime=runtime.public_dict(),
+        strategy=strategy.asdict(),
+        artifacts=[_artifact_summary(path) for path in _recent_artifacts()],
+        account_lines=_account_overview_lines(runtime) if with_account else ["Account lookup skipped. Use --with-account to include it."],
+        notes=notes,
+    )
+
+
+def command_dashboard(args: argparse.Namespace) -> int:
+    snapshot = _dashboard_snapshot(with_account=bool(getattr(args, "with_account", False)))
+    print(render_dashboard(snapshot))
     return 0
 
 
@@ -410,17 +432,18 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
         print("3. Configure strategy")
         print("4. Test connectivity")
         print("5. Account overview")
-        print("6. Fetch market data")
-        print("7. Train model")
-        print("8. Tune strategy")
-        print("9. Run backtest")
-        print("10. Evaluate model")
-        print("11. Run paper session")
-        print("12. Run spot/futures testnet session")
-        print("13. Run full offline pipeline")
-        print("14. View recent artifacts")
-        print("15. Spot testnet BUY+SELL roundtrip")
-        print("16. Exit")
+        print("6. Dashboard snapshot")
+        print("7. Fetch market data")
+        print("8. Train model")
+        print("9. Tune strategy")
+        print("10. Run backtest")
+        print("11. Evaluate model")
+        print("12. Run paper session")
+        print("13. Run spot/futures testnet session")
+        print("14. Run full offline pipeline")
+        print("15. View recent artifacts")
+        print("16. Spot testnet BUY+SELL roundtrip")
+        print("17. Exit")
 
         choice = _menu_prompt("Select option: ", input_fn=input_fn)
         if choice == "1":
@@ -435,6 +458,8 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
         elif choice == "5":
             _show_account_overview()
         elif choice == "6":
+            command_dashboard(argparse.Namespace(with_account=True))
+        elif choice == "7":
             runtime = load_runtime()
             args = argparse.Namespace(
                 symbol=runtime.symbol,
@@ -443,7 +468,7 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 output=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
             )
             command_fetch(args)
-        elif choice == "7":
+        elif choice == "8":
             args = argparse.Namespace(
                 input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
                 output=_menu_data_path("model.json", input_fn=input_fn),
@@ -456,7 +481,7 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 calibrate_threshold=_menu_prompt_bool("Calibrate threshold", True, input_fn=input_fn),
             )
             command_train(args)
-        elif choice == "8":
+        elif choice == "9":
             args = argparse.Namespace(
                 input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
                 save_best=_menu_prompt_bool("Save tuned strategy", False, input_fn=input_fn),
@@ -473,14 +498,14 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 max_stop=_menu_prompt_float("Max stop loss", 0.04, minimum=0.0, maximum=0.99, input_fn=input_fn),
             )
             command_tune(args)
-        elif choice == "9":
+        elif choice == "10":
             args = argparse.Namespace(
                 input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
                 model=_menu_data_path("model.json", input_fn=input_fn),
                 start_cash=_menu_prompt_float("Starting cash", 1000.0, minimum=1.0, input_fn=input_fn),
             )
             command_backtest(args)
-        elif choice == "10":
+        elif choice == "11":
             threshold_raw = _menu_prompt("Evaluation threshold [strategy default]: ", input_fn=input_fn)
             args = argparse.Namespace(
                 input=_menu_data_path("historical_btcusdc.json", input_fn=input_fn),
@@ -489,7 +514,7 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 calibrate_threshold=_menu_prompt_bool("Calibrate threshold", False, input_fn=input_fn),
             )
             command_evaluate(args)
-        elif choice == "11":
+        elif choice == "12":
             args = argparse.Namespace(
                 steps=_menu_prompt_int("Paper steps", 20, minimum=1, input_fn=input_fn),
                 sleep=_menu_prompt_int("Paper sleep seconds", 5, minimum=0, input_fn=input_fn),
@@ -501,7 +526,7 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 live=False,
             )
             command_live(args)
-        elif choice == "12":
+        elif choice == "13":
             confirm = _menu_prompt("Type TESTNET to allow authenticated testnet execution: ", input_fn=input_fn)
             if confirm != "TESTNET":
                 print("Testnet execution cancelled.")
@@ -517,13 +542,13 @@ def _run_menu(*, input_fn: Callable[[str], str] = input) -> int:
                 live=True,
             )
             command_live(args)
-        elif choice == "13":
-            _run_offline_pipeline(input_fn=input_fn)
         elif choice == "14":
-            _show_recent_artifacts()
+            _run_offline_pipeline(input_fn=input_fn)
         elif choice == "15":
+            _show_recent_artifacts()
+        elif choice == "16":
             _run_spot_test_order_roundtrip(input_fn=input_fn)
-        elif choice in {"16", "q", "quit", "exit"}:
+        elif choice in {"17", "q", "quit", "exit"}:
             print("Exiting menu.")
             return 0
         else:
