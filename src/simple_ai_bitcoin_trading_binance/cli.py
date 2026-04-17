@@ -30,6 +30,32 @@ from .model import (
 from .types import RuntimeConfig, StrategyConfig
 
 
+_TRAINING_PRESETS: dict[str, dict[str, object]] = {
+    "custom": {},
+    "quick": {
+        "epochs": 80,
+        "walk_forward": False,
+        "calibrate_threshold": False,
+    },
+    "balanced": {
+        "epochs": 180,
+        "walk_forward": True,
+        "walk_forward_train": 300,
+        "walk_forward_test": 60,
+        "walk_forward_step": 30,
+        "calibrate_threshold": True,
+    },
+    "thorough": {
+        "epochs": 350,
+        "walk_forward": True,
+        "walk_forward_train": 360,
+        "walk_forward_test": 90,
+        "walk_forward_step": 30,
+        "calibrate_threshold": True,
+    },
+}
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="simple-ai-trading",
@@ -42,6 +68,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser_connect = subparsers.add_parser("connect", help="validate credentials and connectivity")
     parser_connect.set_defaults(func=command_connect)
+
+    parser_doctor = subparsers.add_parser("doctor", help="run local readiness checks before paper or testnet trading")
+    parser_doctor.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_doctor.add_argument("--model", default="data/model.json")
+    parser_doctor.add_argument("--online", action="store_true", help="also check exchange connectivity")
+    parser_doctor.set_defaults(func=command_doctor)
 
     parser_menu = subparsers.add_parser("menu", help="launch the interactive operator console")
     parser_menu.set_defaults(func=command_menu)
@@ -56,6 +88,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_train = subparsers.add_parser("train", help="train model from cached candles")
     parser_train.add_argument("--input", default="data/historical_btcusdc.json")
     parser_train.add_argument("--output", default="data/model.json")
+    parser_train.add_argument("--preset", choices=sorted(_TRAINING_PRESETS), default="custom")
     parser_train.add_argument("--epochs", type=int, default=250)
     parser_train.add_argument("--seed", type=int, default=7)
     parser_train.add_argument("--walk-forward", action="store_true", help="run walk-forward validation before final training")
@@ -178,6 +211,22 @@ def _parse_form_bool(raw: str, default: bool) -> bool:
     if token in {"n", "no", "false", "0", "off"}:
         return False
     return default
+
+
+def _parse_training_preset(raw: str) -> str:
+    preset = (raw.strip().lower() or "custom")
+    if preset not in _TRAINING_PRESETS:
+        choices = "/".join(sorted(_TRAINING_PRESETS))
+        raise ValueError(f"Preset must be one of: {choices}.")
+    return preset
+
+
+def _apply_training_preset(args: argparse.Namespace) -> argparse.Namespace:
+    preset = _parse_training_preset(str(getattr(args, "preset", "custom") or "custom"))
+    for key, value in _TRAINING_PRESETS[preset].items():
+        setattr(args, key, value)
+    setattr(args, "preset", preset)
+    return args
 
 
 def _parse_form_int(raw: str, *, label: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -439,6 +488,71 @@ def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
     )
 
 
+def _connection_status_line() -> str:
+    runtime = load_runtime()
+    market = f"{runtime.market_type}/{'testnet' if runtime.testnet else 'mainnet'}"
+    mode = "paper-default" if runtime.dry_run else "testnet-live-default"
+    checked_at = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+    client = _build_client(runtime)
+    try:
+        client.ping()
+        client.get_exchange_time()
+        auth_label = "auth missing"
+        if runtime.api_key and runtime.api_secret:
+            account = client.get_account()
+            auth_label = "auth ok" if isinstance(account, dict) else "auth response ok"
+        return f"Connection {checked_at}: online {market} {mode} server-time ok {auth_label}"
+    except BinanceAPIError as exc:
+        return f"Connection {checked_at}: offline {market} ({exc})"
+
+
+def _readiness_report(*, input_path: str, model_path: str, online: bool = False) -> tuple[bool, list[str]]:
+    runtime = load_runtime()
+    strategy = load_strategy()
+    checks: list[tuple[bool, str, str]] = []
+
+    def add(ok: bool, label: str, detail: str) -> None:
+        checks.append((ok, label, detail))
+
+    mode = "paper" if runtime.dry_run else "authenticated testnet"
+    add(runtime.testnet, "safety target", "testnet enabled" if runtime.testnet else "testnet is disabled")
+    add(runtime.market_type in {"spot", "futures"}, "market type", runtime.market_type)
+    add(
+        runtime.dry_run or bool(runtime.api_key and runtime.api_secret),
+        "execution credentials",
+        f"{mode}; credentials {'present' if runtime.api_key and runtime.api_secret else 'not configured'}",
+    )
+    add(0.01 <= strategy.signal_threshold <= 0.99, "signal threshold", f"{strategy.signal_threshold:.3f}")
+    add(strategy.risk_per_trade > 0 and strategy.max_position_pct > 0, "risk sizing", f"risk={strategy.risk_per_trade} max_position={strategy.max_position_pct}")
+    add(bool(strategy.enabled_features), "feature set", ",".join(strategy.enabled_features))
+
+    data_file = Path(input_path)
+    if data_file.exists():
+        candles = _load_rows_for_command(str(data_file), label="Readiness data load failed")
+        candle_count = len(candles) if candles is not None else 0
+        add(candle_count > max(strategy.feature_windows), "training data", f"{candle_count} candles at {data_file}")
+    else:
+        add(False, "training data", f"missing {data_file}")
+
+    model_file = Path(model_path)
+    if model_file.exists():
+        try:
+            model = _load_runtime_model(model_file, strategy)
+        except (OSError, ModelFeatureMismatchError, ModelLoadError, ValueError) as exc:
+            add(False, "model artifact", f"{model_file} is not usable with current strategy ({exc})")
+        else:
+            add(True, "model artifact", f"{model_file} dim={model.feature_dim}")
+    else:
+        add(False, "model artifact", f"missing {model_file}")
+
+    if online:
+        line = _connection_status_line()
+        add("online" in line and "offline" not in line and "failed" not in line, "exchange connectivity", line)
+
+    lines = [f"[{'ok' if ok else 'fix'}] {label}: {detail}" for ok, label, detail in checks]
+    return all(ok for ok, _label, _detail in checks), lines
+
+
 def _tui_actions():
     from .tui import FormField, TUIAction
     async def _overview(ui):
@@ -452,9 +566,10 @@ def _tui_actions():
                     "Operator help",
                     "- Start with Runtime settings to enter API credentials securely.",
                     "- Run Connect before any data, training, or live action.",
+                    "- Run Readiness check before Paper loop or Testnet loop.",
                     "- The main screen shows actions, selected action details, live snapshot, and activity together.",
                     "- Use Tab and Shift+Tab only inside modal forms.",
-                    "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest.",
+                    "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest -> Readiness check.",
                     "- Use Paper loop before Testnet loop.",
                     "- Spot roundtrip is the smallest authenticated execution check.",
                     "- Keys: j/k move, enter runs the selected action, r refreshes the snapshot, q quits.",
@@ -497,6 +612,26 @@ def _tui_actions():
     async def _connect(_ui):
         return command_connect(argparse.Namespace())
 
+    async def _doctor(ui):
+        payload = await ui.form(
+            "Readiness check",
+            [
+                FormField("input", "Training input path", "data/historical_btcusdc.json"),
+                FormField("model", "Model path", "data/model.json"),
+                FormField("online", "Include exchange connectivity [yes/no]", "yes"),
+            ],
+        )
+        if payload is None:
+            print("Readiness check cancelled.")
+            return 0
+        return command_doctor(
+            argparse.Namespace(
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                model=payload["model"].strip() or "data/model.json",
+                online=_parse_form_bool(payload["online"], True),
+            )
+        )
+
     async def _account(_ui):
         return _show_account_overview()
 
@@ -532,6 +667,7 @@ def _tui_actions():
             [
                 FormField("input", "Training input path", "data/historical_btcusdc.json"),
                 FormField("output", "Model output path", "data/model.json"),
+                FormField("preset", "Preset [custom/quick/balanced/thorough]", "custom"),
                 FormField("epochs", "Training epochs", "250"),
                 FormField("seed", "Training seed", "7"),
                 FormField("walk_forward", "Run walk-forward validation [yes/no]", "no"),
@@ -545,6 +681,7 @@ def _tui_actions():
             print("Training cancelled.")
             return 0
         try:
+            preset = _parse_training_preset(payload["preset"])
             epochs = _parse_form_int(payload["epochs"], label="Training epochs", default=250, minimum=1)
             seed = _parse_form_int(payload["seed"], label="Training seed", default=7, minimum=0)
             walk_forward_train = _parse_form_int(payload["walk_forward_train"], label="Walk-forward train window", default=300, minimum=2)
@@ -557,6 +694,7 @@ def _tui_actions():
             argparse.Namespace(
                 input=payload["input"].strip() or "data/historical_btcusdc.json",
                 output=payload["output"].strip() or "data/model.json",
+                preset=preset,
                 epochs=epochs,
                 seed=seed,
                 walk_forward=_parse_form_bool(payload["walk_forward"], False),
@@ -696,6 +834,7 @@ def _tui_actions():
                 FormField("historical", "Historical candle path", "data/historical_btcusdc.json"),
                 FormField("model", "Model artifact path", "data/model.json"),
                 FormField("limit", "Fetch limit", "500"),
+                FormField("preset", "Training preset [custom/quick/balanced/thorough]", "balanced"),
                 FormField("epochs", "Training epochs", "120"),
                 FormField("seed", "Training seed", "7"),
                 FormField("walk_forward", "Run walk-forward validation [yes/no]", "yes"),
@@ -713,6 +852,7 @@ def _tui_actions():
         model = payload["model"].strip() or "data/model.json"
         try:
             limit = _parse_form_int(payload["limit"], label="Fetch limit", default=500, minimum=1)
+            preset = _parse_training_preset(payload["preset"])
             epochs = _parse_form_int(payload["epochs"], label="Training epochs", default=120, minimum=1)
             seed = _parse_form_int(payload["seed"], label="Training seed", default=7, minimum=0)
             walk_forward_train = _parse_form_int(payload["walk_forward_train"], label="Walk-forward train window", default=300, minimum=2)
@@ -731,6 +871,7 @@ def _tui_actions():
         train_args = argparse.Namespace(
             input=historical,
             output=model,
+            preset=preset,
             epochs=epochs,
             seed=seed,
             walk_forward=_parse_form_bool(payload["walk_forward"], True),
@@ -895,18 +1036,19 @@ def _tui_actions():
         TUIAction("2", "Help", "Show the recommended operator workflow and keyboard shortcuts.", _help),
         TUIAction("3", "Runtime settings", "Enter credentials securely and configure the runtime target.", _runtime),
         TUIAction("4", "Connect", "Validate exchange connectivity and the configured target.", _connect),
-        TUIAction("5", "Account", "Inspect authenticated balances and positions.", _account),
-        TUIAction("6", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
-        TUIAction("7", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
-        TUIAction("8", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
-        TUIAction("9", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
-        TUIAction("10", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
-        TUIAction("11", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
-        TUIAction("12", "Offline pipeline", "Run fetch, train, backtest, and evaluate as one guided flow.", _pipeline),
-        TUIAction("13", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
-        TUIAction("14", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
-        TUIAction("15", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
-        TUIAction("16", "Recent artifacts", "Print the latest local artifacts into the console log.", _artifacts),
+        TUIAction("5", "Readiness check", "Preflight safety flags, data, model compatibility, and optional exchange connectivity.", _doctor),
+        TUIAction("6", "Account", "Inspect authenticated balances and positions.", _account),
+        TUIAction("7", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
+        TUIAction("8", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
+        TUIAction("9", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
+        TUIAction("10", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
+        TUIAction("11", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
+        TUIAction("12", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
+        TUIAction("13", "Offline pipeline", "Run fetch, train, backtest, and evaluate as one guided flow.", _pipeline),
+        TUIAction("14", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
+        TUIAction("15", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
+        TUIAction("16", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
+        TUIAction("17", "Recent artifacts", "Print the latest local artifacts into the console log.", _artifacts),
     ]
 
 
@@ -921,6 +1063,7 @@ def command_menu(_: argparse.Namespace) -> int:
         title="simple-ai-trading interactive console",
         actions=_tui_actions(),
         snapshot_provider=lambda width=72: render_dashboard(_dashboard_snapshot(with_account=False), width=width),
+        connection_provider=_connection_status_line,
     )
 
 
@@ -1279,6 +1422,14 @@ def command_connect(_: argparse.Namespace) -> int:
         return 2
 
 
+def command_doctor(args: argparse.Namespace) -> int:
+    ok, lines = _readiness_report(input_path=args.input, model_path=args.model, online=bool(args.online))
+    print("Readiness report")
+    for line in lines:
+        print(line)
+    return 0 if ok else 2
+
+
 def command_status(_: argparse.Namespace) -> int:
     runtime = load_runtime()
     strategy = load_strategy()
@@ -1400,6 +1551,11 @@ def command_fetch(args: argparse.Namespace) -> int:
 
 
 def command_train(args: argparse.Namespace) -> int:
+    try:
+        args = _apply_training_preset(args)
+    except ValueError as exc:
+        print(f"Training settings invalid: {exc}", file=sys.stderr)
+        return 2
     cfg = load_strategy()
     runtime = load_runtime()
     candles = _load_rows_for_command(args.input, label="Training data load failed")
@@ -1486,6 +1642,7 @@ def command_train(args: argparse.Namespace) -> int:
             "epochs": int(args.epochs),
             "lookback_windows": list(cfg.feature_windows),
             "label_threshold": float(cfg.label_threshold),
+            "preset": str(args.preset),
             "walk_forward": bool(args.walk_forward),
         },
         "walk_forward": wf if wf is not None else None,

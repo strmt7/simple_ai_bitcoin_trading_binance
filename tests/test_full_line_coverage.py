@@ -601,6 +601,10 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
 
     monkeypatch.setattr(cli, "command_connect", lambda _args: 0)
     assert asyncio.run(_action("Connect").run(_ScriptedUI())) == 0
+    monkeypatch.setattr(cli, "command_doctor", capture("doctor"))
+    assert asyncio.run(_action("Readiness check").run(_ScriptedUI(forms=[None]))) == 0
+    assert asyncio.run(_action("Readiness check").run(_ScriptedUI(forms=[{"input": "", "model": "", "online": "no"}]))) == 0
+    assert captured["doctor"].online is False
     monkeypatch.setattr(cli, "_show_account_overview", lambda: 0)
     assert asyncio.run(_action("Account").run(_ScriptedUI())) == 0
 
@@ -614,6 +618,7 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
     bad_train = {
         "input": "",
         "output": "",
+        "preset": "custom",
         "epochs": "0",
         "seed": "7",
         "walk_forward": "no",
@@ -626,6 +631,7 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
     good_train = {**bad_train, "epochs": "1"}
     monkeypatch.setattr(cli, "command_train", capture("train"))
     assert asyncio.run(_action("Train model").run(_ScriptedUI(forms=[good_train]))) == 0
+    assert captured["train"].preset == "custom"
 
     assert asyncio.run(_action("Tune strategy").run(_ScriptedUI(forms=[None]))) == 0
     tune_base = {
@@ -673,6 +679,7 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
         "historical": "",
         "model": "",
         "limit": "0",
+        "preset": "balanced",
         "epochs": "120",
         "seed": "7",
         "walk_forward": "yes",
@@ -946,6 +953,7 @@ def test_cli_train_walk_forward_without_fold_scores(tmp_path, monkeypatch, capsy
         argparse.Namespace(
             input="x",
             output=str(tmp_path / "model.json"),
+            preset="custom",
             epochs=1,
             seed=7,
             walk_forward=True,

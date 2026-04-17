@@ -11,7 +11,7 @@ import pytest
 from simple_ai_bitcoin_trading_binance import cli
 from simple_ai_bitcoin_trading_binance.api import BinanceAPIError, Candle
 from simple_ai_bitcoin_trading_binance.config import RuntimeConfig, load_strategy, save_runtime, save_strategy
-from simple_ai_bitcoin_trading_binance.model import TrainedModel
+from simple_ai_bitcoin_trading_binance.model import ModelLoadError, TrainedModel
 from simple_ai_bitcoin_trading_binance.features import feature_signature
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
@@ -74,6 +74,12 @@ def _simple_candles(n: int = 320) -> list[Candle]:
 def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     args = cli._parse_args(["status"])
     assert callable(args.func)
+    doctor_args = cli._parse_args(["doctor", "--input", "i.json", "--model", "m.json", "--online"])
+    assert doctor_args.input == "i.json"
+    assert doctor_args.model == "m.json"
+    assert doctor_args.online is True
+    train_args = cli._parse_args(["train", "--preset", "quick"])
+    assert train_args.preset == "quick"
 
     marker = []
 
@@ -90,6 +96,36 @@ def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     assert live.retrain_window == 300
     assert live.retrain_min_rows == 240
     assert live.paper is False
+
+
+def test_training_preset_helper_and_invalid_command(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    custom = cli._apply_training_preset(
+        argparse.Namespace(
+            preset="custom",
+            epochs=999,
+            walk_forward=True,
+            walk_forward_train=1,
+            walk_forward_test=1,
+            walk_forward_step=1,
+            calibrate_threshold=True,
+        )
+    )
+    assert custom.epochs == 999
+    quick = cli._apply_training_preset(argparse.Namespace(preset="quick", epochs=999, walk_forward=True, calibrate_threshold=True))
+    assert quick.epochs == 80
+    assert quick.walk_forward is False
+    balanced = cli._apply_training_preset(argparse.Namespace(preset="balanced"))
+    assert balanced.walk_forward is True
+    assert balanced.walk_forward_test == 60
+    thorough = cli._apply_training_preset(argparse.Namespace(preset="thorough"))
+    assert thorough.epochs == 350
+    assert thorough.walk_forward_train == 360
+    with pytest.raises(ValueError):
+        cli._apply_training_preset(argparse.Namespace(preset="wild"))
+
+    assert cli.command_train(argparse.Namespace(input="x", output="y", preset="wild")) == 2
+    assert "Training settings invalid" in capsys.readouterr().err
 
 
 def test_clamp_and_direction_helpers() -> None:
@@ -121,6 +157,67 @@ def test_resolve_futures_leverage(monkeypatch) -> None:
 
     runtime_spot = RuntimeConfig(market_type="spot")
     assert cli._resolve_futures_leverage(runtime_spot, cfg) == 1.0
+
+
+def test_connection_status_line_branches(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class NoAuthClient(_FakeClient):
+        pass
+
+    save_runtime(RuntimeConfig(api_key="", api_secret="", dry_run=True, testnet=True, market_type="spot"))
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: NoAuthClient())
+    line = cli._connection_status_line()
+    assert "online spot/testnet paper-default" in line
+    assert "auth missing" in line
+
+    save_runtime(RuntimeConfig(api_key="k", api_secret="s", dry_run=False, testnet=True, market_type="futures"))
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    line = cli._connection_status_line()
+    assert "online futures/testnet testnet-live-default" in line
+    assert "auth ok" in line
+
+    class OddAuthClient(_FakeClient):
+        def get_account(self):
+            return "accepted"
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: OddAuthClient())
+    assert "auth response ok" in cli._connection_status_line()
+
+    class OfflineClient(_FakeClient):
+        def ping(self):
+            raise BinanceAPIError("timeout")
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: OfflineClient())
+    assert "offline futures/testnet" in cli._connection_status_line()
+
+
+def test_readiness_report_and_command_doctor(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=False, dry_run=False, api_key="", api_secret=""))
+    save_strategy(StrategyConfig())
+    ok, lines = cli._readiness_report(input_path=str(tmp_path / "missing.json"), model_path=str(tmp_path / "missing-model.json"))
+    assert ok is False
+    assert any(line.startswith("[fix] safety target") for line in lines)
+    assert any("training data" in line for line in lines)
+
+    data_file = tmp_path / "history.json"
+    model_file = tmp_path / "model.json"
+    data_file.write_text("[]", encoding="utf-8")
+    model_file.write_text("{}", encoding="utf-8")
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, api_key="", api_secret=""))
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: [object()] * 80)
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: SimpleNamespace(feature_dim=3))
+    monkeypatch.setattr(cli, "_connection_status_line", lambda: "Connection 00: online spot/testnet paper-default server-time ok auth missing")
+    assert cli.command_doctor(argparse.Namespace(input=str(data_file), model=str(model_file), online=True)) == 0
+    output = capsys.readouterr().out
+    assert "Readiness report" in output
+    assert "[ok] exchange connectivity" in output
+
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(ModelLoadError("bad model")))
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+    assert ok is False
+    assert any("bad model" in line for line in lines)
 
 
 def test_build_order_notional_paths() -> None:

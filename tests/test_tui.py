@@ -69,6 +69,14 @@ class _FakeRichLog:
     def write(self, text: str) -> None:
         self.lines.append(text)
 
+
+def _disable_app_timers(app: OperatorApp, monkeypatch) -> list[tuple[str, str]]:
+    timers: list[tuple[str, str]] = []
+    monkeypatch.setattr(app, "set_timer", lambda _delay, _callback, *, name=None, **_kwargs: timers.append(("timer", name or "")))
+    monkeypatch.setattr(app, "set_interval", lambda _interval, _callback, *, name=None, **_kwargs: timers.append(("interval", name or "")))
+    return timers
+
+
 def test_confirm_screen_behaviors(monkeypatch) -> None:
     screen = ConfirmScreen("Confirm?")
 
@@ -227,8 +235,10 @@ def test_operator_app_methods(monkeypatch) -> None:
         snapshot_provider=lambda _width=70: "snapshot",
     )
     monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+    timers = _disable_app_timers(app, monkeypatch)
 
     app.on_mount()
+    assert timers == [("timer", "connection-status-initial"), ("interval", "connection-status")]
     assert widgets["#actions"].focused is True
     assert widgets["#preview"].value == "snapshot"
     assert widgets["#status"].value == "Ready. Enter runs the selected action."
@@ -248,6 +258,7 @@ def test_operator_app_methods(monkeypatch) -> None:
 
     app.action_refresh_preview()
     assert widgets["#status"].value == "Snapshot refreshed"
+    assert timers[-1] == ("timer", "connection-status-manual")
 
     app.action_cursor_down()
     assert widgets["#status"].value == "Async"
@@ -315,6 +326,7 @@ def test_operator_app_first_nonzero_highlight_updates_action_details(monkeypatch
         snapshot_provider=lambda _width=70: "snapshot",
     )
     monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+    _disable_app_timers(app, monkeypatch)
 
     app.on_mount()
     app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 1))
@@ -613,10 +625,11 @@ def test_launch_tui_constructs_operator_app(monkeypatch) -> None:
     captured = {}
 
     class _FakeOperatorApp:
-        def __init__(self, *, title_text, actions, snapshot_provider) -> None:
+        def __init__(self, *, title_text, actions, snapshot_provider, connection_provider=None) -> None:
             captured["title"] = title_text
             captured["actions"] = actions
             captured["snapshot"] = snapshot_provider()
+            captured["connection"] = connection_provider
 
         def run(self):
             return 7
@@ -627,3 +640,34 @@ def test_launch_tui_constructs_operator_app(monkeypatch) -> None:
     assert result == 7
     assert captured["title"] == "title"
     assert captured["snapshot"] == "snap"
+    assert captured["connection"] is None
+
+
+def test_operator_app_connection_status_paths(monkeypatch) -> None:
+    widgets = {"#connectionbar": _FakeStatic()}
+    app = OperatorApp(
+        title_text="title",
+        actions=[TUIAction("1", "One", "desc", lambda _ui: 0)],
+        snapshot_provider=lambda _width=70: "snapshot",
+        connection_provider=lambda: "Connection: online",
+        connection_interval=1.0,
+    )
+    assert app.connection_interval == 5.0
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+
+    asyncio.run(app.refresh_connection_status())
+    assert widgets["#connectionbar"].value == "Connection: online"
+
+    app.connection_provider = None
+    asyncio.run(app.refresh_connection_status())
+    assert widgets["#connectionbar"].value == "Connection: no checker configured"
+
+    def failing_provider() -> str:
+        raise RuntimeError("network down")
+
+    app.connection_provider = failing_provider
+    asyncio.run(app.refresh_connection_status())
+    assert widgets["#connectionbar"].value == "Connection: check failed (network down)"
+
+    monkeypatch.setattr(app, "query_one", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyError("missing")))
+    app.set_connection_status("ignored")

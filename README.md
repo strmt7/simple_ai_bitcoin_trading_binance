@@ -36,26 +36,38 @@ This opens the interactive console inside the current terminal window. The conso
 
 The layout is intentionally simple:
 
-- a left action list in operational order
-- one focused work area with `Action`, `Overview`, and `Activity` tabs
+- a single action list in operational order
+- a selected-action detail panel
+- a live runtime/strategy/artifact snapshot
+- an activity log
 - modal forms for editing runtime, strategy, tuning, and execution parameters
 - password-masked API key and secret fields inside `Runtime settings`
-- footer key hints for navigation and refresh
+- a bottom bar with real exchange connection status and keyboard hints
 
 Use the left action list to:
 
 - read `Help` for the recommended operator sequence
 - update `Runtime settings`, then run `Connect`
+- run `Readiness check` before paper or authenticated testnet execution
 - edit runtime settings
 - edit strategy and feature selection
 - fetch candles
-- train or retrain the model
+- train or retrain the model with `custom`, `quick`, `balanced`, or `thorough` presets
 - tune over all data, a lookback window, or an explicit date range
 - run backtests and evaluation
 - run paper or authenticated testnet live loops
 - inspect recent artifacts and account state
 
 By default data is written to `data/historical_btcusdc.json` and `data/model.json`.
+
+Useful direct commands:
+
+```bash
+simple-ai-trading menu
+simple-ai-trading doctor --online
+simple-ai-trading train --preset balanced
+simple-ai-trading live --paper --steps 20
+```
 
 ## Host overrides
 
@@ -113,9 +125,16 @@ The console supports:
 ### Model and execution workflow
 
 - training uses the current feature selection from strategy settings
+- training supports `custom`, `quick`, `balanced`, and `thorough` presets
 - evaluation and backtesting use the current saved model artifact
 - the live loop supports paper mode and explicit authenticated testnet execution
+- the `doctor` command checks safety flags, training data, model compatibility, risk settings, and optional exchange connectivity
+- the interactive bottom bar refreshes the exchange connection status automatically while the console is open
 - spot roundtrip execution is an explicit console action, not an automatic side effect
+
+## Research reference
+
+For verified design comparisons against high-status trading bots, exchange SDKs, and backtesting frameworks, see `docs/SIMILAR_TRADING_REPOS_REVIEW.md`. Agent instructions in `AGENTS.md` require reading it before broad product, architecture, CLI, or workflow redesigns.
 
 ## Development
 

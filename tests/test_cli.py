@@ -411,6 +411,7 @@ def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypat
                     {
                         "input": "data/in.json",
                         "output": "data/out.json",
+                        "preset": "custom",
                         "epochs": "99",
                         "seed": "11",
                         "walk_forward": "yes",
@@ -459,6 +460,7 @@ def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypat
     assert captured["fetch"].limit == 400
     assert captured["train"].walk_forward is True
     assert captured["train"].calibrate_threshold is False
+    assert captured["train"].preset == "custom"
     assert captured["tune"].from_date == "2024-01-01"
     assert captured["tune"].to_date == "2024-02-01"
     assert captured["backtest"].start_cash == 1500.0
@@ -494,6 +496,7 @@ def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
                 "historical": "tmp/history.json",
                 "model": "tmp/model.json",
                 "limit": "220",
+                "preset": "quick",
                 "epochs": "50",
                 "seed": "7",
                 "walk_forward": "yes",

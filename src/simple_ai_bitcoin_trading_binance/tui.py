@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import io
 import textwrap
@@ -396,9 +397,19 @@ class OperatorApp(App[int]):
         color: #f8fffe;
         background: #0f766e;
     }
-    #footerbar {
+    #bottombar {
         dock: bottom;
         height: 1;
+        background: #0d1822;
+    }
+    #connectionbar {
+        width: 1fr;
+        padding: 0 1;
+        background: #0d1822;
+        color: #7ce0c9;
+    }
+    #keybar {
+        width: auto;
         padding: 0 1;
         background: #0d1822;
         color: #9fb4c4;
@@ -413,11 +424,21 @@ class OperatorApp(App[int]):
         Binding("k", "cursor_up", "Up"),
     ]
 
-    def __init__(self, *, title_text: str, actions: list[TUIAction], snapshot_provider: Callable[..., str]) -> None:
+    def __init__(
+        self,
+        *,
+        title_text: str,
+        actions: list[TUIAction],
+        snapshot_provider: Callable[..., str],
+        connection_provider: Callable[[], str] | None = None,
+        connection_interval: float = 60.0,
+    ) -> None:
         super().__init__()
         self.title = title_text
         self.actions_data = actions
         self.snapshot_provider = snapshot_provider
+        self.connection_provider = connection_provider
+        self.connection_interval = max(5.0, float(connection_interval))
         self.controller = TerminalUI(self)
         self._ignored_initial_highlight = False
 
@@ -438,7 +459,9 @@ class OperatorApp(App[int]):
                 with Vertical(id="activity-panel"):
                     yield Static("Activity", id="log-title", classes="panel-title")
                     yield RichLog(id="log", wrap=True, highlight=True, markup=False)
-        yield Static("j/k or arrows move | Enter run | r refresh | q quit", id="footerbar")
+        with Horizontal(id="bottombar"):
+            yield Static("Connection: not checked", id="connectionbar")
+            yield Static("j/k or arrows move | Enter run | r refresh | q quit", id="keybar")
 
     def on_mount(self) -> None:
         actions = self.query_one("#actions", OptionList)
@@ -447,6 +470,8 @@ class OperatorApp(App[int]):
         self.refresh_preview()
         self._update_action_details()
         self.set_status("Ready. Enter runs the selected action.")
+        self.set_timer(0.1, self.refresh_connection_status, name="connection-status-initial")
+        self.set_interval(self.connection_interval, self.refresh_connection_status, name="connection-status")
 
     def set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
@@ -455,6 +480,12 @@ class OperatorApp(App[int]):
         log = self.query_one("#log", RichLog)
         for line in text.splitlines() or [""]:
             log.write(line)
+
+    def set_connection_status(self, text: str) -> None:
+        try:
+            self.query_one("#connectionbar", Static).update(text)
+        except Exception:
+            return
 
     def _modal_open(self) -> bool:
         return len(self.screen_stack) > 1
@@ -478,6 +509,16 @@ class OperatorApp(App[int]):
         except TypeError:
             rendered = self.snapshot_provider()
         preview.update(rendered)
+
+    async def refresh_connection_status(self) -> None:
+        if self.connection_provider is None:
+            self.set_connection_status("Connection: no checker configured")
+            return
+        try:
+            line = await asyncio.to_thread(self.connection_provider)
+        except Exception as exc:
+            line = f"Connection: check failed ({exc})"
+        self.set_connection_status(line)
 
     def _current_action(self) -> TUIAction:
         option_list = self.query_one("#actions", OptionList)
@@ -522,6 +563,7 @@ class OperatorApp(App[int]):
             return
         self.refresh_preview()
         self.set_status("Snapshot refreshed")
+        self.set_timer(0.1, self.refresh_connection_status, name="connection-status-manual")
 
     def action_cursor_down(self) -> None:
         if self._modal_open():
@@ -561,6 +603,12 @@ def launch_tui(
     title: str,
     actions: list[TUIAction],
     snapshot_provider: Callable[[], str],
+    connection_provider: Callable[[], str] | None = None,
 ) -> int:
-    app = OperatorApp(title_text=title, actions=actions, snapshot_provider=snapshot_provider)
+    app = OperatorApp(
+        title_text=title,
+        actions=actions,
+        snapshot_provider=snapshot_provider,
+        connection_provider=connection_provider,
+    )
     return int(app.run() or 0)
