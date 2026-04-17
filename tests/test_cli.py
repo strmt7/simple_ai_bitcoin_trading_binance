@@ -57,6 +57,9 @@ class _AsyncUI:
         del help_text
         return self._multiselects.pop(0)
 
+    async def run_blocking(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
     def append_log(self, text: str) -> None:
         self.logs.append(text)
 
@@ -225,7 +228,7 @@ def test_build_live_model_respects_existing_model_and_retrain_cadence(monkeypatc
 
     calls: list[tuple[list[int], int]] = []
 
-    def fake_train(train_rows, *, epochs: int):
+    def fake_train(train_rows, *, epochs: int, **_kwargs):
         calls.append((list(train_rows), epochs))
         return {"trained": True}
 
@@ -356,6 +359,7 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
         multiselects=[["momentum_1", "rsi"]],
         forms=[
             {
+                "profile": "custom",
                 "leverage": "3",
                 "risk": "0.02",
                 "max_position": "0.3",
@@ -381,6 +385,7 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
 
     assert result == 0
     assert captured["args"].leverage == 3.0
+    assert captured["args"].profile == "custom"
     assert captured["args"].feature_window_short == 12
     assert captured["args"].feature_window_long == 48
     assert captured["args"].training_epochs == 500
@@ -392,7 +397,7 @@ def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypat
     captured = {}
     monkeypatch.setattr(
         "simple_ai_bitcoin_trading_binance.cli.load_runtime",
-        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m"})(),
+        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m", "market_type": "spot"})(),
     )
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", lambda args: captured.__setitem__("fetch", args) or 0)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", lambda args: captured.__setitem__("train", args) or 0)
@@ -470,12 +475,10 @@ def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
     captured = {"order": []}
     monkeypatch.setattr(
         "simple_ai_bitcoin_trading_binance.cli.load_runtime",
-        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m"})(),
+        lambda: type("R", (), {"symbol": "BTCUSDC", "interval": "15m", "market_type": "spot"})(),
     )
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured.setdefault("evaluate", args) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_fetch", lambda args: captured["order"].append(("fetch", args.output)) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_train", lambda args: captured["order"].append(("train", args.output)) or 0)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_backtest", lambda args: captured["order"].append(("backtest", args.model)) or 0)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_prepare", lambda args: captured["order"].append(("prepare", args.model, args.online_doctor)) or 0)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_evaluate", lambda args: captured["order"].append(("evaluate", args.model)) or 0)
 
     ui_eval = _AsyncUI(
@@ -499,23 +502,16 @@ def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
                 "preset": "quick",
                 "epochs": "50",
                 "seed": "7",
-                "walk_forward": "yes",
-                "walk_forward_train": "300",
-                "walk_forward_test": "60",
-                "walk_forward_step": "30",
-                "calibrate_threshold": "yes",
                 "start_cash": "1000",
+                "online_doctor": "yes",
             }
         ]
     )
-    asyncio.run(_action("Offline pipeline").run(ui_pipeline))
+    asyncio.run(_action("Prepare system").run(ui_pipeline))
 
     assert captured["order"] == [
         ("evaluate", "data/eval-model.json"),
-        ("fetch", "tmp/history.json"),
-        ("train", "tmp/model.json"),
-        ("backtest", "tmp/model.json"),
-        ("evaluate", "tmp/model.json"),
+        ("prepare", "tmp/model.json", True),
     ]
 
 
@@ -540,6 +536,7 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
             _AsyncUI(
                 forms=[
                     {
+                        "model": "data/model.json",
                         "steps": "3",
                         "sleep": "0",
                         "retrain_interval": "1",
@@ -555,6 +552,7 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
             _AsyncUI(
                 forms=[
                     {
+                        "model": "data/model.json",
                         "steps": "2",
                         "sleep": "0",
                         "retrain_interval": "0",
@@ -566,7 +564,23 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
             )
         )
     )
-    asyncio.run(_action("Testnet loop").run(_AsyncUI(confirms=[False])))
+    asyncio.run(
+        _action("Testnet loop").run(
+            _AsyncUI(
+                forms=[
+                    {
+                        "model": "data/model.json",
+                        "steps": "2",
+                        "sleep": "0",
+                        "retrain_interval": "0",
+                        "retrain_window": "240",
+                        "retrain_min_rows": "120",
+                    }
+                ],
+                confirms=[False],
+            )
+        )
+    )
     asyncio.run(
         _action("Spot roundtrip").run(
             _AsyncUI(forms=[{"quantity": "0.00008"}], confirms=[True])
@@ -575,6 +589,7 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
 
     assert calls[0].paper is True and calls[0].steps == 3
     assert calls[1].live is True and calls[1].steps == 2
+    assert calls[0].model == "data/model.json"
     assert "Spot test roundtrip complete." in capsys.readouterr().out
 
 

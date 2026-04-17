@@ -45,6 +45,9 @@ class _ScriptedUI:
     async def multi_select(self, _title, _options, _selected, *, help_text=""):
         return self.multi_selects.pop(0)
 
+    async def run_blocking(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
     def append_log(self, text: str) -> None:
         self.logs.append(text)
 
@@ -72,6 +75,7 @@ def _runtime_form(**overrides: str) -> dict[str, str]:
 def _strategy_form(**overrides: str) -> dict[str, str]:
     cfg = StrategyConfig()
     payload = {
+        "profile": "custom",
         "leverage": str(cfg.leverage),
         "risk": str(cfg.risk_per_trade),
         "max_position": str(cfg.max_position_pct),
@@ -127,6 +131,7 @@ def _flat_model(probability: float, *, feature_dim: int = 1) -> TrainedModel:
 
 def _strategy_args(**overrides):
     defaults = {
+        "profile": "custom",
         "leverage": None,
         "risk": None,
         "max_position": None,
@@ -182,6 +187,7 @@ def _live_args(**overrides):
         "sleep": 0,
         "paper": True,
         "live": False,
+        "model": "data/model.json",
         "leverage": None,
         "retrain_interval": 0,
         "retrain_window": 1,
@@ -424,6 +430,26 @@ def test_cli_dashboard_account_and_artifact_helpers(tmp_path, monkeypatch, capsy
 
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: MixedClient())
     assert cli._account_overview_lines(RuntimeConfig(api_key="k", api_secret="s"))[-1] == "BTC: free=0 locked=0"
+
+    class FuturesAccountClient:
+        def get_account(self):
+            return {
+                "assets": [
+                    object(),
+                    {"asset": "ETH", "walletBalance": "0", "availableBalance": "0", "unrealizedProfit": "0"},
+                    {"asset": "USDC", "walletBalance": "42.0", "availableBalance": "40.0", "unrealizedProfit": "2.0"},
+                ],
+                "positions": [
+                    object(),
+                    {"symbol": "ETHUSDC", "positionAmt": "0", "entryPrice": "0", "unrealizedProfit": "0"},
+                    {"symbol": "BTCUSDC", "positionAmt": "0.01", "entryPrice": "100.0", "unrealizedProfit": "1.5"},
+                ],
+            }
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: FuturesAccountClient())
+    futures_lines = cli._account_overview_lines(RuntimeConfig(api_key="k", api_secret="s", market_type="futures"))
+    assert "USDC: wallet=42.0 available=40.0 unrealized=2.0" in futures_lines
+    assert "BTCUSDC: position=0.01 entry=100.0 unrealized=1.5" in futures_lines
 
 
 def test_cli_remaining_helper_edges(tmp_path, monkeypatch, capsys) -> None:
@@ -670,11 +696,12 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
     assert asyncio.run(_action("Backtest").run(_ScriptedUI(forms=[{"input": "", "model": "", "start_cash": "100"}]))) == 0
 
     assert asyncio.run(_action("Evaluate").run(_ScriptedUI(forms=[None]))) == 0
+    assert asyncio.run(_action("Evaluate").run(_ScriptedUI(forms=[{"input": "", "model": "", "threshold": "bad", "calibrate_threshold": "yes"}]))) == 2
     monkeypatch.setattr(cli, "command_evaluate", capture("evaluate"))
     assert asyncio.run(_action("Evaluate").run(_ScriptedUI(forms=[{"input": "", "model": "", "threshold": "0.7", "calibrate_threshold": "yes"}]))) == 0
     assert captured["evaluate"].threshold == 0.7
 
-    assert asyncio.run(_action("Offline pipeline").run(_ScriptedUI(forms=[None]))) == 0
+    assert asyncio.run(_action("Prepare system").run(_ScriptedUI(forms=[None]))) == 0
     pipeline = {
         "historical": "",
         "model": "",
@@ -682,37 +709,31 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
         "preset": "balanced",
         "epochs": "120",
         "seed": "7",
-        "walk_forward": "yes",
-        "walk_forward_train": "300",
-        "walk_forward_test": "60",
-        "walk_forward_step": "30",
-        "calibrate_threshold": "yes",
         "start_cash": "1000",
+        "online_doctor": "no",
     }
-    assert asyncio.run(_action("Offline pipeline").run(_ScriptedUI(forms=[pipeline]))) == 2
+    assert asyncio.run(_action("Prepare system").run(_ScriptedUI(forms=[pipeline]))) == 2
     pipeline["limit"] = "1"
-    monkeypatch.setattr(cli, "command_fetch", lambda args: 2)
-    assert asyncio.run(_action("Offline pipeline").run(_ScriptedUI(forms=[pipeline]))) == 2
-    monkeypatch.setattr(cli, "command_fetch", lambda args: 0)
-    monkeypatch.setattr(cli, "command_train", lambda args: 0)
-    monkeypatch.setattr(cli, "command_backtest", lambda args: 0)
-    monkeypatch.setattr(cli, "command_evaluate", lambda args: 0)
-    assert asyncio.run(_action("Offline pipeline").run(_ScriptedUI(forms=[pipeline]))) == 0
+    monkeypatch.setattr(cli, "command_prepare", lambda args: 2)
+    assert asyncio.run(_action("Prepare system").run(_ScriptedUI(forms=[pipeline]))) == 2
+    monkeypatch.setattr(cli, "command_prepare", capture("prepare"))
+    assert asyncio.run(_action("Prepare system").run(_ScriptedUI(forms=[{**pipeline, "online_doctor": "yes"}]))) == 0
+    assert captured["prepare"].online_doctor is True
 
     assert asyncio.run(_action("Paper loop").run(_ScriptedUI(forms=[None]))) == 0
-    paper = {"steps": "0", "sleep": "0", "retrain_interval": "0", "retrain_window": "300", "retrain_min_rows": "240"}
+    paper = {"model": "", "steps": "0", "sleep": "0", "retrain_interval": "0", "retrain_window": "300", "retrain_min_rows": "240"}
     assert asyncio.run(_action("Paper loop").run(_ScriptedUI(forms=[paper]))) == 2
     monkeypatch.setattr(cli, "command_live", capture("live"))
     assert asyncio.run(_action("Paper loop").run(_ScriptedUI(forms=[{**paper, "steps": "1"}]))) == 0
 
-    assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(confirms=[False]))) == 0
-    assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(confirms=[True], forms=[None]))) == 0
-    live_form = {"steps": "0", "sleep": "0", "retrain_interval": "0", "retrain_window": "300", "retrain_min_rows": "240"}
+    live_form = {"model": "", "steps": "0", "sleep": "0", "retrain_interval": "0", "retrain_window": "300", "retrain_min_rows": "240"}
+    assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(forms=[None]))) == 0
+    assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(confirms=[False], forms=[{**live_form, "steps": "1"}]))) == 0
     assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(confirms=[True], forms=[live_form]))) == 2
     assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(confirms=[True], forms=[{**live_form, "steps": "1"}]))) == 0
 
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[False]))) == 0
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[None]))) == 0
+    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(forms=[None]))) == 0
+    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[False], forms=[{"quantity": "0.1"}]))) == 0
     assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0"}]))) == 2
     save_runtime(RuntimeConfig(market_type="futures", api_key="k", api_secret="s"))
     assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 2
@@ -736,8 +757,11 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: OrderClient())
     assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 0
 
-    monkeypatch.setattr(cli, "_show_recent_artifacts", lambda: 0)
-    assert asyncio.run(_action("Recent artifacts").run(_ScriptedUI())) == 0
+    monkeypatch.setattr(cli, "command_report", capture("report"))
+    assert asyncio.run(_action("Operator report").run(_ScriptedUI(forms=[None]))) == 0
+    report_form = {"input": "", "model": "", "readiness": "yes", "online": "yes", "account": "no"}
+    assert asyncio.run(_action("Operator report").run(_ScriptedUI(forms=[report_form]))) == 0
+    assert captured["report"].online is True
 
 
 def test_cli_strategy_tune_evaluate_and_live_remaining_edges(tmp_path, monkeypatch, capsys) -> None:
@@ -831,6 +855,7 @@ def test_cli_strategy_tune_evaluate_and_live_remaining_edges(tmp_path, monkeypat
                 "feature_version": "v1",
                 "feature_means": [0.0],
                 "feature_stds": [1.0],
+                "feature_signature": cli._strategy_feature_signature(StrategyConfig()),
             }
         ),
         encoding="utf-8",
@@ -980,6 +1005,9 @@ def test_cli_live_guards_leverage_clamps_and_no_rows(tmp_path, monkeypatch, caps
     client = _LiveClient(set_response={"leverage": "200"})
     save_runtime(RuntimeConfig(market_type="futures", testnet=True, dry_run=False, api_key="k", api_secret="s"))
     save_strategy(StrategyConfig(max_trades_per_day=0))
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "model.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: _flat_model(0.5))
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: client)
     monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 200.0)
     assert cli.command_live(_live_args(steps=0, paper=False, live=True)) == 0

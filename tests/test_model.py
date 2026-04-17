@@ -100,6 +100,22 @@ def test_load_model_rejects_signature_mismatch(tmp_path: Path) -> None:
         )
 
 
+def test_load_model_rejects_missing_signature_when_expected(tmp_path: Path) -> None:
+    model_path = tmp_path / "missing_signature.json"
+    model_payload = {
+        "weights": [0.1] * feature_dimension(),
+        "feature_version": "v1",
+        "bias": 0.01,
+        "feature_dim": feature_dimension(),
+        "epochs": 3,
+        "feature_means": [1.0] * feature_dimension(),
+        "feature_stds": [1.0] * feature_dimension(),
+    }
+    model_path.write_text(json.dumps(model_payload), encoding="utf-8")
+    with pytest.raises(ModelFeatureMismatchError, match="missing `feature_signature`"):
+        load_model(model_path, expected_feature_signature="runtime-signature")
+
+
 def test_load_model_allows_subset_feature_dim_when_signature_matches(tmp_path: Path) -> None:
     model_path = tmp_path / "subset_model.json"
     model_payload = {

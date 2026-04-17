@@ -202,6 +202,9 @@ class TerminalUI:
     def append_log(self, text: str) -> None:
         self.app.append_log(text)
 
+    async def run_blocking(self, func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+
 
 class OperatorApp(App[int]):
     CSS = """

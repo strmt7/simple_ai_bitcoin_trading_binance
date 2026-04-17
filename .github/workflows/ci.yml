@@ -43,7 +43,7 @@ jobs:
         run: |
           python3 -m coverage run --source=src/simple_ai_bitcoin_trading_binance -m pytest -q
           python3 -m coverage xml
-          python3 -m coverage report --fail-under=80
+          python3 -m coverage report --fail-under=100
           python3 -m coverage html
 
       - name: Upload HTML coverage artifact

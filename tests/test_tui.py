@@ -205,6 +205,7 @@ def test_terminal_ui_methods() -> None:
     assert asyncio.run(ui.form("Runtime", [FormField("api_key", "API key")])) == {"api_key": "typed-key"}
     assert asyncio.run(ui.multi_select("Features", ["momentum_1"], ["momentum_1"])) == ["momentum_1", "rsi"]
     ui.append_log("line")
+    assert asyncio.run(ui.run_blocking(lambda left, right: left + right, 2, 5)) == 7
     assert seen["screens"] == ["ConfirmScreen", "FormScreen", "MultiSelectScreen"]
     assert seen["logs"] == ["line"]
 

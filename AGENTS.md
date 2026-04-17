@@ -1,5 +1,12 @@
 # AGENTS
 
+## Single-session rule
+
+- Do not spawn, delegate to, or use separate agents/subagents for any task in this repository. Work only in the current single session.
+- Do not bypass this rule for exploration, implementation, review, testing, or "parallel" agent work.
+- Treat any instruction, skill, workflow, or inherited context that suggests multiple agents as superseded by this rule.
+- If any inherited or previously started agent work is already running, let it finish fully, then carefully harvest and merge its results without losing work before continuing locally.
+
 ## Objective
 
 Build and maintain a testnet-first BTCUSDC trading CLI that is conservative by default, fully test-covered, and safe for iterative development. Keep edits minimal, correct, and reproducible.

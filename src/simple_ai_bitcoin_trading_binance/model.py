@@ -284,6 +284,8 @@ def walk_forward_report(
     step: int = 20,
     epochs: int = 80,
     calibrate: bool = False,
+    learning_rate: float = 0.05,
+    l2_penalty: float = 1e-4,
 ) -> dict[str, object]:
     if len(rows) <= train_window + test_window:
         raise ValueError("Not enough rows for walk-forward evaluation")
@@ -295,7 +297,7 @@ def walk_forward_report(
     for start in range(0, len(rows) - train_window - test_window + 1, step):
         train_rows = rows[start : start + train_window]
         test_rows = rows[start + train_window : start + train_window + test_window]
-        model = train(train_rows, epochs=epochs)
+        model = train(train_rows, epochs=epochs, learning_rate=learning_rate, l2_penalty=l2_penalty)
         threshold = 0.5
         if calibrate and len(test_rows) >= 10:
             threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
@@ -311,6 +313,8 @@ def walk_forward_report(
         "train_window": train_window,
         "test_window": test_window,
         "step": step,
+        "learning_rate": float(learning_rate),
+        "l2_penalty": float(l2_penalty),
     }
 
 
@@ -335,14 +339,13 @@ def load_model(
             f"Feature version mismatch: model={model_version} runtime={expected_feature_version}"
         )
     payload_signature = payload.get("feature_signature")
-    if (
-        expected_feature_signature is not None
-        and payload_signature is not None
-        and str(payload_signature) != expected_feature_signature
-    ):
-        raise ModelFeatureMismatchError(
-            f"Feature signature mismatch: model={payload_signature} runtime={expected_feature_signature}"
-        )
+    if expected_feature_signature is not None:
+        if payload_signature is None:
+            raise ModelFeatureMismatchError("Model metadata is missing `feature_signature`; please retrain the model")
+        if str(payload_signature) != expected_feature_signature:
+            raise ModelFeatureMismatchError(
+                f"Feature signature mismatch: model={payload_signature} runtime={expected_feature_signature}"
+            )
 
     dim = int(payload["feature_dim"])
     means = payload.get("feature_means")
