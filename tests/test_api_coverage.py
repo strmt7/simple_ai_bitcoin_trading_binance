@@ -288,6 +288,11 @@ def test_request_signed_payload_and_unsigned_payload_paths(monkeypatch) -> None:
     monkeypatch.setattr(client.session, "request", request_signed)
     client._request("POST", "/fapi/v1/order", {"symbol": "BTCUSDC"}, signed=True)
     assert any("signature=" in item for item in captured)
+    recorded_url = str(client.last_request_info["url"])
+    assert recorded_url.startswith("/fapi/v1/order?")
+    assert "signature=%3Credacted%3E" in recorded_url
+    assert "timestamp=%3Credacted%3E" in recorded_url
+    assert "recvWindow=5000" not in recorded_url
 
 
 def test_throttle_waits_when_cadence_exceeded(monkeypatch) -> None:
@@ -589,6 +594,34 @@ def test_place_order_spot_live_uses_spot_endpoint(monkeypatch) -> None:
     payload = client.place_order("BTCUSDC", "BUY", 0.25, dry_run=False, leverage=1.0)
     assert payload == {"ok": True}
     assert calls == [("POST", "/api/v3/order", {"symbol": "BTCUSDC", "side": "BUY", "type": "MARKET", "quantity": "0.25000000"}, True)]
+
+
+def test_place_order_futures_reduce_only_requests_result(monkeypatch) -> None:
+    client = BinanceClient(api_key="k", api_secret="s", market_type="futures")
+    calls: list[tuple[str, str, dict, bool]] = []
+
+    def request(method: str, path: str, params=None, signed: bool = False):
+        calls.append((method, path, params or {}, signed))
+        if path == "/fapi/v1/leverageBracket":
+            return [{"symbol": "BTCUSDC", "brackets": [{"initialLeverage": 5}]}]
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.place_order("BTCUSDC", "SELL", 0.25, dry_run=False, leverage=2.0, reduce_only=True) == {"ok": True}
+    order_call = calls[-1]
+    assert order_call == (
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": "BTCUSDC",
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": "0.25000000",
+            "newOrderRespType": "RESULT",
+            "reduceOnly": "true",
+        },
+        True,
+    )
 
 
 def test_set_leverage_low_and_high_clamp(monkeypatch) -> None:

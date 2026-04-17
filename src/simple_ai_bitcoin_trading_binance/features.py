@@ -241,9 +241,6 @@ def make_rows(
         ]))
         features = tuple(full_features[index] for index in selected_indices)
 
-        if not all(math.isfinite(v) for v in features):
-            continue
-
         future = closes[i + lookahead]
         present = closes[i]
         label = int(_pct(future, present) >= label_threshold)

@@ -12,7 +12,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import requests
 
@@ -24,6 +24,7 @@ BINANCE_FUTURES_LIVE = "https://fapi.binance.com"
 _MAX_FUTURES_LEVERAGE = 125
 _RETRY_HTTP_STATUSES = {418, 429, 500, 502, 503, 504}
 _RETRY_BAPI_CODES = {-1003, -1007}
+_SENSITIVE_QUERY_FIELDS = {"signature", "timestamp", "recvWindow"}
 
 
 def _extract_retry_after(value: str | None) -> float | None:
@@ -35,6 +36,29 @@ def _extract_retry_after(value: str | None) -> float | None:
         return max(0.0, float(value.strip()))
     except ValueError:
         return None
+
+
+def _redact_request_url(url: str) -> str:
+    parts = urlsplit(url)
+    if not parts.query:
+        return parts.path or url
+    query = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        query.append((key, "<redacted>" if key in _SENSITIVE_QUERY_FIELDS else value))
+    return f"{parts.path}?{urlencode(query)}"
+
+
+def _redact_sensitive_text(text: str, request_url: str | None = None) -> str:
+    redacted = text
+    if request_url:
+        redacted = redacted.replace(request_url, _redact_request_url(request_url))
+    for field in _SENSITIVE_QUERY_FIELDS:
+        redacted = re.sub(
+            rf"([?&]{re.escape(field)}=)[^&\s'\"<>)]*",
+            rf"\1<redacted>",
+            redacted,
+        )
+    return redacted
 
 
 def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
@@ -51,8 +75,6 @@ def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
         return spot_override, "api"
     if common_override:
         return common_override, "api"
-    if market_type == "futures":
-        return (BINANCE_FUTURES_TESTNET if testnet else BINANCE_FUTURES_LIVE, "fapi")
     return (BINANCE_SPOT_TESTNET if testnet else BINANCE_SPOT_LIVE, "api")
 
 
@@ -137,7 +159,7 @@ class BinanceClient:
             "method": method,
             "path": path,
             "last_error": last_error,
-            "url": url,
+            "url": _redact_request_url(url),
         }
 
     def _throttle(self) -> None:
@@ -196,24 +218,25 @@ class BinanceClient:
             try:
                 response = self.session.request(method, url, params=payload, timeout=self.timeout)
             except requests.RequestException as err:
-                last_error = str(err)
+                last_error = _redact_sensitive_text(str(err), url)
                 if attempt < self.max_retries:
                     delay = self._retry_delay(attempt, response_status=response_status)
                     time.sleep(delay)
                     continue
                 self._record_request(attempt + 1, response_status, method, path, url, last_error)
-                raise BinanceAPIError(f"Binance request failed: {err}") from err
+                raise BinanceAPIError(f"Binance request failed: {last_error}") from err
 
             response_status = response.status_code
             if response_status >= 400:
                 retry_after = _extract_retry_after(response.headers.get("Retry-After"))
-                last_error = f"HTTP {response_status}: {response.text}"
+                response_text = _redact_sensitive_text(response.text, url)
+                last_error = f"HTTP {response_status}: {response_text}"
                 if response_status in _RETRY_HTTP_STATUSES and attempt < self.max_retries:
                     delay = self._retry_delay(attempt, response_status=response_status, retry_after=retry_after)
                     time.sleep(delay)
                     continue
                 self._record_request(attempt + 1, response_status, method, path, url, last_error)
-                raise BinanceAPIError(f"Binance returned {response.status_code}: {response.text}")
+                raise BinanceAPIError(f"Binance returned {response.status_code}: {response_text}")
 
             try:
                 data = response.json()
@@ -229,23 +252,28 @@ class BinanceClient:
             if isinstance(data, dict) and data.get("code") and data.get("msg"):
                 if self._is_retryable_code(data.get("code")) and attempt < self.max_retries:
                     code = data.get("code")
-                    last_error = f"Binance API error {code}: {data['msg']}"
+                    last_error = _redact_sensitive_text(f"Binance API error {code}: {data['msg']}", url)
                     delay = self._retry_delay(attempt, response_status=response_status)
                     time.sleep(delay)
                     continue
+                api_error = _redact_sensitive_text(
+                    f"Binance API error {data['code']}: {data['msg']}",
+                    url,
+                )
                 self._record_request(
                     attempt + 1,
                     response_status,
                     method,
                     path,
                     url,
-                    f"Binance API error {data['code']}: {data['msg']}",
+                    api_error,
                 )
-                raise BinanceAPIError(f"Binance API error {data['code']}: {data['msg']}")
+                raise BinanceAPIError(api_error)
 
             self._record_request(attempt + 1, response_status, method, path, url, None)
             return data
 
+        last_error = _redact_sensitive_text(last_error or "", last_url) or None
         self._record_request(max_attempts, response_status, method, path, last_url or path, last_error)
         raise BinanceAPIError(last_error or "Binance request failed")
 
@@ -475,7 +503,7 @@ class BinanceClient:
         return self._request("POST", "/fapi/v1/leverage", payload, signed=True)
 
     def place_order(self, symbol: str, side: str, quantity: float, *, dry_run: bool,
-                   leverage: float = 1.0) -> Dict[str, object]:
+                   leverage: float = 1.0, reduce_only: bool = False) -> Dict[str, object]:
         payload = {
             "symbol": symbol,
             "side": side,
@@ -491,11 +519,15 @@ class BinanceClient:
                 "type": "MARKET",
                 "quantity": payload["quantity"],
                 "leverage": leverage,
+                "reduceOnly": bool(reduce_only),
             }
 
         if self.market_type == "spot":
             return self._request("POST", "/api/v3/order", payload, signed=True)
 
+        payload["newOrderRespType"] = "RESULT"
+        if reduce_only:
+            payload["reduceOnly"] = "true"
         # futures: configure leverage before market order submission
         self.set_leverage(symbol, int(max(1, round(leverage))))
         return self._request("POST", "/fapi/v1/order", payload, signed=True)

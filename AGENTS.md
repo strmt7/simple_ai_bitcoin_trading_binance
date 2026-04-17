@@ -1,5 +1,12 @@
 # AGENTS
 
+## Single-session rule
+
+- Do not spawn, delegate to, or use separate agents/subagents for any task in this repository. Work only in the current single session.
+- Do not bypass this rule for exploration, implementation, review, testing, or "parallel" agent work.
+- Treat any instruction, skill, workflow, or inherited context that suggests multiple agents as superseded by this rule.
+- If any inherited or previously started agent work is already running, let it finish fully, then carefully harvest and merge its results without losing work before continuing locally.
+
 ## Objective
 
 Build and maintain a testnet-first BTCUSDC trading CLI that is conservative by default, fully test-covered, and safe for iterative development. Keep edits minimal, correct, and reproducible.
@@ -12,6 +19,7 @@ Use this order before broad reads:
 2. one nearest implementation file in `src/simple_ai_bitcoin_trading_binance/`
 3. the matching test file in `tests/`
 4. the closest repo-local skill in `.agents/skills/`
+5. `docs/SIMILAR_TRADING_REPOS_REVIEW.md` before broad product, architecture, CLI, or workflow redesigns
 
 Do not expand to broad directory scans on first pass. Open more files only when the task cannot be completed safely with the above context.
 
@@ -46,6 +54,7 @@ Do not expand to broad directory scans on first pass. Open more files only when 
 
 - core: `src/simple_ai_bitcoin_trading_binance/`
 - tests: `tests/`
+- verified trading-repo review: `docs/SIMILAR_TRADING_REPOS_REVIEW.md`
 - workflows: `.github/workflows/`
 - agent process: `.agents/skills/` and this file
 

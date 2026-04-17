@@ -30,6 +30,79 @@ from .model import (
 from .types import RuntimeConfig, StrategyConfig
 
 
+_TRAINING_PRESETS: dict[str, dict[str, object]] = {
+    "custom": {},
+    "quick": {
+        "epochs": 80,
+        "walk_forward": False,
+        "calibrate_threshold": False,
+    },
+    "balanced": {
+        "epochs": 180,
+        "walk_forward": True,
+        "walk_forward_train": 300,
+        "walk_forward_test": 60,
+        "walk_forward_step": 30,
+        "calibrate_threshold": True,
+    },
+    "thorough": {
+        "epochs": 350,
+        "walk_forward": True,
+        "walk_forward_train": 360,
+        "walk_forward_test": 90,
+        "walk_forward_step": 30,
+        "calibrate_threshold": True,
+    },
+}
+
+
+_STRATEGY_PROFILES: dict[str, dict[str, object]] = {
+    "custom": {},
+    "conservative": {
+        "leverage": 1.0,
+        "risk_per_trade": 0.005,
+        "max_position_pct": 0.10,
+        "stop_loss_pct": 0.015,
+        "take_profit_pct": 0.025,
+        "cooldown_minutes": 10,
+        "max_open_positions": 1,
+        "max_trades_per_day": 6,
+        "signal_threshold": 0.64,
+        "max_drawdown_limit": 0.12,
+        "training_epochs": 180,
+        "confidence_beta": 0.90,
+    },
+    "balanced": {
+        "leverage": 2.0,
+        "risk_per_trade": 0.01,
+        "max_position_pct": 0.20,
+        "stop_loss_pct": 0.02,
+        "take_profit_pct": 0.03,
+        "cooldown_minutes": 5,
+        "max_open_positions": 1,
+        "max_trades_per_day": 12,
+        "signal_threshold": 0.58,
+        "max_drawdown_limit": 0.20,
+        "training_epochs": 250,
+        "confidence_beta": 0.85,
+    },
+    "active": {
+        "leverage": 3.0,
+        "risk_per_trade": 0.015,
+        "max_position_pct": 0.25,
+        "stop_loss_pct": 0.025,
+        "take_profit_pct": 0.04,
+        "cooldown_minutes": 3,
+        "max_open_positions": 1,
+        "max_trades_per_day": 24,
+        "signal_threshold": 0.55,
+        "max_drawdown_limit": 0.25,
+        "training_epochs": 300,
+        "confidence_beta": 0.80,
+    },
+}
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="simple-ai-trading",
@@ -43,6 +116,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_connect = subparsers.add_parser("connect", help="validate credentials and connectivity")
     parser_connect.set_defaults(func=command_connect)
 
+    parser_doctor = subparsers.add_parser("doctor", help="run local readiness checks before paper or testnet trading")
+    parser_doctor.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_doctor.add_argument("--model", default="data/model.json")
+    parser_doctor.add_argument("--online", action="store_true", help="also check exchange connectivity")
+    parser_doctor.set_defaults(func=command_doctor)
+
+    parser_report = subparsers.add_parser("report", help="show dashboard, artifacts, and optional readiness checks")
+    parser_report.add_argument("--account", action="store_true", help="include authenticated account state")
+    parser_report.add_argument("--doctor", action="store_true", help="include readiness checks")
+    parser_report.add_argument("--no-doctor", action="store_false", dest="doctor", help="omit readiness checks")
+    parser_report.add_argument("--online", action="store_true", help="include exchange connectivity in readiness checks")
+    parser_report.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_report.add_argument("--model", default="data/model.json")
+    parser_report.set_defaults(doctor=True)
+    parser_report.set_defaults(func=command_report)
+
     parser_menu = subparsers.add_parser("menu", help="launch the interactive operator console")
     parser_menu.set_defaults(func=command_menu)
 
@@ -50,13 +139,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_fetch.add_argument("--symbol", default=None)
     parser_fetch.add_argument("--interval", default=None)
     parser_fetch.add_argument("--limit", type=int, default=500)
+    parser_fetch.add_argument("--batch-size", type=int, default=1000, help="klines per request (spot max 1000, futures max 1500)")
     parser_fetch.add_argument("--output", default="data/historical_btcusdc.json")
     parser_fetch.set_defaults(func=command_fetch)
 
     parser_train = subparsers.add_parser("train", help="train model from cached candles")
     parser_train.add_argument("--input", default="data/historical_btcusdc.json")
     parser_train.add_argument("--output", default="data/model.json")
+    parser_train.add_argument("--preset", choices=sorted(_TRAINING_PRESETS), default="custom")
     parser_train.add_argument("--epochs", type=int, default=250)
+    parser_train.add_argument("--learning-rate", type=float, default=0.05)
+    parser_train.add_argument("--l2-penalty", type=float, default=1e-4)
     parser_train.add_argument("--seed", type=int, default=7)
     parser_train.add_argument("--walk-forward", action="store_true", help="run walk-forward validation before final training")
     parser_train.add_argument("--walk-forward-train", type=int, default=300)
@@ -64,6 +157,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_train.add_argument("--walk-forward-step", type=int, default=30)
     parser_train.add_argument("--calibrate-threshold", action="store_true", help="optimize a probability threshold on validation split")
     parser_train.set_defaults(func=command_train)
+
+    parser_prepare = subparsers.add_parser("prepare", help="fetch, train, evaluate, backtest, then run readiness checks")
+    parser_prepare.add_argument("--historical", default="data/historical_btcusdc.json")
+    parser_prepare.add_argument("--model", default="data/model.json")
+    parser_prepare.add_argument("--limit", type=int, default=500)
+    parser_prepare.add_argument("--batch-size", type=int, default=1000, help="klines per fetch request (spot max 1000, futures max 1500)")
+    parser_prepare.add_argument("--preset", choices=sorted(_TRAINING_PRESETS), default="balanced")
+    parser_prepare.add_argument("--epochs", type=int, default=None, help="override preset training epochs")
+    parser_prepare.add_argument("--learning-rate", type=float, default=0.05)
+    parser_prepare.add_argument("--l2-penalty", type=float, default=1e-4)
+    parser_prepare.add_argument("--seed", type=int, default=7)
+    parser_prepare.add_argument("--start-cash", type=float, default=1000.0)
+    parser_prepare.add_argument("--walk-forward", action="store_true", dest="walk_forward", help="force walk-forward validation")
+    parser_prepare.add_argument("--no-walk-forward", action="store_false", dest="walk_forward", help="skip walk-forward validation")
+    parser_prepare.add_argument("--walk-forward-train", type=int, default=None, help="override walk-forward training window")
+    parser_prepare.add_argument("--walk-forward-test", type=int, default=None, help="override walk-forward test window")
+    parser_prepare.add_argument("--walk-forward-step", type=int, default=None, help="override walk-forward step")
+    parser_prepare.add_argument("--calibrate-threshold", action="store_true", dest="calibrate_threshold", help="force threshold calibration")
+    parser_prepare.add_argument("--no-calibrate-threshold", action="store_false", dest="calibrate_threshold", help="skip threshold calibration")
+    parser_prepare.set_defaults(walk_forward=None, calibrate_threshold=None)
+    parser_prepare.add_argument("--online-doctor", action="store_true", help="include exchange connectivity in final readiness checks")
+    parser_prepare.set_defaults(func=command_prepare)
 
     parser_tune = subparsers.add_parser("tune", help="perform a focused walk-forward tune over few risk parameters")
     parser_tune.add_argument("--input", default="data/historical_btcusdc.json")
@@ -98,6 +213,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_evaluate.set_defaults(func=command_evaluate)
 
     parser_live = subparsers.add_parser("live", help="run a conservative live loop on testnet or paper mode")
+    parser_live.add_argument("--model", default="data/model.json")
     parser_live.add_argument("--steps", type=int, default=20)
     parser_live.add_argument("--sleep", type=int, default=5)
     parser_live.add_argument("--leverage", type=float, default=None, help="override leverage for this run (futures only)")
@@ -135,6 +251,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_status.set_defaults(func=command_status)
 
     parser_strategy = subparsers.add_parser("strategy", help="adjust strategy and risk parameters")
+    parser_strategy.add_argument("--profile", choices=sorted(_STRATEGY_PROFILES), default="custom")
     parser_strategy.add_argument("--leverage", type=float, default=None)
     parser_strategy.add_argument("--risk", type=float, default=None)
     parser_strategy.add_argument("--max-position", type=float, default=None)
@@ -180,6 +297,41 @@ def _parse_form_bool(raw: str, default: bool) -> bool:
     return default
 
 
+def _parse_optional_form_bool(raw: str) -> bool | None:
+    token = raw.strip().lower()
+    if not token:
+        return None
+    if token in {"y", "yes", "true", "1", "on"}:
+        return True
+    if token in {"n", "no", "false", "0", "off"}:
+        return False
+    raise ValueError(f"Expected yes/no/blank, got {raw!r}.")
+
+
+def _parse_training_preset(raw: str) -> str:
+    preset = (raw.strip().lower() or "custom")
+    if preset not in _TRAINING_PRESETS:
+        choices = "/".join(sorted(_TRAINING_PRESETS))
+        raise ValueError(f"Preset must be one of: {choices}.")
+    return preset
+
+
+def _parse_strategy_profile(raw: str) -> str:
+    profile = (raw.strip().lower() or "custom")
+    if profile not in _STRATEGY_PROFILES:
+        choices = "/".join(sorted(_STRATEGY_PROFILES))
+        raise ValueError(f"Profile must be one of: {choices}.")
+    return profile
+
+
+def _apply_training_preset(args: argparse.Namespace) -> argparse.Namespace:
+    preset = _parse_training_preset(str(getattr(args, "preset", "custom") or "custom"))
+    for key, value in _TRAINING_PRESETS[preset].items():
+        setattr(args, key, value)
+    setattr(args, "preset", preset)
+    return args
+
+
 def _parse_form_int(raw: str, *, label: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
     value = default if not raw.strip() else int(raw.strip())
     if minimum is not None and value < minimum:
@@ -187,6 +339,12 @@ def _parse_form_int(raw: str, *, label: str, default: int, minimum: int | None =
     if maximum is not None and value > maximum:
         raise ValueError(f"{label} must be <= {maximum}.")
     return value
+
+
+def _parse_optional_form_int(raw: str, *, label: str, minimum: int | None = None, maximum: int | None = None) -> int | None:
+    if not raw.strip():
+        return None
+    return _parse_form_int(raw, label=label, default=0, minimum=minimum, maximum=maximum)
 
 
 def _parse_form_float(
@@ -203,6 +361,16 @@ def _parse_form_float(
     if maximum is not None and value > maximum:
         raise ValueError(f"{label} must be <= {maximum}.")
     return value
+
+
+def _unchanged_form_value(payload: dict[str, str], key: str, current: object) -> bool:
+    return payload.get(key, "").strip() == str(current)
+
+
+def _profile_field_value(profile: str, payload: dict[str, str], key: str, current: object, parser) -> object | None:
+    if profile != "custom" and _unchanged_form_value(payload, key, current):
+        return None
+    return parser(payload[key])
 
 
 async def _ui_edit_runtime(ui, current) -> object:
@@ -262,6 +430,7 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
     )
     if selected_features is None:
         return argparse.Namespace(
+            profile="custom",
             leverage=None,
             risk=None,
             max_position=None,
@@ -288,6 +457,7 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
     payload = await ui.form(
         "Strategy settings",
         [
+            FormField("profile", "Risk profile [custom/conservative/balanced/active]", "custom"),
             FormField("leverage", "Leverage", str(cfg.leverage)),
             FormField("risk", "Risk per trade", str(cfg.risk_per_trade)),
             FormField("max_position", "Max position percent", str(cfg.max_position_pct)),
@@ -310,6 +480,7 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
     )
     if payload is None:
         return argparse.Namespace(
+            profile="custom",
             leverage=None,
             risk=None,
             max_position=None,
@@ -332,30 +503,58 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             enable_feature=None,
             disable_feature=None,
         )
-    feature_window_short = _parse_form_int(payload["feature_window_short"], label="Feature window short", default=cfg.feature_windows[0], minimum=1)
-    feature_window_long = _parse_form_int(
-        payload["feature_window_long"],
-        label="Feature window long",
-        default=max(cfg.feature_windows[1], feature_window_short + 1),
-        minimum=feature_window_short + 1,
+    profile = _parse_strategy_profile(payload["profile"])
+
+    def field_float(key: str, current: float, label: str, *, minimum=None, maximum=None):
+        return _profile_field_value(
+            profile,
+            payload,
+            key,
+            current,
+            lambda raw: _parse_form_float(raw, label=label, default=current, minimum=minimum, maximum=maximum),
+        )
+
+    def field_int(key: str, current: int, label: str, *, minimum=None, maximum=None):
+        return _profile_field_value(
+            profile,
+            payload,
+            key,
+            current,
+            lambda raw: _parse_form_int(raw, label=label, default=current, minimum=minimum, maximum=maximum),
+        )
+
+    feature_window_short = field_int("feature_window_short", cfg.feature_windows[0], "Feature window short", minimum=1)
+    feature_window_floor = int(feature_window_short or cfg.feature_windows[0])
+    feature_window_long = _profile_field_value(
+        profile,
+        payload,
+        "feature_window_long",
+        cfg.feature_windows[1],
+        lambda raw: _parse_form_int(
+            raw,
+            label="Feature window long",
+            default=max(cfg.feature_windows[1], feature_window_floor + 1),
+            minimum=feature_window_floor + 1,
+        ),
     )
     return argparse.Namespace(
-        leverage=_parse_form_float(payload["leverage"], label="Leverage", default=cfg.leverage, minimum=1.0),
-        risk=_parse_form_float(payload["risk"], label="Risk per trade", default=cfg.risk_per_trade, minimum=0.0001),
-        max_position=_parse_form_float(payload["max_position"], label="Max position percent", default=cfg.max_position_pct, minimum=0.0, maximum=1.0),
-        stop=_parse_form_float(payload["stop"], label="Stop loss percent", default=cfg.stop_loss_pct, minimum=0.0, maximum=0.99),
-        take=_parse_form_float(payload["take"], label="Take profit percent", default=cfg.take_profit_pct, minimum=0.0, maximum=0.99),
-        cooldown=_parse_form_int(payload["cooldown"], label="Cooldown minutes", default=cfg.cooldown_minutes, minimum=0),
-        max_open=_parse_form_int(payload["max_open"], label="Max open positions", default=cfg.max_open_positions, minimum=0),
-        max_trades_per_day=_parse_form_int(payload["max_trades_per_day"], label="Max trades per day", default=cfg.max_trades_per_day, minimum=0),
-        signal_threshold=_parse_form_float(payload["signal_threshold"], label="Signal threshold", default=cfg.signal_threshold, minimum=0.01, maximum=0.99),
-        max_drawdown=_parse_form_float(payload["max_drawdown"], label="Max drawdown limit", default=cfg.max_drawdown_limit, minimum=0.0, maximum=1.0),
-        taker_fee_bps=_parse_form_float(payload["taker_fee_bps"], label="Taker fee bps", default=cfg.taker_fee_bps, minimum=0.0),
-        slippage_bps=_parse_form_float(payload["slippage_bps"], label="Slippage bps", default=cfg.slippage_bps, minimum=0.0),
-        label_threshold=_parse_form_float(payload["label_threshold"], label="Label threshold", default=cfg.label_threshold, minimum=0.0001),
-        model_lookback=_parse_form_int(payload["model_lookback"], label="Model lookback rows", default=cfg.model_lookback, minimum=10),
-        training_epochs=_parse_form_int(payload["training_epochs"], label="Training epochs", default=cfg.training_epochs, minimum=1),
-        confidence_beta=_parse_form_float(payload["confidence_beta"], label="Confidence beta", default=cfg.confidence_beta, minimum=0.0, maximum=1.0),
+        profile=profile,
+        leverage=field_float("leverage", cfg.leverage, "Leverage", minimum=1.0),
+        risk=field_float("risk", cfg.risk_per_trade, "Risk per trade", minimum=0.0001),
+        max_position=field_float("max_position", cfg.max_position_pct, "Max position percent", minimum=0.0, maximum=1.0),
+        stop=field_float("stop", cfg.stop_loss_pct, "Stop loss percent", minimum=0.0, maximum=0.99),
+        take=field_float("take", cfg.take_profit_pct, "Take profit percent", minimum=0.0, maximum=0.99),
+        cooldown=field_int("cooldown", cfg.cooldown_minutes, "Cooldown minutes", minimum=0),
+        max_open=field_int("max_open", cfg.max_open_positions, "Max open positions", minimum=0),
+        max_trades_per_day=field_int("max_trades_per_day", cfg.max_trades_per_day, "Max trades per day", minimum=0),
+        signal_threshold=field_float("signal_threshold", cfg.signal_threshold, "Signal threshold", minimum=0.01, maximum=0.99),
+        max_drawdown=field_float("max_drawdown", cfg.max_drawdown_limit, "Max drawdown limit", minimum=0.0, maximum=1.0),
+        taker_fee_bps=field_float("taker_fee_bps", cfg.taker_fee_bps, "Taker fee bps", minimum=0.0),
+        slippage_bps=field_float("slippage_bps", cfg.slippage_bps, "Slippage bps", minimum=0.0),
+        label_threshold=field_float("label_threshold", cfg.label_threshold, "Label threshold", minimum=0.0001),
+        model_lookback=field_int("model_lookback", cfg.model_lookback, "Model lookback rows", minimum=10),
+        training_epochs=field_int("training_epochs", cfg.training_epochs, "Training epochs", minimum=1),
+        confidence_beta=field_float("confidence_beta", cfg.confidence_beta, "Confidence beta", minimum=0.0, maximum=1.0),
         feature_window_short=feature_window_short,
         feature_window_long=feature_window_long,
         set_features=",".join(enabled_features),
@@ -387,6 +586,23 @@ def _show_recent_artifacts() -> int:
     return 0
 
 
+def _render_operator_report(
+    *,
+    with_account: bool,
+    doctor: bool,
+    online: bool,
+    input_path: str,
+    model_path: str,
+    width: int = 90,
+) -> str:
+    sections = [render_dashboard(_dashboard_snapshot(with_account=with_account), width=width)]
+    if doctor:
+        ok, lines = _readiness_report(input_path=input_path, model_path=model_path, online=online)
+        status = "ok" if ok else "fix"
+        sections.append("\n".join([f"Readiness report ({status})", *lines]))
+    return "\n\n".join(sections)
+
+
 def _account_overview_lines(runtime) -> list[str]:
     if not runtime.api_key or not runtime.api_secret:
         return ["No API credentials configured."]
@@ -396,6 +612,8 @@ def _account_overview_lines(runtime) -> list[str]:
     except BinanceAPIError as exc:
         return [f"Account overview failed: {exc}"]
     balances = account.get("balances", []) if isinstance(account, dict) else []
+    assets = account.get("assets", []) if isinstance(account, dict) else []
+    positions = account.get("positions", []) if isinstance(account, dict) else []
     interesting = []
     for item in balances:
         if not isinstance(item, dict):
@@ -405,6 +623,24 @@ def _account_overview_lines(runtime) -> list[str]:
         locked = str(item.get("locked", "0"))
         if asset in {"BTC", "USDC"} or free not in {"0", "0.0", "0.00000000"} or locked not in {"0", "0.0", "0.00000000"}:
             interesting.append(f"{asset}: free={free} locked={locked}")
+    for item in assets:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset", ""))
+        wallet = str(item.get("walletBalance", item.get("availableBalance", "0")))
+        available = str(item.get("availableBalance", "0"))
+        unrealized = str(item.get("unrealizedProfit", "0"))
+        if asset in {"BTC", "USDC", "USDT"} or wallet not in {"0", "0.0", "0.00000000"} or unrealized not in {"0", "0.0", "0.00000000"}:
+            interesting.append(f"{asset}: wallet={wallet} available={available} unrealized={unrealized}")
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol", ""))
+        amount = str(item.get("positionAmt", item.get("positionAmount", "0")))
+        entry = str(item.get("entryPrice", "0"))
+        unrealized = str(item.get("unrealizedProfit", "0"))
+        if amount not in {"0", "0.0", "0.00000000"} or unrealized not in {"0", "0.0", "0.00000000"}:
+            interesting.append(f"{symbol}: position={amount} entry={entry} unrealized={unrealized}")
     if not interesting:
         return [f"market={runtime.market_type} testnet={runtime.testnet}", "No non-zero balances found."]
     return [f"market={runtime.market_type} testnet={runtime.testnet}", *interesting[:20]]
@@ -439,10 +675,75 @@ def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
     )
 
 
+def _connection_status_line() -> str:
+    runtime = load_runtime()
+    market = f"{runtime.market_type}/{'testnet' if runtime.testnet else 'mainnet'}"
+    mode = "paper-default" if runtime.dry_run else "testnet-live-default"
+    checked_at = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+    client = _build_client(runtime)
+    try:
+        client.ping()
+        client.get_exchange_time()
+        auth_label = "auth missing"
+        if runtime.api_key and runtime.api_secret:
+            account = client.get_account()
+            auth_label = "auth ok" if isinstance(account, dict) else "auth response ok"
+        return f"Connection {checked_at}: online {market} {mode} server-time ok {auth_label}"
+    except BinanceAPIError as exc:
+        return f"Connection {checked_at}: offline {market} ({exc})"
+
+
+def _readiness_report(*, input_path: str, model_path: str, online: bool = False) -> tuple[bool, list[str]]:
+    runtime = load_runtime()
+    strategy = load_strategy()
+    checks: list[tuple[bool, str, str]] = []
+
+    def add(ok: bool, label: str, detail: str) -> None:
+        checks.append((ok, label, detail))
+
+    mode = "paper" if runtime.dry_run else "authenticated testnet"
+    add(runtime.testnet, "safety target", "testnet enabled" if runtime.testnet else "testnet is disabled")
+    add(runtime.market_type in {"spot", "futures"}, "market type", runtime.market_type)
+    add(
+        runtime.dry_run or bool(runtime.api_key and runtime.api_secret),
+        "execution credentials",
+        f"{mode}; credentials {'present' if runtime.api_key and runtime.api_secret else 'not configured'}",
+    )
+    add(0.01 <= strategy.signal_threshold <= 0.99, "signal threshold", f"{strategy.signal_threshold:.3f}")
+    add(strategy.risk_per_trade > 0 and strategy.max_position_pct > 0, "risk sizing", f"risk={strategy.risk_per_trade} max_position={strategy.max_position_pct}")
+    add(bool(strategy.enabled_features), "feature set", ",".join(strategy.enabled_features))
+
+    data_file = Path(input_path)
+    if data_file.exists():
+        candles = _load_rows_for_command(str(data_file), label="Readiness data load failed")
+        candle_count = len(candles) if candles is not None else 0
+        add(candle_count > max(strategy.feature_windows), "training data", f"{candle_count} candles at {data_file}")
+    else:
+        add(False, "training data", f"missing {data_file}")
+
+    model_file = Path(model_path)
+    if model_file.exists():
+        try:
+            model = _load_runtime_model(model_file, strategy)
+        except (OSError, ModelFeatureMismatchError, ModelLoadError, ValueError) as exc:
+            add(False, "model artifact", f"{model_file} is not usable with current strategy ({exc})")
+        else:
+            add(True, "model artifact", f"{model_file} dim={model.feature_dim}")
+    else:
+        add(False, "model artifact", f"missing {model_file}")
+
+    if online:
+        line = _connection_status_line()
+        add("online" in line and "offline" not in line and "failed" not in line, "exchange connectivity", line)
+
+    lines = [f"[{'ok' if ok else 'fix'}] {label}: {detail}" for ok, label, detail in checks]
+    return all(ok for ok, _label, _detail in checks), lines
+
+
 def _tui_actions():
     from .tui import FormField, TUIAction
     async def _overview(ui):
-        ui.append_log(render_dashboard(_dashboard_snapshot(with_account=True)))
+        ui.append_log(await ui.run_blocking(lambda: render_dashboard(_dashboard_snapshot(with_account=True))))
         return 0
 
     async def _help(ui):
@@ -452,11 +753,13 @@ def _tui_actions():
                     "Operator help",
                     "- Start with Runtime settings to enter API credentials securely.",
                     "- Run Connect before any data, training, or live action.",
-                    "- Use Tab and Shift+Tab to move between workspace panels or modal controls.",
-                    "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest.",
+                    "- Run Readiness check before Paper loop or Testnet loop.",
+                    "- The main screen shows actions, selected action details, live snapshot, and activity together.",
+                    "- Use Tab and Shift+Tab only inside modal forms.",
+                    "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest -> Readiness check.",
                     "- Use Paper loop before Testnet loop.",
                     "- Spot roundtrip is the smallest authenticated execution check.",
-                    "- Keys: j/k move, enter runs the selected action, r refreshes, q quits.",
+                    "- Keys: j/k move, enter runs the selected action, r refreshes the snapshot, q quits.",
                 ]
             )
         )
@@ -473,8 +776,8 @@ def _tui_actions():
         if next_runtime.validate_account and next_runtime.api_key and next_runtime.api_secret:
             client = _build_client(next_runtime)
             try:
-                client.ping()
-                client.ensure_btcusdc()
+                await ui.run_blocking(client.ping)
+                await ui.run_blocking(client.ensure_btcusdc)
             except BinanceAPIError as exc:
                 print(f"Configuration saved, but validation failed: {exc}", file=sys.stderr)
                 return 2
@@ -488,23 +791,46 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Strategy settings invalid: {exc}", file=sys.stderr)
             return 2
-        if args.set_features is None and args.leverage is None:
+        if args.set_features is None and args.leverage is None and getattr(args, "profile", "custom") == "custom":
             print("Strategy update cancelled.")
             return 0
-        return command_strategy(args)
+        return await ui.run_blocking(command_strategy, args)
 
     async def _connect(_ui):
-        return command_connect(argparse.Namespace())
+        return await _ui.run_blocking(command_connect, argparse.Namespace())
 
-    async def _account(_ui):
-        return _show_account_overview()
+    async def _doctor(ui):
+        payload = await ui.form(
+            "Readiness check",
+            [
+                FormField("input", "Training input path", "data/historical_btcusdc.json"),
+                FormField("model", "Model path", "data/model.json"),
+                FormField("online", "Include exchange connectivity [yes/no]", "yes"),
+            ],
+        )
+        if payload is None:
+            print("Readiness check cancelled.")
+            return 0
+        return await ui.run_blocking(
+            command_doctor,
+            argparse.Namespace(
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                model=payload["model"].strip() or "data/model.json",
+                online=_parse_form_bool(payload["online"], True),
+            ),
+        )
+
+    async def _account(ui):
+        return await ui.run_blocking(_show_account_overview)
 
     async def _fetch(ui):
         runtime = load_runtime()
+        max_batch_size = 1500 if runtime.market_type == "futures" else 1000
         payload = await ui.form(
             "Fetch candles",
             [
                 FormField("limit", "Fetch limit", "500"),
+                FormField("batch_size", f"Klines per request [max {max_batch_size}]", "1000"),
                 FormField("output", "Candle output path", "data/historical_btcusdc.json"),
             ],
         )
@@ -513,16 +839,19 @@ def _tui_actions():
             return 0
         try:
             limit = _parse_form_int(payload["limit"], label="Fetch limit", default=500, minimum=1)
+            batch_size = _parse_form_int(payload.get("batch_size", "1000"), label="Klines per request", default=1000, minimum=1, maximum=max_batch_size)
         except ValueError as exc:
             print(f"Fetch settings invalid: {exc}", file=sys.stderr)
             return 2
-        return command_fetch(
+        return await ui.run_blocking(
+            command_fetch,
             argparse.Namespace(
                 symbol=runtime.symbol,
                 interval=runtime.interval,
                 limit=limit,
+                batch_size=batch_size,
                 output=payload["output"].strip() or "data/historical_btcusdc.json",
-            )
+            ),
         )
 
     async def _train(ui):
@@ -531,7 +860,10 @@ def _tui_actions():
             [
                 FormField("input", "Training input path", "data/historical_btcusdc.json"),
                 FormField("output", "Model output path", "data/model.json"),
+                FormField("preset", "Preset [custom/quick/balanced/thorough]", "custom"),
                 FormField("epochs", "Training epochs", "250"),
+                FormField("learning_rate", "Learning rate", "0.05"),
+                FormField("l2_penalty", "L2 penalty", "0.0001"),
                 FormField("seed", "Training seed", "7"),
                 FormField("walk_forward", "Run walk-forward validation [yes/no]", "no"),
                 FormField("walk_forward_train", "Walk-forward train window", "300"),
@@ -544,7 +876,10 @@ def _tui_actions():
             print("Training cancelled.")
             return 0
         try:
+            preset = _parse_training_preset(payload["preset"])
             epochs = _parse_form_int(payload["epochs"], label="Training epochs", default=250, minimum=1)
+            learning_rate = _parse_form_float(payload.get("learning_rate", "0.05"), label="Learning rate", default=0.05, minimum=0.000001)
+            l2_penalty = _parse_form_float(payload.get("l2_penalty", "0.0001"), label="L2 penalty", default=0.0001, minimum=0.0)
             seed = _parse_form_int(payload["seed"], label="Training seed", default=7, minimum=0)
             walk_forward_train = _parse_form_int(payload["walk_forward_train"], label="Walk-forward train window", default=300, minimum=2)
             walk_forward_test = _parse_form_int(payload["walk_forward_test"], label="Walk-forward test window", default=60, minimum=1)
@@ -552,18 +887,22 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Training settings invalid: {exc}", file=sys.stderr)
             return 2
-        return command_train(
+        return await ui.run_blocking(
+            command_train,
             argparse.Namespace(
                 input=payload["input"].strip() or "data/historical_btcusdc.json",
                 output=payload["output"].strip() or "data/model.json",
+                preset=preset,
                 epochs=epochs,
+                learning_rate=learning_rate,
+                l2_penalty=l2_penalty,
                 seed=seed,
                 walk_forward=_parse_form_bool(payload["walk_forward"], False),
                 walk_forward_train=walk_forward_train,
                 walk_forward_test=walk_forward_test,
                 walk_forward_step=walk_forward_step,
                 calibrate_threshold=_parse_form_bool(payload["calibrate_threshold"], True),
-            )
+            ),
         )
 
     async def _tune(ui):
@@ -618,7 +957,8 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Tune settings invalid: {exc}", file=sys.stderr)
             return 2
-        return command_tune(
+        return await ui.run_blocking(
+            command_tune,
             argparse.Namespace(
                 input=payload["input"].strip() or "data/historical_btcusdc.json",
                 save_best=_parse_form_bool(payload["save_best"], False),
@@ -636,7 +976,7 @@ def _tui_actions():
                 lookback_days=lookback_days,
                 from_date=from_date,
                 to_date=to_date,
-            )
+            ),
         )
 
     async def _backtest(ui):
@@ -656,12 +996,13 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Backtest settings invalid: {exc}", file=sys.stderr)
             return 2
-        return command_backtest(
+        return await ui.run_blocking(
+            command_backtest,
             argparse.Namespace(
                 input=payload["input"].strip() or "data/historical_btcusdc.json",
                 model=payload["model"].strip() or "data/model.json",
                 start_cash=start_cash,
-            )
+            ),
         )
 
     async def _evaluate(ui):
@@ -678,92 +1019,94 @@ def _tui_actions():
             print("Evaluation cancelled.")
             return 0
         threshold_raw = payload["threshold"].strip()
-        return command_evaluate(
+        try:
+            threshold = float(threshold_raw) if threshold_raw else None
+        except ValueError as exc:
+            print(f"Evaluation settings invalid: {exc}", file=sys.stderr)
+            return 2
+        return await ui.run_blocking(
+            command_evaluate,
             argparse.Namespace(
                 input=payload["input"].strip() or "data/historical_btcusdc.json",
                 model=payload["model"].strip() or "data/model.json",
-                threshold=float(threshold_raw) if threshold_raw else None,
+                threshold=threshold,
                 calibrate_threshold=_parse_form_bool(payload["calibrate_threshold"], False),
-            )
+            ),
         )
 
-    async def _pipeline(ui):
+    async def _prepare(ui):
         runtime = load_runtime()
+        max_batch_size = 1500 if runtime.market_type == "futures" else 1000
         payload = await ui.form(
-            "Offline pipeline",
+            "Prepare system",
             [
                 FormField("historical", "Historical candle path", "data/historical_btcusdc.json"),
                 FormField("model", "Model artifact path", "data/model.json"),
                 FormField("limit", "Fetch limit", "500"),
-                FormField("epochs", "Training epochs", "120"),
+                FormField("batch_size", f"Klines per request [max {max_batch_size}]", "1000"),
+                FormField("preset", "Training preset [custom/quick/balanced/thorough]", "balanced"),
+                FormField("epochs", "Training epochs [blank=preset]", ""),
+                FormField("learning_rate", "Learning rate", "0.05"),
+                FormField("l2_penalty", "L2 penalty", "0.0001"),
                 FormField("seed", "Training seed", "7"),
-                FormField("walk_forward", "Run walk-forward validation [yes/no]", "yes"),
-                FormField("walk_forward_train", "Walk-forward train window", "300"),
-                FormField("walk_forward_test", "Walk-forward test window", "60"),
-                FormField("walk_forward_step", "Walk-forward step", "30"),
-                FormField("calibrate_threshold", "Calibrate threshold [yes/no]", "yes"),
+                FormField("walk_forward", "Walk-forward validation [yes/no/blank=preset]", ""),
+                FormField("walk_forward_train", "Walk-forward train window [blank=preset]", ""),
+                FormField("walk_forward_test", "Walk-forward test window [blank=preset]", ""),
+                FormField("walk_forward_step", "Walk-forward step [blank=preset]", ""),
+                FormField("calibrate_threshold", "Calibrate threshold [yes/no/blank=preset]", ""),
                 FormField("start_cash", "Backtest starting cash", "1000"),
+                FormField("online_doctor", "Include exchange connectivity in final check [yes/no]", "no"),
             ],
         )
         if payload is None:
-            print("Pipeline cancelled.")
+            print("Prepare cancelled.")
             return 0
         historical = payload["historical"].strip() or "data/historical_btcusdc.json"
         model = payload["model"].strip() or "data/model.json"
         try:
             limit = _parse_form_int(payload["limit"], label="Fetch limit", default=500, minimum=1)
-            epochs = _parse_form_int(payload["epochs"], label="Training epochs", default=120, minimum=1)
+            batch_size = _parse_form_int(payload.get("batch_size", "1000"), label="Klines per request", default=1000, minimum=1, maximum=max_batch_size)
+            preset = _parse_training_preset(payload["preset"])
+            epochs = _parse_optional_form_int(payload.get("epochs", ""), label="Training epochs", minimum=1)
+            learning_rate = _parse_form_float(payload.get("learning_rate", "0.05"), label="Learning rate", default=0.05, minimum=0.000001)
+            l2_penalty = _parse_form_float(payload.get("l2_penalty", "0.0001"), label="L2 penalty", default=0.0001, minimum=0.0)
             seed = _parse_form_int(payload["seed"], label="Training seed", default=7, minimum=0)
-            walk_forward_train = _parse_form_int(payload["walk_forward_train"], label="Walk-forward train window", default=300, minimum=2)
-            walk_forward_test = _parse_form_int(payload["walk_forward_test"], label="Walk-forward test window", default=60, minimum=1)
-            walk_forward_step = _parse_form_int(payload["walk_forward_step"], label="Walk-forward step", default=30, minimum=1)
+            walk_forward_train = _parse_optional_form_int(payload.get("walk_forward_train", ""), label="Walk-forward train window", minimum=2)
+            walk_forward_test = _parse_optional_form_int(payload.get("walk_forward_test", ""), label="Walk-forward test window", minimum=1)
+            walk_forward_step = _parse_optional_form_int(payload.get("walk_forward_step", ""), label="Walk-forward step", minimum=1)
+            walk_forward = _parse_optional_form_bool(payload.get("walk_forward", ""))
+            calibrate_threshold = _parse_optional_form_bool(payload.get("calibrate_threshold", ""))
             start_cash = _parse_form_float(payload["start_cash"], label="Backtest starting cash", default=1000.0, minimum=1.0)
         except ValueError as exc:
-            print(f"Pipeline settings invalid: {exc}", file=sys.stderr)
+            print(f"Prepare settings invalid: {exc}", file=sys.stderr)
             return 2
-        fetch_args = argparse.Namespace(
-            symbol=runtime.symbol,
-            interval=runtime.interval,
-            limit=limit,
-            output=historical,
+        return await ui.run_blocking(
+            command_prepare,
+            argparse.Namespace(
+                historical=historical,
+                model=model,
+                limit=limit,
+                batch_size=batch_size,
+                preset=preset,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                l2_penalty=l2_penalty,
+                seed=seed,
+                walk_forward=walk_forward,
+                walk_forward_train=walk_forward_train,
+                walk_forward_test=walk_forward_test,
+                walk_forward_step=walk_forward_step,
+                calibrate_threshold=calibrate_threshold,
+                start_cash=start_cash,
+                online_doctor=_parse_form_bool(payload["online_doctor"], False),
+            ),
         )
-        train_args = argparse.Namespace(
-            input=historical,
-            output=model,
-            epochs=epochs,
-            seed=seed,
-            walk_forward=_parse_form_bool(payload["walk_forward"], True),
-            walk_forward_train=walk_forward_train,
-            walk_forward_test=walk_forward_test,
-            walk_forward_step=walk_forward_step,
-            calibrate_threshold=_parse_form_bool(payload["calibrate_threshold"], True),
-        )
-        backtest_args = argparse.Namespace(
-            input=historical,
-            model=model,
-            start_cash=start_cash,
-        )
-        evaluate_args = argparse.Namespace(
-            input=historical,
-            model=model,
-            threshold=None,
-            calibrate_threshold=True,
-        )
-        for fn, args in (
-            (command_fetch, fetch_args),
-            (command_train, train_args),
-            (command_backtest, backtest_args),
-            (command_evaluate, evaluate_args),
-        ):
-            result = fn(args)
-            if result != 0:
-                return result
-        return 0
 
     async def _paper(ui):
         payload = await ui.form(
             "Paper loop",
             [
+                FormField("model", "Model path", "data/model.json"),
                 FormField("steps", "Paper loop steps", "20"),
                 FormField("sleep", "Sleep seconds", "5"),
                 FormField("retrain_interval", "Retrain interval", "0"),
@@ -783,9 +1126,11 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Paper loop settings invalid: {exc}", file=sys.stderr)
             return 2
-        return command_live(
+        return await ui.run_blocking(
+            command_live,
             argparse.Namespace(
                 steps=steps,
+                model=payload["model"].strip() or "data/model.json",
                 sleep=sleep,
                 leverage=None,
                 retrain_interval=retrain_interval,
@@ -793,16 +1138,14 @@ def _tui_actions():
                 retrain_min_rows=retrain_min_rows,
                 paper=True,
                 live=False,
-            )
+            ),
         )
 
     async def _live(ui):
-        if not await ui.confirm("Run authenticated testnet execution?"):
-            print("Testnet execution cancelled.")
-            return 0
         payload = await ui.form(
             "Testnet loop",
             [
+                FormField("model", "Model path", "data/model.json"),
                 FormField("steps", "Live steps", "1"),
                 FormField("sleep", "Sleep seconds", "5"),
                 FormField("retrain_interval", "Retrain interval", "0"),
@@ -822,9 +1165,15 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Testnet loop settings invalid: {exc}", file=sys.stderr)
             return 2
-        return command_live(
+        model = payload["model"].strip() or "data/model.json"
+        if not await ui.confirm(f"Run authenticated testnet execution with model={model}, steps={steps}, sleep={sleep}s?"):
+            print("Testnet execution cancelled.")
+            return 0
+        return await ui.run_blocking(
+            command_live,
             argparse.Namespace(
                 steps=steps,
+                model=model,
                 sleep=sleep,
                 leverage=None,
                 retrain_interval=retrain_interval,
@@ -832,13 +1181,10 @@ def _tui_actions():
                 retrain_min_rows=retrain_min_rows,
                 paper=False,
                 live=True,
-            )
+            ),
         )
 
     async def _roundtrip(ui):
-        if not await ui.confirm("Place a minimal BUY then SELL on spot testnet?"):
-            print("Spot test order cancelled.")
-            return 0
         payload = await ui.form(
             "Spot roundtrip",
             [
@@ -853,6 +1199,9 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Spot roundtrip settings invalid: {exc}", file=sys.stderr)
             return 2
+        if not await ui.confirm(f"Place BUY then SELL on spot testnet for quantity={quantity:.8f}?"):
+            print("Spot test order cancelled.")
+            return 0
         runtime = load_runtime()
         if runtime.market_type != "spot":
             print("Spot test order is only available when runtime.market_type=spot.")
@@ -865,8 +1214,8 @@ def _tui_actions():
             return 2
         client = _build_client(runtime)
         try:
-            buy = client.place_order(runtime.symbol, "BUY", quantity, dry_run=False)
-            sell = client.place_order(runtime.symbol, "SELL", quantity, dry_run=False)
+            buy = await ui.run_blocking(client.place_order, runtime.symbol, "BUY", quantity, dry_run=False)
+            sell = await ui.run_blocking(client.place_order, runtime.symbol, "SELL", quantity, dry_run=False)
         except BinanceAPIError as exc:
             print(f"Spot test order failed: {exc}", file=sys.stderr)
             return 2
@@ -886,26 +1235,49 @@ def _tui_actions():
         )
         return 0
 
-    async def _artifacts(_ui):
-        return _show_recent_artifacts()
+    async def _report(ui):
+        payload = await ui.form(
+            "Operator report",
+            [
+                FormField("input", "Training input path", "data/historical_btcusdc.json"),
+                FormField("model", "Model path", "data/model.json"),
+                FormField("readiness", "Include readiness report [yes/no]", "yes"),
+                FormField("online", "Include exchange connectivity [yes/no]", "no"),
+                FormField("account", "Include account state [yes/no]", "no"),
+            ],
+        )
+        if payload is None:
+            print("Operator report cancelled.")
+            return 0
+        return await ui.run_blocking(
+            command_report,
+            argparse.Namespace(
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                model=payload["model"].strip() or "data/model.json",
+                doctor=_parse_form_bool(payload["readiness"], True),
+                online=_parse_form_bool(payload["online"], False),
+                account=_parse_form_bool(payload["account"], False),
+            ),
+        )
 
     return [
         TUIAction("1", "Overview", "Refresh runtime, strategy, artifact, and account context.", _overview),
         TUIAction("2", "Help", "Show the recommended operator workflow and keyboard shortcuts.", _help),
         TUIAction("3", "Runtime settings", "Enter credentials securely and configure the runtime target.", _runtime),
         TUIAction("4", "Connect", "Validate exchange connectivity and the configured target.", _connect),
-        TUIAction("5", "Account", "Inspect authenticated balances and positions.", _account),
-        TUIAction("6", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
-        TUIAction("7", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
-        TUIAction("8", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
-        TUIAction("9", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
-        TUIAction("10", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
-        TUIAction("11", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
-        TUIAction("12", "Offline pipeline", "Run fetch, train, backtest, and evaluate as one guided flow.", _pipeline),
-        TUIAction("13", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
-        TUIAction("14", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
-        TUIAction("15", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
-        TUIAction("16", "Recent artifacts", "Print the latest local artifacts into the console log.", _artifacts),
+        TUIAction("5", "Readiness check", "Preflight safety flags, data, model compatibility, and optional exchange connectivity.", _doctor),
+        TUIAction("6", "Prepare system", "Run fetch, train, evaluate, backtest, then readiness checks.", _prepare),
+        TUIAction("7", "Account", "Inspect authenticated balances and positions.", _account),
+        TUIAction("8", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
+        TUIAction("9", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
+        TUIAction("10", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
+        TUIAction("11", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
+        TUIAction("12", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
+        TUIAction("13", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
+        TUIAction("14", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
+        TUIAction("15", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
+        TUIAction("16", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
+        TUIAction("17", "Operator report", "Print dashboard, recent artifacts, and readiness checks.", _report),
     ]
 
 
@@ -920,6 +1292,7 @@ def command_menu(_: argparse.Namespace) -> int:
         title="simple-ai-trading interactive console",
         actions=_tui_actions(),
         snapshot_provider=lambda width=72: render_dashboard(_dashboard_snapshot(with_account=False), width=width),
+        connection_provider=_connection_status_line,
     )
 
 
@@ -1067,14 +1440,18 @@ def _resolve_symbol_constraints(runtime, client) -> SymbolConstraints | None:
         return None
 
 
-def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
-    strategy_signature = feature_signature(
+def _strategy_feature_signature(strategy: StrategyConfig) -> str:
+    return feature_signature(
         strategy.feature_windows[0],
         strategy.feature_windows[1],
         strategy.label_threshold,
         feature_version=strategy.feature_version,
         enabled_features=strategy.enabled_features,
     )
+
+
+def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
+    strategy_signature = _strategy_feature_signature(strategy)
     return load_model(
         model_path,
         expected_feature_version=strategy.feature_version,
@@ -1186,7 +1563,7 @@ def _build_live_model(
         return model
 
     epochs = max(20, int(cfg.training_epochs * 0.4))
-    return train(train_rows, epochs=epochs)
+    return train(train_rows, epochs=epochs, feature_signature=_strategy_feature_signature(cfg))
 
 
 def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> int:
@@ -1199,6 +1576,65 @@ def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> 
     return 1 if score >= cfg.signal_threshold else 0
 
 
+def _safe_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _detect_existing_position(runtime, client, *, leverage: float, reference_price: float | None = None) -> dict[str, float | int | str] | None:
+    if not hasattr(client, "get_account"):
+        return None
+    account = client.get_account()
+    if not isinstance(account, dict):
+        return None
+    if runtime.market_type == "futures":
+        for item in account.get("positions", []) or []:
+            if not isinstance(item, dict) or item.get("symbol") != runtime.symbol:
+                continue
+            amount = _safe_float(item.get("positionAmt"))
+            if amount == 0.0:
+                continue
+            entry_price = _safe_float(item.get("entryPrice")) or _safe_float(item.get("markPrice")) or reference_price or 0.0
+            qty = abs(amount)
+            margin = (
+                _safe_float(item.get("positionInitialMargin"))
+                or _safe_float(item.get("initialMargin"))
+                or _safe_float(item.get("isolatedWallet"))
+                or (qty * entry_price / max(1.0, leverage) if entry_price > 0.0 else 0.0)
+            )
+            return {
+                "market": "futures",
+                "side": 1 if amount > 0.0 else -1,
+                "qty": qty,
+                "entry_price": entry_price,
+                "notional": qty * entry_price,
+                "margin": margin,
+            }
+        return None
+
+    base_asset = runtime.symbol.removesuffix("USDC")
+    for item in account.get("balances", []) or []:
+        if not isinstance(item, dict) or item.get("asset") != base_asset:
+            continue
+        qty = _safe_float(item.get("free")) + _safe_float(item.get("locked"))
+        if qty <= 0.0:
+            continue
+        price = reference_price
+        if price is None:
+            price, _timestamp = client.get_symbol_price(runtime.symbol)
+        return {
+            "market": "spot",
+            "side": 1,
+            "qty": qty,
+            "entry_price": float(price),
+            "notional": qty * float(price),
+            "margin": qty * float(price),
+        }
+    return None
+
+
 def _paper_or_live_order(
     client: BinanceClient,
     runtime,
@@ -1208,10 +1644,14 @@ def _paper_or_live_order(
     size: float,
     dry_run: bool,
     leverage: float | None = None,
+    reduce_only: bool = False,
 ) -> None:
     if leverage is None:
         leverage = _effective_leverage(strategy, runtime.market_type)
-    response = client.place_order(runtime.symbol, side, size, dry_run=dry_run, leverage=leverage)
+    kwargs = {"dry_run": dry_run, "leverage": leverage}
+    if reduce_only and not dry_run:
+        kwargs["reduce_only"] = True
+    response = client.place_order(runtime.symbol, side, size, **kwargs)
     if dry_run:
         print("paper order:", json.dumps(response, indent=2))
         return
@@ -1278,6 +1718,152 @@ def command_connect(_: argparse.Namespace) -> int:
         return 2
 
 
+def command_doctor(args: argparse.Namespace) -> int:
+    ok, lines = _readiness_report(input_path=args.input, model_path=args.model, online=bool(args.online))
+    print("Readiness report")
+    for line in lines:
+        print(line)
+    return 0 if ok else 2
+
+
+def command_report(args: argparse.Namespace) -> int:
+    print(
+        _render_operator_report(
+            with_account=bool(args.account),
+            doctor=bool(args.doctor),
+            online=bool(args.online),
+            input_path=args.input,
+            model_path=args.model,
+        )
+    )
+    return 0
+
+
+def command_prepare(args: argparse.Namespace) -> int:
+    try:
+        runtime = load_runtime()
+        max_batch_size = 1500 if runtime.market_type == "futures" else 1000
+        preset = _parse_training_preset(str(args.preset))
+        limit = int(args.limit)
+        batch_size = int(getattr(args, "batch_size", 1000))
+        seed = int(args.seed)
+        learning_rate = float(getattr(args, "learning_rate", 0.05))
+        l2_penalty = float(getattr(args, "l2_penalty", 1e-4))
+        start_cash = float(args.start_cash)
+        preset_args = _apply_training_preset(
+            argparse.Namespace(
+                preset=preset,
+                epochs=250,
+                walk_forward=False,
+                walk_forward_train=300,
+                walk_forward_test=60,
+                walk_forward_step=30,
+                calibrate_threshold=False,
+            )
+        )
+        epochs = int(args.epochs if getattr(args, "epochs", None) is not None else preset_args.epochs)
+        walk_forward = (
+            bool(args.walk_forward)
+            if getattr(args, "walk_forward", None) is not None
+            else bool(preset_args.walk_forward)
+        )
+        walk_forward_train = int(
+            args.walk_forward_train
+            if getattr(args, "walk_forward_train", None) is not None
+            else preset_args.walk_forward_train
+        )
+        walk_forward_test = int(
+            args.walk_forward_test
+            if getattr(args, "walk_forward_test", None) is not None
+            else preset_args.walk_forward_test
+        )
+        walk_forward_step = int(
+            args.walk_forward_step
+            if getattr(args, "walk_forward_step", None) is not None
+            else preset_args.walk_forward_step
+        )
+        calibrate_threshold = (
+            bool(args.calibrate_threshold)
+            if getattr(args, "calibrate_threshold", None) is not None
+            else bool(preset_args.calibrate_threshold)
+        )
+        if limit < 1:
+            raise ValueError("Fetch limit must be >= 1.")
+        if batch_size < 1:
+            raise ValueError("Fetch batch size must be >= 1.")
+        batch_size = min(batch_size, max_batch_size)
+        if epochs < 1:
+            raise ValueError("Training epochs must be >= 1.")
+        if seed < 0:
+            raise ValueError("Training seed must be >= 0.")
+        if learning_rate <= 0.0:
+            raise ValueError("Learning rate must be > 0.")
+        if l2_penalty < 0.0:
+            raise ValueError("L2 penalty must be >= 0.")
+        if start_cash < 1:
+            raise ValueError("Backtest starting cash must be >= 1.")
+        if walk_forward_train < 2:
+            raise ValueError("Walk-forward train window must be >= 2.")
+        if walk_forward_test < 1:
+            raise ValueError("Walk-forward test window must be >= 1.")
+        if walk_forward_step < 1:
+            raise ValueError("Walk-forward step must be >= 1.")
+    except (TypeError, ValueError) as exc:
+        print(f"Prepare settings invalid: {exc}", file=sys.stderr)
+        return 2
+
+    historical = str(args.historical)
+    model = str(args.model)
+    sequence = [
+        (
+            "Fetch candles",
+            command_fetch,
+            argparse.Namespace(symbol=runtime.symbol, interval=runtime.interval, limit=limit, batch_size=batch_size, output=historical),
+        ),
+        (
+            "Train model",
+            command_train,
+            argparse.Namespace(
+                input=historical,
+                output=model,
+                preset="custom",
+                requested_preset=preset,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                l2_penalty=l2_penalty,
+                seed=seed,
+                walk_forward=walk_forward,
+                walk_forward_train=walk_forward_train,
+                walk_forward_test=walk_forward_test,
+                walk_forward_step=walk_forward_step,
+                calibrate_threshold=calibrate_threshold,
+            ),
+        ),
+        (
+            "Evaluate",
+            command_evaluate,
+            argparse.Namespace(input=historical, model=model, threshold=None, calibrate_threshold=calibrate_threshold),
+        ),
+        (
+            "Backtest",
+            command_backtest,
+            argparse.Namespace(input=historical, model=model, start_cash=start_cash),
+        ),
+        (
+            "Readiness check",
+            command_doctor,
+            argparse.Namespace(input=historical, model=model, online=bool(args.online_doctor)),
+        ),
+    ]
+    for label, fn, step_args in sequence:
+        print(f"== {label} ==")
+        result = fn(step_args)
+        if result != 0:
+            print(f"Prepare stopped at {label}.", file=sys.stderr)
+            return result
+    return 0
+
+
 def command_status(_: argparse.Namespace) -> int:
     runtime = load_runtime()
     strategy = load_strategy()
@@ -1288,7 +1874,12 @@ def command_status(_: argparse.Namespace) -> int:
 def command_strategy(args: argparse.Namespace) -> int:
     cfg = load_strategy()
     runtime = load_runtime()
-    updates = {}
+    try:
+        profile = _parse_strategy_profile(str(getattr(args, "profile", "custom") or "custom"))
+    except ValueError as exc:
+        print(f"Invalid strategy profile: {exc}", file=sys.stderr)
+        return 2
+    updates = dict(_STRATEGY_PROFILES[profile])
     if args.leverage is not None:
         requested = max(1.0, args.leverage)
         if runtime.market_type == "futures":
@@ -1371,14 +1962,33 @@ def command_fetch(args: argparse.Namespace) -> int:
     if symbol != "BTCUSDC":
         print("Error: this CLI supports BTCUSDC only", file=sys.stderr)
         return 2
+    limit = max(1, int(args.limit))
+    max_batch_size = 1500 if runtime.market_type == "futures" else 1000
+    batch_size = max(1, min(max_batch_size, int(getattr(args, "batch_size", 1000))))
 
     client = _build_client(runtime)
     try:
         client.ensure_btcusdc()
-        candles = client.get_klines(symbol, interval, limit=args.limit)
+        candles_by_open_time = {}
+        end_time = None
+        while len(candles_by_open_time) < limit:
+            request_limit = min(batch_size, limit - len(candles_by_open_time))
+            chunk = client.get_klines(symbol, interval, limit=request_limit, end_time=end_time)
+            if not chunk:
+                break
+            before = len(candles_by_open_time)
+            for candle in chunk:
+                candles_by_open_time[candle.open_time] = candle
+            earliest_open_time = min(c.open_time for c in chunk)
+            end_time = earliest_open_time - 1
+            if len(candles_by_open_time) == before or end_time < 0:
+                break
+            if len(chunk) < request_limit:
+                break
     except BinanceAPIError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
+    candles = sorted(candles_by_open_time.values(), key=lambda candle: candle.open_time)[-limit:]
 
     payload = [
         {
@@ -1399,6 +2009,11 @@ def command_fetch(args: argparse.Namespace) -> int:
 
 
 def command_train(args: argparse.Namespace) -> int:
+    try:
+        args = _apply_training_preset(args)
+    except ValueError as exc:
+        print(f"Training settings invalid: {exc}", file=sys.stderr)
+        return 2
     cfg = load_strategy()
     runtime = load_runtime()
     candles = _load_rows_for_command(args.input, label="Training data load failed")
@@ -1411,6 +2026,14 @@ def command_train(args: argparse.Namespace) -> int:
 
     wf = None
     seed = int(getattr(args, "seed", 7))
+    learning_rate = float(getattr(args, "learning_rate", 0.05))
+    l2_penalty = float(getattr(args, "l2_penalty", 1e-4))
+    if learning_rate <= 0.0:
+        print("Training settings invalid: learning_rate must be > 0.", file=sys.stderr)
+        return 2
+    if l2_penalty < 0.0:
+        print("Training settings invalid: l2_penalty must be >= 0.", file=sys.stderr)
+        return 2
 
     if args.walk_forward:
         try:
@@ -1421,6 +2044,8 @@ def command_train(args: argparse.Namespace) -> int:
                 step=args.walk_forward_step,
                 epochs=max(50, args.epochs // 2),
                 calibrate=args.calibrate_threshold,
+                learning_rate=learning_rate,
+                l2_penalty=l2_penalty,
             )
             print(
                 f"walk-forward: folds={wf['folds']} avg_score={wf['average_score']:.4f} "
@@ -1436,13 +2061,7 @@ def command_train(args: argparse.Namespace) -> int:
             print(f"walk-forward unavailable: {exc}")
             wf = None
 
-    model_signature = feature_signature(
-        cfg.feature_windows[0],
-        cfg.feature_windows[1],
-        cfg.label_threshold,
-        feature_version=cfg.feature_version,
-        enabled_features=cfg.enabled_features,
-    )
+    model_signature = _strategy_feature_signature(cfg)
 
     split = max(2, int(len(rows) * 0.8))
     train_rows = rows[:split]
@@ -1451,6 +2070,8 @@ def command_train(args: argparse.Namespace) -> int:
     model = train(
         train_rows,
         epochs=args.epochs,
+        learning_rate=learning_rate,
+        l2_penalty=l2_penalty,
         seed=seed,
         feature_signature=model_signature,
     )
@@ -1483,8 +2104,11 @@ def command_train(args: argparse.Namespace) -> int:
             "rows_train": len(train_rows),
             "rows_test": len(test_rows),
             "epochs": int(args.epochs),
+            "learning_rate": float(learning_rate),
+            "l2_penalty": float(l2_penalty),
             "lookback_windows": list(cfg.feature_windows),
             "label_threshold": float(cfg.label_threshold),
+            "preset": str(getattr(args, "requested_preset", args.preset)),
             "walk_forward": bool(args.walk_forward),
         },
         "walk_forward": wf if wf is not None else None,
@@ -1544,11 +2168,8 @@ def command_tune(args: argparse.Namespace) -> int:
     split = max(10, int(len(rows) * 0.7))
     train_rows = rows[:split]
     test_rows = rows[split:]
-    if not test_rows:
-        print("Need post-split test data to tune parameters")
-        return 2
 
-    risks: Iterable[float] = [cfg.risk_per_trade + (args.max_risk - args.min_risk) * i / max(args.steps - 1, 1)
+    risks: Iterable[float] = [args.min_risk + (args.max_risk - args.min_risk) * i / max(args.steps - 1, 1)
                               for i in range(args.steps)]
     levs: Iterable[float] = [args.min_leverage + (args.max_leverage - args.min_leverage) * i / max(args.steps - 1, 1)
                              for i in range(args.steps)]
@@ -1772,14 +2393,11 @@ def command_evaluate(args: argparse.Namespace) -> int:
 
     print(f"evaluate model={model_path}")
     print(f"threshold: {report.threshold:.3f}")
-    if train_report is None:
-        print("train_size: 0")
-    else:
-        print(
-            "train_accuracy: "
-            f"{train_report.accuracy:.3f} precision={train_report.precision:.3f} "
-            f"recall={train_report.recall:.3f} f1={train_report.f1:.3f}"
-        )
+    print(
+        "train_accuracy: "
+        f"{train_report.accuracy:.3f} precision={train_report.precision:.3f} "
+        f"recall={train_report.recall:.3f} f1={train_report.f1:.3f}"
+    )
     print(
         "test_accuracy: "
         f"{report.accuracy:.3f} precision={report.precision:.3f} "
@@ -1807,7 +2425,7 @@ def command_live(args: argparse.Namespace) -> int:
         else:
             print("Leverage override is spot-inactive; spot runs at 1x.")
     client = _build_client(runtime)
-    model_path = Path("data/model.json")
+    model_path = Path(getattr(args, "model", "data/model.json"))
 
     if getattr(args, "live", False):
         effective_dry_run = False
@@ -1819,6 +2437,10 @@ def command_live(args: argparse.Namespace) -> int:
     if not effective_dry_run and (not runtime.api_key or not runtime.api_secret):
         print("Live mode needs API key and secret. Run configure first or run with --paper.")
         return 2
+    sleep_seconds = max(0, int(getattr(args, "sleep", 0)))
+    if not effective_dry_run and sleep_seconds < 1:
+        print("Authenticated live mode uses minimum sleep=1s.")
+        sleep_seconds = 1
 
     leverage = _resolve_futures_leverage(runtime, cfg)
     if runtime.market_type == "futures" and not effective_dry_run:
@@ -1849,11 +2471,20 @@ def command_live(args: argparse.Namespace) -> int:
         try:
             model = _load_runtime_model(model_path, cfg)
         except (ModelLoadError, ModelFeatureMismatchError) as exc:
+            if not effective_dry_run:
+                print(f"Live mode requires a compatible model: {exc}", file=sys.stderr)
+                return 2
             print(f"Model load failed; regenerating: {exc}", file=sys.stderr)
             model = None
         except Exception:
+            if not effective_dry_run:
+                print(f"Live mode requires a readable model: {model_path}", file=sys.stderr)
+                return 2
             model = None
     else:
+        if not effective_dry_run:
+            print(f"Live mode needs model file: {model_path}", file=sys.stderr)
+            return 2
         model = None
 
     mode_label = "paper" if effective_dry_run else "live"
@@ -1879,9 +2510,39 @@ def command_live(args: argparse.Namespace) -> int:
         "symbol": runtime.symbol,
         "model_path": str(model_path),
         "events": [],
-        "model_signature": None,
+        "model_signature": str(getattr(model, "feature_signature", "")) or None,
         "starting_cash": float(cash),
     }
+    if not effective_dry_run:
+        try:
+            detected_position = _detect_existing_position(runtime, client, leverage=leverage)
+        except BinanceAPIError as exc:
+            print(f"Existing position check failed: {exc}", file=sys.stderr)
+            return 2
+        if detected_position is not None:
+            position_side = int(detected_position["side"])
+            qty = float(detected_position["qty"])
+            entry_price = float(detected_position["entry_price"])
+            position_notional = position_side * float(detected_position["notional"])
+            margin_used = max(0.0, float(detected_position["margin"]))
+            cash = max(0.0, cash - margin_used)
+            print(
+                "Detected existing exchange position: "
+                f"{'long' if position_side > 0 else 'short'} qty={qty:.8f} entry={entry_price:.2f}"
+            )
+            live_run["events"].append(
+                {
+                    "step": 0,
+                    "status": "resume_exchange_position",
+                    "market": str(detected_position["market"]),
+                    "direction": int(position_side),
+                    "qty": float(qty),
+                    "entry_price": float(entry_price),
+                    "notional": float(position_notional),
+                    "margin": float(margin_used),
+                    "cash_after_resume": float(cash),
+                }
+            )
     drawdown_limit = float(cfg.max_drawdown_limit)
     halt_reason = "completed"
     steps_executed = 0
@@ -1889,6 +2550,22 @@ def command_live(args: argparse.Namespace) -> int:
     closes = 0
     skipped_entries = 0
     model_loads = 0 if model is None else 1
+    exit_code = 0
+
+    def record_order_error(step: int, side: str, size: float, exc: BinanceAPIError) -> None:
+        nonlocal halt_reason, exit_code
+        print(f"order error: {exc}", file=sys.stderr)
+        halt_reason = "order_error"
+        exit_code = 2
+        live_run["events"].append(
+            {
+                "step": step,
+                "status": "order_error",
+                "side": side,
+                "size": float(size),
+                "error": str(exc),
+            }
+        )
 
     for i in range(args.steps):
         try:
@@ -1896,7 +2573,9 @@ def command_live(args: argparse.Namespace) -> int:
         except BinanceAPIError as exc:
             print(f"market error: {exc}", file=sys.stderr)
             halt_reason = "market_error"
-            return 2
+            exit_code = 2
+            live_run["events"].append({"step": i + 1, "status": "market_error", "error": str(exc)})
+            break
 
         steps_executed += 1
 
@@ -1904,7 +2583,7 @@ def command_live(args: argparse.Namespace) -> int:
         if not rows:
             print("not enough historical data for live signal")
             live_run["events"].append({"step": i + 1, "status": "no_rows"})
-            time.sleep(args.sleep)
+            time.sleep(sleep_seconds)
             continue
 
         live_run["events"].append({"step": i + 1, "status": "rows", "count": len(rows)})
@@ -1942,10 +2621,22 @@ def command_live(args: argparse.Namespace) -> int:
             live_run["model_signature"] = str(model_signature) if model_signature else None
 
         if model is None:
-            model = train(rows, epochs=40)
+            model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
             model_loads += 1
         latest = rows[-1]
-        score = model.predict_proba(latest.features)
+        try:
+            score = model.predict_proba(latest.features)
+        except ValueError as exc:
+            if not effective_dry_run:
+                print(f"Live model incompatible with current rows: {exc}", file=sys.stderr)
+                halt_reason = "model_incompatible"
+                exit_code = 2
+                live_run["events"].append({"step": i + 1, "status": "model_incompatible", "error": str(exc)})
+                break
+            print(f"paper model incompatible; retraining: {exc}", file=sys.stderr)
+            model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
+            model_loads += 1
+            score = model.predict_proba(latest.features)
         direction = _score_to_direction(score, cfg, runtime.market_type)
 
         # cooldown reduces immediate flip-flopping in choppy conditions
@@ -1969,7 +2660,7 @@ def command_live(args: argparse.Namespace) -> int:
                         "score": float(score),
                     }
                 )
-                time.sleep(max(1, args.sleep))
+                time.sleep(sleep_seconds)
                 continue
             if max_open_positions <= 0:
                 print(f"step {i + 1:>2}: max open positions reached ({max_open_positions}), skipping entry")
@@ -1981,7 +2672,7 @@ def command_live(args: argparse.Namespace) -> int:
                         "score": float(score),
                     }
                 )
-                time.sleep(max(1, args.sleep))
+                time.sleep(sleep_seconds)
                 continue
 
             notional, qty = _build_order_notional(
@@ -2004,7 +2695,7 @@ def command_live(args: argparse.Namespace) -> int:
                         "notional": float(notional),
                     }
                 )
-                time.sleep(max(1, args.sleep))
+                time.sleep(sleep_seconds)
                 continue
 
             if runtime.market_type == "spot":
@@ -2024,13 +2715,13 @@ def command_live(args: argparse.Namespace) -> int:
                         "score": float(score),
                     }
                 )
-                time.sleep(max(1, args.sleep))
+                time.sleep(sleep_seconds)
                 continue
 
             side_sign = 1 if direction > 0 else -1
             fill = price * (1.0 + side_sign * slippage)
             if fill <= 0:
-                time.sleep(max(1, args.sleep))
+                time.sleep(sleep_seconds)
                 continue
 
             notional = qty * fill
@@ -2047,8 +2738,23 @@ def command_live(args: argparse.Namespace) -> int:
                         "fill": float(fill),
                     }
                 )
-                time.sleep(max(1, args.sleep))
+                time.sleep(sleep_seconds)
                 continue
+
+            side = "BUY" if side_sign > 0 else "SELL"
+            try:
+                _paper_or_live_order(
+                    client,
+                    runtime,
+                    cfg,
+                    side=side,
+                    size=qty,
+                    dry_run=effective_dry_run,
+                    leverage=leverage,
+                )
+            except BinanceAPIError as exc:
+                record_order_error(i + 1, side, qty, exc)
+                break
 
             cash -= total
             position_side = direction
@@ -2058,16 +2764,6 @@ def command_live(args: argparse.Namespace) -> int:
             margin_used = margin
             daily_trade_count[day] = daily_trade_count.get(day, 0) + 1
 
-            side = "BUY" if side_sign > 0 else "SELL"
-            _paper_or_live_order(
-                client,
-                runtime,
-                cfg,
-                side=side,
-                size=qty,
-                dry_run=effective_dry_run,
-                leverage=leverage,
-            )
             print(f"step {i + 1:>2}: enter {'long' if position_side > 0 else 'short'} at {fill:.2f} qty={qty:.6f}")
             entries += 1
             live_run["events"].append(
@@ -2095,18 +2791,23 @@ def command_live(args: argparse.Namespace) -> int:
                 fill = price * (1.0 - position_side * slippage)
                 realized = position_side * (fill - entry_price) * qty
                 exit_fee = abs(fill * qty) * fee_rate
-                cash += margin_used + realized - exit_fee
 
                 side_to_close = "SELL" if position_side > 0 else "BUY"
-                _paper_or_live_order(
-                    client,
-                    runtime,
-                    cfg,
-                    side=side_to_close,
-                    size=abs(qty),
-                    dry_run=effective_dry_run,
-                    leverage=leverage,
-                )
+                try:
+                    _paper_or_live_order(
+                        client,
+                        runtime,
+                        cfg,
+                        side=side_to_close,
+                        size=abs(qty),
+                        dry_run=effective_dry_run,
+                        leverage=leverage,
+                        reduce_only=runtime.market_type == "futures",
+                    )
+                except BinanceAPIError as exc:
+                    record_order_error(i + 1, side_to_close, abs(qty), exc)
+                    break
+                cash += margin_used + realized - exit_fee
                 print(
                     f"step {i + 1:>2}: close {'long' if position_side > 0 else 'short'} "
                     f"pnl={pnl:.2f} cash={cash:.2f}"
@@ -2164,18 +2865,23 @@ def command_live(args: argparse.Namespace) -> int:
                     fill = price * (1.0 - position_side * slippage)
                     realized = position_side * (fill - entry_price) * qty
                     exit_fee = abs(fill * qty) * fee_rate
-                    cash += margin_used + realized - exit_fee
 
                     side_to_close = "SELL" if position_side > 0 else "BUY"
-                    _paper_or_live_order(
-                        client,
-                        runtime,
-                        cfg,
-                        side=side_to_close,
-                        size=abs(qty),
-                        dry_run=effective_dry_run,
-                        leverage=leverage,
-                    )
+                    try:
+                        _paper_or_live_order(
+                            client,
+                            runtime,
+                            cfg,
+                            side=side_to_close,
+                            size=abs(qty),
+                            dry_run=effective_dry_run,
+                            leverage=leverage,
+                            reduce_only=runtime.market_type == "futures",
+                        )
+                    except BinanceAPIError as exc:
+                        record_order_error(i + 1, side_to_close, abs(qty), exc)
+                        break
+                    cash += margin_used + realized - exit_fee
                     print(
                         f"step {i + 1:>2}: emergency close from drawdown "
                         f"{drawdown:.2%}; cash={cash:.2f}"
@@ -2208,7 +2914,7 @@ def command_live(args: argparse.Namespace) -> int:
                 }
             )
 
-        time.sleep(max(1, args.sleep))
+        time.sleep(sleep_seconds)
     live_run["result"] = {
         "status": halt_reason,
         "steps_executed": steps_executed,
@@ -2225,7 +2931,7 @@ def command_live(args: argparse.Namespace) -> int:
     if max_drawdown_seen > 0.0:
         print(f"max_drawdown observed: {max_drawdown_seen:.2%}")
     print(f"finished loop market={runtime.market_type} cash={cash:.2f}")
-    return 0
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
