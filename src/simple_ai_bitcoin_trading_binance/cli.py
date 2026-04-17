@@ -452,11 +452,12 @@ def _tui_actions():
                     "Operator help",
                     "- Start with Runtime settings to enter API credentials securely.",
                     "- Run Connect before any data, training, or live action.",
-                    "- Use Tab and Shift+Tab to move between workspace panels or modal controls.",
+                    "- The main screen shows actions, selected action details, live snapshot, and activity together.",
+                    "- Use Tab and Shift+Tab only inside modal forms.",
                     "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest.",
                     "- Use Paper loop before Testnet loop.",
                     "- Spot roundtrip is the smallest authenticated execution check.",
-                    "- Keys: j/k move, enter runs the selected action, r refreshes, q quits.",
+                    "- Keys: j/k move, enter runs the selected action, r refreshes the snapshot, q quits.",
                 ]
             )
         )
@@ -1544,9 +1545,6 @@ def command_tune(args: argparse.Namespace) -> int:
     split = max(10, int(len(rows) * 0.7))
     train_rows = rows[:split]
     test_rows = rows[split:]
-    if not test_rows:
-        print("Need post-split test data to tune parameters")
-        return 2
 
     risks: Iterable[float] = [cfg.risk_per_trade + (args.max_risk - args.min_risk) * i / max(args.steps - 1, 1)
                               for i in range(args.steps)]
@@ -1772,14 +1770,11 @@ def command_evaluate(args: argparse.Namespace) -> int:
 
     print(f"evaluate model={model_path}")
     print(f"threshold: {report.threshold:.3f}")
-    if train_report is None:
-        print("train_size: 0")
-    else:
-        print(
-            "train_accuracy: "
-            f"{train_report.accuracy:.3f} precision={train_report.precision:.3f} "
-            f"recall={train_report.recall:.3f} f1={train_report.f1:.3f}"
-        )
+    print(
+        "train_accuracy: "
+        f"{train_report.accuracy:.3f} precision={train_report.precision:.3f} "
+        f"recall={train_report.recall:.3f} f1={train_report.f1:.3f}"
+    )
     print(
         "test_accuracy: "
         f"{report.accuracy:.3f} precision={report.precision:.3f} "

@@ -51,8 +51,6 @@ def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
         return spot_override, "api"
     if common_override:
         return common_override, "api"
-    if market_type == "futures":
-        return (BINANCE_FUTURES_TESTNET if testnet else BINANCE_FUTURES_LIVE, "fapi")
     return (BINANCE_SPOT_TESTNET if testnet else BINANCE_SPOT_LIVE, "api")
 
 

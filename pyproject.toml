@@ -27,4 +27,4 @@ omit = ["src/simple_ai_bitcoin_trading_binance/__main__.py"]
 [tool.coverage.report]
 skip_empty = true
 show_missing = true
-fail_under = 75
+fail_under = 100

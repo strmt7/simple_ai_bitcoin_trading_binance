@@ -13,7 +13,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, OptionList, RichLog, SelectionList, Static, TabbedContent, TabPane
+from textual.widgets import Button, Input, Label, OptionList, RichLog, SelectionList, Static
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class ConfirmScreen(ModalScreen[bool]):
         yield Vertical(
             Label(self.message, id="confirm-label"),
             Horizontal(
-                Button("Confirm", variant="error", id="confirm"),
+                Button("Confirm", id="confirm"),
                 Button("Cancel", id="cancel"),
                 id="confirm-buttons",
             ),
@@ -79,7 +79,7 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
             Label(self.title_text, id="form-title"),
             VerticalScroll(*rows, id="form-fields"),
             Horizontal(
-                Button("Save", variant="primary", id="save"),
+                Button("Save", id="save"),
                 Button("Cancel", id="cancel"),
                 id="form-buttons",
             ),
@@ -149,7 +149,7 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
             Horizontal(
                 Button("All", id="all"),
                 Button("None", id="none"),
-                Button("Save", variant="primary", id="save"),
+                Button("Save", id="save"),
                 Button("Cancel", id="cancel"),
                 id="feature-buttons",
             ),
@@ -209,6 +209,9 @@ class OperatorApp(App[int]):
         background: #081018;
         color: #dbe8f2;
     }
+    ConfirmScreen, FormScreen, MultiSelectScreen {
+        align: center middle;
+    }
     #titlebar {
         dock: top;
         height: 1;
@@ -217,14 +220,35 @@ class OperatorApp(App[int]):
         color: #f4fbff;
         text-style: bold;
     }
+    #status {
+        dock: top;
+        height: 1;
+        border: none;
+        background: #0b141d;
+        padding: 0 1;
+        content-align: left middle;
+        color: #dbe8f2;
+    }
     #body {
         height: 1fr;
         padding: 1;
     }
-    #actions {
-        width: 22;
-        min-width: 22;
+    #nav {
+        width: 30;
+        min-width: 24;
         border: solid #183140;
+        background: #0b141d;
+    }
+    .panel-title {
+        height: 1;
+        padding: 0 1;
+        background: #102131;
+        color: #7ce0c9;
+        text-style: bold;
+    }
+    #actions {
+        height: 1fr;
+        border: none;
         background: #0b141d;
         color: #dbe8f2;
         padding: 0;
@@ -248,52 +272,55 @@ class OperatorApp(App[int]):
         color: #faffff;
         text-style: bold;
     }
-    #right {
+    #context {
         width: 1fr;
         padding-left: 1;
     }
-    #status {
-        height: 1;
-        border: none;
-        background: #0b141d;
-        padding: 0 1;
-        content-align: left middle;
-        color: #dbe8f2;
-    }
-    #workspace {
-        height: 1fr;
+    #action-panel {
+        height: 8;
+        min-height: 5;
         border: solid #183140;
         background: #0b141d;
     }
-    #workspace > ContentTabs {
-        height: 3;
-        background: #0b141d;
-    }
-    #workspace > ContentTabs Tab {
-        padding: 0 1;
-        color: #86a0b4;
-        text-style: bold;
-    }
-    #workspace > ContentTabs Tab.-active {
-        color: #f4fbff;
-        background: #173549;
-    }
-    #details, #preview, #log {
+    #snapshot-panel {
         height: 1fr;
+        min-height: 6;
+        border: solid #183140;
+        background: #0b141d;
+        margin-top: 1;
+    }
+    #activity-panel {
+        height: 10;
+        min-height: 5;
+        border: solid #183140;
+        background: #0b141d;
+        margin-top: 1;
+    }
+    #details {
+        height: 1fr;
+        border: none;
+        padding: 1;
+        color: #dbe8f2;
+    }
+    #preview {
+        height: 1fr;
+        border: none;
         padding: 1;
         color: #dbe8f2;
     }
     #log {
+        height: 1fr;
         border: none;
-        background: #0b141d;
+        padding: 1;
+        color: #dbe8f2;
     }
     #confirm-dialog, #form-dialog, #feature-dialog {
         width: 68;
+        max-width: 100%;
         height: auto;
         padding: 1 2;
-        border: round #2ea7a0;
+        border: solid #29475d;
         background: #0b141d;
-        align: center middle;
     }
     #confirm-buttons, #form-buttons, #feature-buttons {
         height: auto;
@@ -331,30 +358,19 @@ class OperatorApp(App[int]):
     }
     Button {
         min-width: 9;
-        padding: 0 1;
-        background: #0f1822;
+        padding: 0 2;
+        background: #14202b;
         color: #e7f0f7;
-        border: solid #29475d;
+        border: none;
         text-style: bold;
     }
     Button:hover {
-        background: #153042;
-        border: solid #3a617c;
-    }
-    Button:focus {
-        background: #173549;
-        border: solid #2ea7a0;
+        background: #1d3444;
         color: #ffffff;
     }
-    Button.-primary {
-        background: #124b59;
-        border: solid #2ea7a0;
-        color: #f8fffe;
-    }
-    Button.-error {
-        background: #4d1f1f;
-        border: solid #c95c5c;
-        color: #fff7f7;
+    Button:focus {
+        background: #2ea7a0;
+        color: #081018;
     }
     #feature-list {
         border: solid #193243;
@@ -395,10 +411,6 @@ class OperatorApp(App[int]):
         Binding("enter", "run_selected", "Run"),
         Binding("j", "cursor_down", "Down"),
         Binding("k", "cursor_up", "Up"),
-        Binding("tab", "next_workspace", "Panel", show=True, priority=True),
-        Binding("shift+tab", "previous_workspace", "Back", show=False, priority=True),
-        Binding("left", "previous_workspace", "", show=False),
-        Binding("right", "next_workspace", "", show=False),
     ]
 
     def __init__(self, *, title_text: str, actions: list[TUIAction], snapshot_provider: Callable[..., str]) -> None:
@@ -407,25 +419,31 @@ class OperatorApp(App[int]):
         self.actions_data = actions
         self.snapshot_provider = snapshot_provider
         self.controller = TerminalUI(self)
+        self._ignored_initial_highlight = False
 
     def compose(self) -> ComposeResult:
         yield Static(self.title, id="titlebar")
+        yield Static("", id="status")
         with Horizontal(id="body"):
-            yield OptionList(*[action.title for action in self.actions_data], id="actions")
-            with Vertical(id="right"):
-                yield Static("", id="status")
-                with TabbedContent(id="workspace"):
-                    with TabPane("Action", id="panel-action"):
-                        yield Static("", id="details")
-                    with TabPane("Overview", id="panel-overview"):
-                        yield Static("", id="preview")
-                    with TabPane("Activity", id="panel-activity"):
-                        yield RichLog(id="log", wrap=True, highlight=True, markup=False)
-        yield Static("Enter run  Tab panel  j/k move  Space toggle  q quit", id="footerbar")
+            with Vertical(id="nav"):
+                yield Static("Commands", id="actions-title", classes="panel-title")
+                yield OptionList(*[action.title for action in self.actions_data], id="actions")
+            with Vertical(id="context"):
+                with Vertical(id="action-panel"):
+                    yield Static("Selected", id="details-title", classes="panel-title")
+                    yield Static("", id="details")
+                with Vertical(id="snapshot-panel"):
+                    yield Static("Snapshot", id="preview-title", classes="panel-title")
+                    yield Static("", id="preview")
+                with Vertical(id="activity-panel"):
+                    yield Static("Activity", id="log-title", classes="panel-title")
+                    yield RichLog(id="log", wrap=True, highlight=True, markup=False)
+        yield Static("j/k or arrows move | Enter run | r refresh | q quit", id="footerbar")
 
     def on_mount(self) -> None:
-        self.query_one("#actions", OptionList).highlighted = 0
-        self._activate_workspace("panel-overview")
+        actions = self.query_one("#actions", OptionList)
+        actions.highlighted = 0
+        actions.focus()
         self.refresh_preview()
         self._update_action_details()
         self.set_status("Ready. Enter runs the selected action.")
@@ -438,25 +456,8 @@ class OperatorApp(App[int]):
         for line in text.splitlines() or [""]:
             log.write(line)
 
-    def _activate_workspace(self, panel_id: str) -> None:
-        try:
-            self.query_one("#workspace", TabbedContent).active = panel_id
-        except Exception:
-            return
-
     def _modal_open(self) -> bool:
         return len(self.screen_stack) > 1
-
-    def _workspace_ids(self) -> list[str]:
-        return ["panel-action", "panel-overview", "panel-activity"]
-
-    def _workspace_label(self, panel_id: str) -> str:
-        labels = {
-            "panel-action": "Action",
-            "panel-overview": "Overview",
-            "panel-activity": "Activity",
-        }
-        return labels.get(panel_id, panel_id)
 
     def _update_action_details(self) -> None:
         action = self._current_action()
@@ -467,7 +468,7 @@ class OperatorApp(App[int]):
             break_long_words=False,
             break_on_hyphens=False,
         ) or [action.description]
-        details.update("\n".join([action.title, "", *wrapped, "", "Enter runs the action.", "Tab switches the workspace panel."]))
+        details.update("\n".join([action.title, "", *wrapped]))
 
     def refresh_preview(self) -> None:
         preview = self.query_one("#preview", Static)
@@ -483,8 +484,13 @@ class OperatorApp(App[int]):
         index = option_list.highlighted or 0
         return self.actions_data[index]
 
+    def _select_action(self, index: int) -> TUIAction:
+        option_list = self.query_one("#actions", OptionList)
+        safe_index = max(0, min(index, len(self.actions_data) - 1))
+        option_list.highlighted = safe_index
+        return self.actions_data[safe_index]
+
     async def _execute_action(self, action: TUIAction) -> None:
-        self._activate_workspace("panel-activity")
         self.set_status(f"Running: {action.title}")
         stream = io.StringIO()
         result: int | None = None
@@ -515,8 +521,7 @@ class OperatorApp(App[int]):
         if self._modal_open():
             return
         self.refresh_preview()
-        self._activate_workspace("panel-overview")
-        self.set_status("Refreshed")
+        self.set_status("Snapshot refreshed")
 
     def action_cursor_down(self) -> None:
         if self._modal_open():
@@ -524,7 +529,6 @@ class OperatorApp(App[int]):
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_down()
         self._update_action_details()
-        self._activate_workspace("panel-action")
         self.set_status(self._current_action().title)
 
     def action_cursor_up(self) -> None:
@@ -533,33 +537,23 @@ class OperatorApp(App[int]):
         option_list = self.query_one("#actions", OptionList)
         option_list.action_cursor_up()
         self._update_action_details()
-        self._activate_workspace("panel-action")
         self.set_status(self._current_action().title)
 
-    def action_next_workspace(self) -> None:
-        if self._modal_open():
-            self.screen.focus_next()
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.id != "actions" or self._modal_open():
             return
-        workspace = self.query_one("#workspace", TabbedContent)
-        ids = self._workspace_ids()
-        current = workspace.active or ids[0]
-        next_id = ids[(ids.index(current) + 1) % len(ids)]
-        self._activate_workspace(next_id)
-        self.set_status(f"Panel: {self._workspace_label(next_id)}")
+        if not self._ignored_initial_highlight:
+            self._ignored_initial_highlight = True
+            if event.option_index == 0:
+                return
+        self._select_action(event.option_index)
+        self._update_action_details()
+        self.set_status(self._current_action().title)
 
-    def action_previous_workspace(self) -> None:
-        if self._modal_open():
-            self.screen.focus_previous()
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "actions" or self._modal_open():
             return
-        workspace = self.query_one("#workspace", TabbedContent)
-        ids = self._workspace_ids()
-        current = workspace.active or ids[0]
-        next_id = ids[(ids.index(current) - 1) % len(ids)]
-        self._activate_workspace(next_id)
-        self.set_status(f"Panel: {self._workspace_label(next_id)}")
-
-    async def on_option_list_option_selected(self, _event: OptionList.OptionSelected) -> None:
-        await self._execute_action(self._current_action())
+        await self._execute_action(self._select_action(event.option_index))
 
 
 def launch_tui(

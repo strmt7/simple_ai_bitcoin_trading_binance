@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from textual.widgets import Button
+
 from simple_ai_bitcoin_trading_binance.tui import (
     ConfirmScreen,
     FormField,
@@ -39,8 +41,10 @@ class _FakeFormInput(_FakeInput):
 
 
 class _FakeOptionList:
-    def __init__(self) -> None:
+    def __init__(self, identifier: str = "actions") -> None:
+        self.id = identifier
         self.highlighted = 0
+        self.focused = False
 
     def action_cursor_down(self) -> None:
         self.highlighted = 1
@@ -48,10 +52,14 @@ class _FakeOptionList:
     def action_cursor_up(self) -> None:
         self.highlighted = 0
 
+    def focus(self) -> None:
+        self.focused = True
 
-class _FakeWorkspace:
-    def __init__(self) -> None:
-        self.active = ""
+
+class _FakeOptionEvent:
+    def __init__(self, option_list: _FakeOptionList, option_index: int) -> None:
+        self.option_list = option_list
+        self.option_index = option_index
 
 
 class _FakeRichLog:
@@ -69,8 +77,9 @@ def test_confirm_screen_behaviors(monkeypatch) -> None:
 
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "confirm"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
+    screen.action_dismiss_false()
 
-    assert dismissed == [True, False]
+    assert dismissed == [True, False, False]
 
 
 def test_form_screen_behaviors(monkeypatch) -> None:
@@ -107,10 +116,12 @@ def test_form_screen_behaviors(monkeypatch) -> None:
     screen.on_input_submitted(second_event)
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "save"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
+    screen.action_dismiss_none()
 
     assert dismissed == [
         {"api_key": "typed-key", "interval": "1h"},
         {"api_key": "typed-key", "interval": "1h"},
+        None,
         None,
     ]
 
@@ -159,10 +170,11 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "none"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "save"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
+    screen.action_dismiss_none()
 
     assert selection_list.selected_all is True
     assert selection_list.cleared is True
-    assert dismissed == [[], None]
+    assert dismissed == [[], None, None]
 
 
 def test_terminal_ui_methods() -> None:
@@ -192,7 +204,6 @@ def test_terminal_ui_methods() -> None:
 def test_operator_app_methods(monkeypatch) -> None:
     widgets = {
         "#actions": _FakeOptionList(),
-        "#workspace": _FakeWorkspace(),
         "#status": _FakeStatic(),
         "#details": _FakeStatic(),
         "#preview": _FakeStatic(),
@@ -218,13 +229,16 @@ def test_operator_app_methods(monkeypatch) -> None:
     monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
 
     app.on_mount()
-    assert widgets["#workspace"].active == "panel-overview"
+    assert widgets["#actions"].focused is True
     assert widgets["#preview"].value == "snapshot"
     assert widgets["#status"].value == "Ready. Enter runs the selected action."
     assert widgets["#details"].value.startswith("Sync")
 
+    app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 0))
+    assert widgets["#status"].value == "Ready. Enter runs the selected action."
+    assert app._ignored_initial_highlight is True
+
     asyncio.run(app._execute_action(app.actions_data[0]))
-    assert widgets["#workspace"].active == "panel-activity"
     assert "sync output" in widgets["#log"].lines
     assert widgets["#status"].value == "Sync complete (1)"
 
@@ -233,23 +247,81 @@ def test_operator_app_methods(monkeypatch) -> None:
     assert "async output" in widgets["#log"].lines
 
     app.action_refresh_preview()
-    assert widgets["#workspace"].active == "panel-overview"
-    assert widgets["#status"].value == "Refreshed"
+    assert widgets["#status"].value == "Snapshot refreshed"
 
     app.action_cursor_down()
-    assert widgets["#workspace"].active == "panel-action"
     assert widgets["#status"].value == "Async"
     app.action_cursor_up()
-    assert widgets["#workspace"].active == "panel-action"
     assert widgets["#status"].value == "Sync"
 
-    asyncio.run(app.on_option_list_option_selected(object()))
+    app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 0))
+    assert widgets["#status"].value == "Sync"
+    app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 1))
+    assert widgets["#actions"].highlighted == 1
+    assert widgets["#details"].value.startswith("Async")
+    assert widgets["#status"].value == "Async"
+
+    asyncio.run(app.on_option_list_option_selected(_FakeOptionEvent(widgets["#actions"], 0)))
+    assert widgets["#actions"].highlighted == 0
+    assert widgets["#status"].value == "Sync complete (1)"
+    asyncio.run(app.on_option_list_option_selected(_FakeOptionEvent(_FakeOptionList("other"), 1)))
     assert widgets["#status"].value == "Sync complete (1)"
 
-    app.action_next_workspace()
-    assert widgets["#workspace"].active == "panel-action"
-    app.action_previous_workspace()
-    assert widgets["#workspace"].active == "panel-activity"
+
+def test_operator_app_global_actions_are_blocked_while_modal_is_open(monkeypatch) -> None:
+    widgets = {
+        "#actions": _FakeOptionList(),
+        "#status": _FakeStatic(),
+        "#details": _FakeStatic(),
+        "#preview": _FakeStatic(),
+        "#log": _FakeRichLog(),
+    }
+    called: list[str] = []
+
+    app = OperatorApp(
+        title_text="console",
+        actions=[TUIAction("1", "Sync", "sync description", lambda _ui: called.append("run"))],
+        snapshot_provider=lambda _width=70: "snapshot",
+    )
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+    monkeypatch.setattr(app, "_modal_open", lambda: True)
+
+    asyncio.run(app.action_run_selected())
+    app.action_refresh_preview()
+    app.action_cursor_down()
+    app.action_cursor_up()
+    app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 0))
+    asyncio.run(app.on_option_list_option_selected(_FakeOptionEvent(widgets["#actions"], 0)))
+
+    assert called == []
+    assert widgets["#actions"].highlighted == 0
+    assert widgets["#status"].value == ""
+
+
+def test_operator_app_first_nonzero_highlight_updates_action_details(monkeypatch) -> None:
+    widgets = {
+        "#actions": _FakeOptionList(),
+        "#status": _FakeStatic(),
+        "#details": _FakeStatic(),
+        "#preview": _FakeStatic(),
+        "#log": _FakeRichLog(),
+    }
+    app = OperatorApp(
+        title_text="console",
+        actions=[
+            TUIAction("1", "Sync", "sync description", lambda _ui: 0),
+            TUIAction("2", "Async", "async description", lambda _ui: 0),
+        ],
+        snapshot_provider=lambda _width=70: "snapshot",
+    )
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+
+    app.on_mount()
+    app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 1))
+
+    assert app._ignored_initial_highlight is True
+    assert widgets["#actions"].highlighted == 1
+    assert widgets["#details"].value.startswith("Async")
 
 
 def test_operator_app_refresh_preview_supports_zero_arg_provider(monkeypatch) -> None:
@@ -270,7 +342,6 @@ def test_operator_app_refresh_preview_supports_zero_arg_provider(monkeypatch) ->
 
 def test_operator_app_execute_action_handles_silent_result(monkeypatch) -> None:
     widgets = {
-        "#workspace": _FakeWorkspace(),
         "#status": _FakeStatic(),
         "#preview": _FakeStatic(),
         "#log": _FakeRichLog(),
@@ -285,20 +356,28 @@ def test_operator_app_execute_action_handles_silent_result(monkeypatch) -> None:
 
     asyncio.run(app._execute_action(app.actions_data[0]))
 
-    assert widgets["#workspace"].active == "panel-activity"
     assert widgets["#log"].lines == []
     assert widgets["#status"].value == "Silent complete (None)"
 
 
-def test_operator_app_activate_workspace_is_defensive(monkeypatch) -> None:
+def test_operator_app_select_action_clamps_index(monkeypatch) -> None:
+    widgets = {
+        "#actions": _FakeOptionList(),
+    }
     app = OperatorApp(
         title_text="console",
-        actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+        actions=[
+            TUIAction("1", "Sync", "sync description", lambda _ui: 0),
+            TUIAction("2", "Async", "async description", lambda _ui: 0),
+        ],
         snapshot_provider=lambda _width=70: "snapshot",
     )
-    monkeypatch.setattr(app, "query_one", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyError("missing")))
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
 
-    app._activate_workspace("panel-action")
+    assert app._select_action(-10).title == "Sync"
+    assert widgets["#actions"].highlighted == 0
+    assert app._select_action(100).title == "Async"
+    assert widgets["#actions"].highlighted == 1
 
 
 def test_operator_app_runs_in_textual_runtime() -> None:
@@ -316,13 +395,14 @@ def test_operator_app_runs_in_textual_runtime() -> None:
         )
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert app.query_one("#workspace").active == "panel-overview"
-            await pilot.press("tab")
-            await pilot.pause()
-            assert app.query_one("#workspace").active == "panel-activity"
-            await pilot.press("shift+tab")
-            await pilot.pause()
-            assert app.query_one("#workspace").active == "panel-overview"
+            assert app.query_one("#actions").has_focus
+            assert str(app.query_one("#actions-title").content) == "Commands"
+            assert str(app.query_one("#details-title").content) == "Selected"
+            assert str(app.query_one("#preview-title").content) == "Snapshot"
+            assert str(app.query_one("#log-title").content) == "Activity"
+            assert str(app.query_one("#preview").content) == "snapshot"
+            assert "Sync" in str(app.query_one("#details").content)
+            assert app.query_one("#log") is not None
             await pilot.press("enter")
             await pilot.pause()
 
@@ -377,6 +457,9 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
             await pilot.press("tab")
             await pilot.pause()
             assert form_app.focused.id == "field-interval"
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert form_app.focused.id == "field-api_key"
 
         multi_app = _MultiApp(
             title_text="console",
@@ -389,6 +472,139 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
             await pilot.press("tab")
             await pilot.pause()
             assert multi_app.focused.id == "all"
+
+    asyncio.run(runner())
+
+
+def test_operator_app_flat_button_css_is_homogeneous() -> None:
+    css = OperatorApp.CSS
+
+    assert "border: round" not in css
+    assert "ContentTabs" not in css
+    assert "#workspace" not in css
+    assert "#nav" in css
+    assert "#action-panel" in css
+    assert "#snapshot-panel" in css
+    assert "#activity-panel" in css
+    assert "Button.-primary" not in css
+    assert "Button.-error" not in css
+    assert 'variant="primary"' not in css
+    assert 'variant="error"' not in css
+    assert "border: none;" in css
+
+
+def test_modal_buttons_use_one_default_variant_in_textual_runtime() -> None:
+    class _ConfirmApp(OperatorApp):
+        def on_mount(self) -> None:
+            super().on_mount()
+            self.push_screen(ConfirmScreen("Confirm?"))
+
+    class _FormApp(OperatorApp):
+        def on_mount(self) -> None:
+            super().on_mount()
+            self.push_screen(FormScreen("Runtime", [FormField("interval", "Interval", "15m")]))
+
+    class _MultiApp(OperatorApp):
+        def on_mount(self) -> None:
+            super().on_mount()
+            self.push_screen(MultiSelectScreen("Features", ["momentum_1"], ["momentum_1"]))
+
+    async def runner() -> None:
+        for app_cls, button_ids in (
+            (_ConfirmApp, ("confirm", "cancel")),
+            (_FormApp, ("save", "cancel")),
+            (_MultiApp, ("all", "none", "save", "cancel")),
+        ):
+            app = app_cls(
+                title_text="console",
+                actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+                snapshot_provider=lambda _width=70: "snapshot",
+            )
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                variants = [app.screen.query_one(f"#{button_id}", Button).variant for button_id in button_ids]
+                assert variants == ["default"] * len(button_ids)
+
+    asyncio.run(runner())
+
+
+def test_operator_app_live_keyboard_navigation_keeps_context_visible() -> None:
+    calls: list[str] = []
+
+    async def runner(size: tuple[int, int]) -> None:
+        def action(name: str):
+            def _run(_ui):
+                calls.append(name)
+                print(f"{name} output")
+                return 1
+
+            return _run
+
+        app = OperatorApp(
+            title_text="console",
+            actions=[
+                TUIAction("1", "One", "first description", action("one")),
+                TUIAction("2", "Two", "second description", action("two")),
+                TUIAction("3", "Three", "third description", action("three")),
+            ],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            assert app.query_one("#actions").has_focus
+            assert str(app.query_one("#preview").content) == "snapshot"
+            assert app.query_one("#log") is not None
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert app.query_one("#actions").highlighted == 1
+            assert "Two" in str(app.query_one("#details").content)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert str(app.query_one("#status").content) == "Two complete (1)"
+            assert calls[-1:] == ["two"]
+
+            await pilot.press("k")
+            await pilot.pause()
+            assert app.query_one("#actions").highlighted == 0
+            assert "One" in str(app.query_one("#details").content)
+
+            await pilot.press("r")
+            await pilot.pause()
+            assert str(app.query_one("#status").content) == "Snapshot refreshed"
+            assert str(app.query_one("#preview").content) == "snapshot"
+
+        assert calls[-1:] == ["two"]
+
+    asyncio.run(runner((100, 32)))
+    asyncio.run(runner((52, 18)))
+
+
+def test_modal_keyboard_navigation_does_not_trigger_background_action() -> None:
+    calls: list[str] = []
+
+    async def runner() -> None:
+        def tracked(_ui):
+            calls.append("run")
+            return 0
+
+        app = OperatorApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", tracked)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(FormScreen("Runtime", [FormField("interval", "Interval", "15m")]))
+            await pilot.pause()
+            assert isinstance(app.screen_stack[-1], FormScreen)
+            assert app.focused.id == "field-interval"
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert calls == []
+            assert len(app.screen_stack) == 1
 
     asyncio.run(runner())
 
