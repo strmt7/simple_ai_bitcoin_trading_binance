@@ -26,16 +26,21 @@ The project is intentionally narrow and operator-focused:
 
 ```bash
 python3 -m pip install -e .
-simple-ai-trading
+simple-ai-trading shell      # Claude-Code-style interactive shell
+simple-ai-trading menu       # legacy textual operator console
+simple-ai-trading objectives # preview Conservative / Default / Risky presets
 ```
 
 If your shell does not expose the console entrypoint:
 
 ```bash
-PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli
+PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli shell
 ```
 
-This opens the interactive console inside the current terminal window. The console is the primary operator workflow.
+The `shell` command opens a slash-command REPL inspired by Claude Code — tab
+completion, a muted-gradient palette, live status bar, and fall-through to the
+rest of the CLI (type `status` or `/status`; both work).  The `menu` command
+launches the legacy full-screen Textual console.
 
 The layout is intentionally simple:
 
@@ -68,6 +73,15 @@ Useful direct commands:
 
 ```bash
 simple-ai-trading menu
+simple-ai-trading shell                     # Claude-Code-style interactive REPL
+simple-ai-trading objectives                # list Conservative / Default / Risky
+simple-ai-trading train-suite               # parallel: one model per objective
+simple-ai-trading backtest-panel --interval 5m --tag week --objective default \
+    --from-date 2026-04-20 --to-date 2026-04-25 --model data/model_default.json
+simple-ai-trading autonomous start --objective default
+simple-ai-trading autonomous pause          # or: resume, stop, status
+simple-ai-trading positions --stats         # open positions + realized/unrealized P&L
+simple-ai-trading close <id|all>            # local ledger close (no exchange order)
 simple-ai-trading prepare --preset balanced --epochs 180 --learning-rate 0.05 --l2-penalty 0.0001 --batch-size 1000 --online-doctor
 simple-ai-trading report
 simple-ai-trading doctor --online
@@ -75,6 +89,61 @@ simple-ai-trading train --preset balanced
 simple-ai-trading strategy --profile conservative
 simple-ai-trading live --paper --model data/model.json --steps 20 --sleep 0
 ```
+
+### Objectives (risk-adjusted scorers)
+
+`train-suite` trains one advanced model per registered objective and writes
+`data/model_<objective>.json` plus a `training_suite_summary.json`:
+
+| Objective | Intent | Notable defaults |
+|---|---|---|
+| `conservative` | Capital preservation, rejects > 15% drawdown, fewer trades. | 1x leverage, signal ≥ 0.66, stop 1.0%, take 2.2%, 400 epochs, poly deg 2 |
+| `default` | Balanced risk-adjusted return — the middle preset. | 1.5x, signal ≥ 0.58, stop 1.8%, take 3.0%, 600 epochs, poly deg 2 |
+| `risky` | Chase return, tolerate bigger drawdowns + more trades. | 2.5x, signal ≥ 0.53, stop 2.8%, take 4.5%, 900 epochs, poly deg 3 |
+
+Training is parallelized across a `ProcessPoolExecutor` (defaults to
+`os.cpu_count()`).  Feature expansion is computed once per objective and
+shared across every candidate in the hyperparameter grid; the full 3-objective
+suite on ~500 candles runs in seconds on a modern laptop.
+
+### Backtest panel (independent)
+
+`backtest-panel` is a standalone surface: pick any Binance-supported interval,
+any time window, any saved model — training is never forced.  Each run writes
+a timestamped, tagged JSON under `data/backtests/`:
+
+```
+data/backtests/backtest_<tag>_<market>_<interval>_<YYYYMMDDHHMMSS>.json
+```
+
+Interval strings are validated against Binance's published enums (1s, 1m, 3m,
+5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M; spot-only adds `1s`).
+A typo is rejected with a clear error listing every allowed value.
+
+### Autonomous testnet loop
+
+`autonomous start` drives an indefinite, pause-able live loop on Binance
+testnet.  Control is a tiny state file under `data/autonomous/state.json`
+(`RUNNING` / `PAUSED` / `STOPPING` / `STOPPED`) so a second shell can pause or
+stop the loop without signals.  Every iteration writes a heartbeat to
+`data/autonomous/heartbeat.json`; every fill + close updates
+`data/autonomous/open_positions.json` and `data/autonomous/ledger.json`.  The
+loop refuses to start when `testnet=False` — real-money execution stays
+blocked in this phase.
+
+### Positions + P&L stats
+
+```
+simple-ai-trading positions --stats
+#  id           side    qty       entry       mark        pnl$   pnl%
+# 1 ab3f2e…     LONG    0.012345  78200.00   78450.50   +3.09   +0.32%
+# Closed trades  : 12  (wins 7, losses 5)
+# Realized P&L   : +18.42 USDC  (+1.84%)
+# Unrealized P&L : +3.09 USDC  (+0.32%)
+```
+
+Inside the shell, the same data is reachable via `/positions`, `/stats`,
+`/close <id|all>`.
 
 ## Host overrides
 
@@ -175,6 +244,28 @@ For verified design comparisons against high-status trading bots, exchange SDKs,
 .venv/bin/python -m coverage run --source=src/simple_ai_bitcoin_trading_binance -m pytest -q
 .venv/bin/python -m coverage report --fail-under=100
 ```
+
+### Containerized run
+
+```bash
+docker build -t simple-ai-trading:dev .
+docker compose run --rm simple-ai-trading                 # opens /shell
+docker compose run --rm simple-ai-trading objectives      # one-shot command
+```
+
+Config and data live in named Docker volumes (`simple-ai-config`,
+`simple-ai-data`).  Secrets are never baked into the image — the `configure`
+command writes them to a `0600` file under the mounted config volume at
+runtime.
+
+### Push with a PAT
+
+```bash
+GITHUB_TOKEN=ghp_… python3 tools/push_with_pat.py origin feat/my-branch
+```
+
+The helper serves the token to `git push` over a short-lived UNIX socket so it
+never appears in `argv`, remote URLs, `~/.git-credentials`, or shell history.
 
 ## Limitations
 

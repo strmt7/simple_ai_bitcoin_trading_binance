@@ -1,0 +1,26 @@
+services:
+  simple-ai-trading:
+    build: .
+    image: simple-ai-trading:dev
+    # One operator, interactive by default — docker compose run for one-shots.
+    stdin_open: true
+    tty: true
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NO_COLOR: "${NO_COLOR:-}"
+      BINANCE_BASE_URL: "${BINANCE_BASE_URL:-}"
+      BINANCE_SPOT_BASE_URL: "${BINANCE_SPOT_BASE_URL:-}"
+      BINANCE_FUTURES_BASE_URL: "${BINANCE_FUTURES_BASE_URL:-}"
+    volumes:
+      # persisted runtime/strategy JSON (0600 perms are enforced by the app)
+      - simple-ai-config:/home/trader/.config
+      # candle JSON, trained models, backtest reports, autonomous artifacts
+      - simple-ai-data:/home/trader/work/data
+    working_dir: /home/trader/work
+    command: ["shell"]
+
+volumes:
+  simple-ai-config:
+  simple-ai-data:
