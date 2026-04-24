@@ -196,6 +196,11 @@ def test_terminal_ui_methods() -> None:
             seen["screens"].append(type(screen).__name__)
             return next(self.results)
 
+        def push_screen(self, screen, callback=None):
+            seen["screens"].append(type(screen).__name__)
+            if callback is not None:
+                callback(next(self.results))
+
         def append_log(self, text: str) -> None:
             seen["logs"].append(text)
 
@@ -578,7 +583,7 @@ def test_operator_app_live_keyboard_navigation_keeps_context_visible() -> None:
             assert str(app.query_one("#status").content) == "Two complete (1)"
             assert calls[-1:] == ["two"]
 
-            await pilot.press("k")
+            await pilot.press("up")
             await pilot.pause()
             assert app.query_one("#actions").highlighted == 0
             assert "One" in str(app.query_one("#details").content)

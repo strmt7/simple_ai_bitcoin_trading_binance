@@ -24,6 +24,10 @@ class RuntimeConfig:
     dry_run: bool = True
     validate_account: bool = True
     max_rate_calls_per_minute: int = 1100
+    recv_window_ms: int = 5000
+    compute_backend: str = "cpu"
+    managed_usdc: float = 1000.0
+    managed_btc: float = 0.0
 
     def asdict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -59,6 +63,10 @@ class StrategyConfig:
     label_threshold: float = 0.001
     feature_version: str = FEATURE_VERSION
     enabled_features: tuple[str, ...] = FEATURE_NAMES
+    order_type: str = "MARKET"
+    time_in_force: str = "GTC"
+    post_only: bool = False
+    reduce_only_on_close: bool = True
 
     def __post_init__(self) -> None:
         self.feature_windows = tuple(int(value) for value in self.feature_windows)

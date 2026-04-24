@@ -387,6 +387,7 @@ async def _ui_edit_runtime(ui, current) -> object:
             FormField("dry_run", "Paper trading mode [yes/no]", "yes" if current.dry_run else "no"),
             FormField("validate_account", "Validate credentials at startup [yes/no]", "yes" if current.validate_account else "no"),
             FormField("max_rate_calls_per_minute", "Max REST calls per minute", str(current.max_rate_calls_per_minute)),
+            FormField("recv_window_ms", "Request recvWindow (ms, 1-60000)", str(getattr(current, "recv_window_ms", 5000))),
         ],
     )
     if payload is None:
@@ -406,6 +407,13 @@ async def _ui_edit_runtime(ui, current) -> object:
         default=current.max_rate_calls_per_minute,
         minimum=1,
     )
+    recv_window_ms = _parse_form_int(
+        payload.get("recv_window_ms", "5000"),
+        label="Request recvWindow",
+        default=getattr(current, "recv_window_ms", 5000),
+        minimum=1,
+        maximum=60000,
+    )
     return RuntimeConfig(
         symbol="BTCUSDC",
         interval=interval,
@@ -416,6 +424,8 @@ async def _ui_edit_runtime(ui, current) -> object:
         dry_run=dry_run,
         validate_account=validate_account,
         max_rate_calls_per_minute=max_rate,
+        recv_window_ms=recv_window_ms,
+        compute_backend=getattr(current, "compute_backend", "cpu"),
     )
 
 
@@ -740,6 +750,239 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
     return all(ok for ok, _label, _detail in checks), lines
 
 
+_COMPUTE_BACKEND_CHOICES = ("cpu", "cuda", "rocm", "auto")
+
+
+def _funds_summary(runtime) -> str:
+    return (
+        f"USDC available: {runtime.managed_usdc:.4f}  "
+        f"BTC available: {runtime.managed_btc:.8f}"
+    )
+
+
+def _apply_funds_change(action: str, amount: float) -> tuple[object, str]:
+    """Apply a Funds-menu mutation. Returns (new runtime, log message)."""
+    runtime = load_runtime()
+    if action == "deposit_usdc":
+        runtime.managed_usdc = max(0.0, float(runtime.managed_usdc) + abs(amount))
+        msg = f"Deposited {amount:.4f} USDC."
+    elif action == "withdraw_usdc":
+        avail = float(runtime.managed_usdc)
+        take = min(avail, abs(amount))
+        runtime.managed_usdc = max(0.0, avail - take)
+        msg = f"Withdrew {take:.4f} USDC (capped to available {avail:.4f})."
+    elif action == "deposit_btc":
+        runtime.managed_btc = max(0.0, float(runtime.managed_btc) + abs(amount))
+        msg = f"Deposited {amount:.8f} BTC."
+    elif action == "withdraw_btc":
+        avail = float(runtime.managed_btc)
+        take = min(avail, abs(amount))
+        runtime.managed_btc = max(0.0, avail - take)
+        msg = f"Withdrew {take:.8f} BTC (capped to available {avail:.8f})."
+    elif action == "reset":
+        runtime.managed_usdc = 1000.0
+        runtime.managed_btc = 0.0
+        msg = "Reset funds to 1000.000 USDC and 0.000 BTC."
+    else:  # pragma: no cover - guarded by menu options
+        return runtime, f"Unknown funds action {action!r}."
+    save_runtime(runtime)
+    return runtime, msg
+
+
+async def _ui_funds_menu(ui) -> int:
+    from .tui import FormField
+
+    while True:
+        runtime = load_runtime()
+        choice = await ui.menu(
+            "Funds — virtual BTCUSDC allocation",
+            [
+                ("deposit_usdc", "Deposit USDC"),
+                ("withdraw_usdc", "Withdraw USDC"),
+                ("deposit_btc", "Deposit BTC"),
+                ("withdraw_btc", "Withdraw BTC"),
+                ("reset", "Reset to 1000 USDC / 0 BTC"),
+                ("show", "Show current allocation"),
+                ("close", "Close"),
+            ],
+            help_text=(
+                f"Spot BTCUSDC only. {_funds_summary(runtime)}. "
+                "Trading consumes from this allocation; the testnet wallet is a hard ceiling."
+            ),
+        )
+        if choice in (None, "close"):
+            return 0
+        if choice == "show":
+            ui.append_log(_funds_summary(runtime))
+            continue
+        if choice == "reset":
+            confirmed = await ui.confirm("Reset allocation to 1000.0 USDC and 0.0 BTC?")
+            if not confirmed:
+                continue
+            _, msg = _apply_funds_change("reset", 0.0)
+            ui.append_log(msg)
+            continue
+        is_btc = choice.endswith("btc")
+        unit = "BTC" if is_btc else "USDC"
+        default_amount = "0.0001" if is_btc else "100"
+        payload = await ui.form(
+            f"{choice.replace('_', ' ').title()}",
+            [
+                FormField("amount", f"Amount in {unit}", default_amount),
+            ],
+        )
+        if payload is None:
+            continue
+        try:
+            amount = _parse_form_float(
+                payload["amount"],
+                label=f"Amount ({unit})",
+                default=0.0,
+                minimum=0.0,
+            )
+        except ValueError as exc:
+            ui.append_log(f"Funds change rejected: {exc}")
+            continue
+        if amount <= 0:
+            ui.append_log("Amount must be > 0.")
+            continue
+        _, msg = _apply_funds_change(choice, amount)
+        ui.append_log(msg)
+
+
+async def _ui_edit_execution(ui) -> int:
+    from .tui import FormField
+
+    cfg = load_strategy()
+    payload = await ui.form(
+        "Execution settings",
+        [
+            FormField(
+                "order_type",
+                "Order type [MARKET / LIMIT / LIMIT_MAKER]",
+                str(getattr(cfg, "order_type", "MARKET")),
+            ),
+            FormField(
+                "time_in_force",
+                "Time in force [GTC / IOC / FOK]",
+                str(getattr(cfg, "time_in_force", "GTC")),
+            ),
+            FormField(
+                "post_only",
+                "Post-only (LIMIT_MAKER) [yes/no]",
+                "yes" if getattr(cfg, "post_only", False) else "no",
+            ),
+            FormField(
+                "reduce_only_on_close",
+                "Reduce-only when closing [yes/no]",
+                "yes" if getattr(cfg, "reduce_only_on_close", True) else "no",
+            ),
+        ],
+    )
+    if payload is None:
+        ui.append_log("Execution settings cancelled.")
+        return 0
+    order_type = payload["order_type"].strip().upper() or "MARKET"
+    if order_type not in {"MARKET", "LIMIT", "LIMIT_MAKER"}:
+        ui.append_log(f"Unsupported order type {order_type!r}; keeping {cfg.order_type!r}.")
+        order_type = cfg.order_type
+    tif = payload["time_in_force"].strip().upper() or "GTC"
+    if tif not in {"GTC", "IOC", "FOK"}:
+        ui.append_log(f"Unsupported timeInForce {tif!r}; keeping {cfg.time_in_force!r}.")
+        tif = cfg.time_in_force
+    post_only = _parse_form_bool(payload["post_only"], getattr(cfg, "post_only", False))
+    reduce_only = _parse_form_bool(
+        payload["reduce_only_on_close"],
+        getattr(cfg, "reduce_only_on_close", True),
+    )
+    cfg.order_type = order_type
+    cfg.time_in_force = tif
+    cfg.post_only = post_only
+    cfg.reduce_only_on_close = reduce_only
+    save_strategy(cfg)
+    ui.append_log(
+        f"Saved execution: order_type={order_type} tif={tif} "
+        f"post_only={post_only} reduce_only_on_close={reduce_only}"
+    )
+    return 0
+
+
+async def _ui_edit_compute(ui) -> int:
+    from .compute import describe_backend, resolve_backend
+    from .tui import FormField
+
+    runtime = load_runtime()
+    current = getattr(runtime, "compute_backend", "cpu")
+    payload = await ui.form(
+        "Compute backend",
+        [
+            FormField(
+                "backend",
+                "Backend [cpu / cuda / rocm / auto]",
+                current,
+            ),
+        ],
+    )
+    if payload is None:
+        ui.append_log("Compute backend selection cancelled.")
+        return 0
+    requested = payload["backend"].strip().lower() or "cpu"
+    if requested not in _COMPUTE_BACKEND_CHOICES:
+        ui.append_log(f"Unknown backend {requested!r}; keeping {current!r}.")
+        return 2
+    info = await ui.run_blocking(resolve_backend, requested)
+    runtime.compute_backend = requested
+    save_runtime(runtime)
+    ui.append_log(
+        f"Saved compute_backend={requested}. Runtime status: {describe_backend(info)}"
+    )
+    return 0
+
+
+async def _ui_settings_menu(ui) -> int:
+    while True:
+        choice = await ui.menu(
+            "Settings",
+            [
+                ("runtime", "Runtime — credentials and connection"),
+                ("strategy", "Strategy — risk, thresholds, features"),
+                ("execution", "Execution — order type and routing"),
+                ("compute", "Compute backend — CPU / GPU / auto"),
+                ("close", "Close"),
+            ],
+            help_text="Centralized configuration. Up/Down to choose, Enter to open, Escape to close.",
+        )
+        if choice in (None, "close"):
+            return 0
+        if choice == "runtime":
+            current = load_runtime()
+            try:
+                next_runtime = await _ui_edit_runtime(ui, current)
+            except ValueError as exc:
+                ui.append_log(f"Runtime settings invalid: {exc}")
+                continue
+            save_runtime(next_runtime)
+            ui.append_log("Runtime settings saved.")
+            continue
+        if choice == "strategy":
+            try:
+                args = await _ui_edit_strategy_args(ui, load_strategy())
+            except ValueError as exc:
+                ui.append_log(f"Strategy settings invalid: {exc}")
+                continue
+            if args.set_features is None and args.leverage is None and getattr(args, "profile", "custom") == "custom":
+                ui.append_log("Strategy update cancelled.")
+                continue
+            await ui.run_blocking(command_strategy, args)
+            continue
+        if choice == "execution":
+            await _ui_edit_execution(ui)
+            continue
+        if choice == "compute":
+            await _ui_edit_compute(ui)
+            continue
+
+
 def _tui_actions():
     from .tui import FormField, TUIAction
     async def _overview(ui):
@@ -750,16 +993,58 @@ def _tui_actions():
         ui.append_log(
             "\n".join(
                 [
-                    "Operator help",
-                    "- Start with Runtime settings to enter API credentials securely.",
-                    "- Run Connect before any data, training, or live action.",
-                    "- Run Readiness check before Paper loop or Testnet loop.",
-                    "- The main screen shows actions, selected action details, live snapshot, and activity together.",
-                    "- Use Tab and Shift+Tab only inside modal forms.",
-                    "- Typical flow: Fetch candles -> Strategy settings -> Train model -> Evaluate -> Backtest -> Readiness check.",
-                    "- Use Paper loop before Testnet loop.",
-                    "- Spot roundtrip is the smallest authenticated execution check.",
-                    "- Keys: j/k move, enter runs the selected action, r refreshes the snapshot, q quits.",
+                    "Operator help — simple-ai-trading",
+                    "==================================",
+                    "",
+                    "Scope: BTCUSDC spot trading on the Binance testnet only.",
+                    "",
+                    "First-time setup",
+                    "----------------",
+                    "  1. Settings -> Runtime — paste your Binance testnet API key and secret.",
+                    "  2. Connect — pings the exchange and validates credentials.",
+                    "  3. Funds — set how much virtual USDC and BTC the strategy is allowed to use.",
+                    "  4. Readiness check — confirms safety flags, data, model, and connectivity.",
+                    "",
+                    "End-to-end paper run",
+                    "--------------------",
+                    "  1. Prepare system — fetches candles, trains, evaluates, backtests.",
+                    "  2. Paper loop — runs the strategy without placing real orders.",
+                    "  3. Operator report — prints dashboard, artifacts, and readiness summary.",
+                    "",
+                    "Manual pipeline (full control)",
+                    "------------------------------",
+                    "  Fetch candles -> Settings -> Strategy -> Train model -> Evaluate -> Backtest -> Tune strategy",
+                    "",
+                    "Authenticated testnet execution",
+                    "-------------------------------",
+                    "  * Always run Readiness check first.",
+                    "  * Spot roundtrip is the smallest signed test (BUY then SELL).",
+                    "  * Testnet loop runs the strategy with signed orders against the testnet.",
+                    "  * The strategy is capped by the Funds allocation, never the raw testnet wallet.",
+                    "",
+                    "Keyboard",
+                    "--------",
+                    "  Tab / Shift-Tab     change active panel (the active panel has a green border)",
+                    "  Up / Down           move within the active panel",
+                    "  Enter               run the selected command",
+                    "  r                   refresh the snapshot panel",
+                    "  <  >                shrink / grow the command list",
+                    "  -  +                shrink / grow the activity log",
+                    "  Ctrl-L              clear the activity log",
+                    "  q                   quit",
+                    "  Inside any modal: Tab cycles fields, Enter saves, Escape cancels.",
+                    "",
+                    "Centralized configuration",
+                    "-------------------------",
+                    "  Settings opens a hub with: Runtime, Strategy, Execution, Compute backend.",
+                    "  Funds is independent of trading — deposit / withdraw virtual USDC / BTC there.",
+                    "  Compute backend selects CPU (default), CUDA, ROCm, or auto-detect.",
+                    "",
+                    "Safety",
+                    "------",
+                    "  testnet=true is the default and required for signed live execution in this build.",
+                    "  Paper mode never places real orders, even when credentials are present.",
+                    "  Credentials are stored at ~/.config/simple_ai_bitcoin_trading_binance/runtime.json (mode 600).",
                 ]
             )
         )
@@ -1260,24 +1545,33 @@ def _tui_actions():
             ),
         )
 
+    async def _funds(ui):
+        return await _ui_funds_menu(ui)
+
+    async def _settings(ui):
+        return await _ui_settings_menu(ui)
+
     return [
-        TUIAction("1", "Overview", "Refresh runtime, strategy, artifact, and account context.", _overview),
-        TUIAction("2", "Help", "Show the recommended operator workflow and keyboard shortcuts.", _help),
-        TUIAction("3", "Runtime settings", "Enter credentials securely and configure the runtime target.", _runtime),
-        TUIAction("4", "Connect", "Validate exchange connectivity and the configured target.", _connect),
-        TUIAction("5", "Readiness check", "Preflight safety flags, data, model compatibility, and optional exchange connectivity.", _doctor),
-        TUIAction("6", "Prepare system", "Run fetch, train, evaluate, backtest, then readiness checks.", _prepare),
-        TUIAction("7", "Account", "Inspect authenticated balances and positions.", _account),
-        TUIAction("8", "Fetch candles", "Download fresh BTCUSDC market data into a dataset.", _fetch),
-        TUIAction("9", "Strategy settings", "Edit risk, model windows, training knobs, and active features.", _strategy),
-        TUIAction("10", "Train model", "Train or retrain the model with current strategy feature selection.", _train),
-        TUIAction("11", "Evaluate", "Inspect classification quality and threshold behavior.", _evaluate),
-        TUIAction("12", "Backtest", "Estimate trading behavior, fees, and drawdown on historical data.", _backtest),
-        TUIAction("13", "Tune strategy", "Search execution parameters across all data, a lookback, or a date range.", _tune),
-        TUIAction("14", "Paper loop", "Run the live loop in paper mode with retraining controls.", _paper),
-        TUIAction("15", "Testnet loop", "Run authenticated testnet execution from the console.", _live),
-        TUIAction("16", "Spot roundtrip", "Execute a minimal BUY and SELL roundtrip on spot testnet.", _roundtrip),
-        TUIAction("17", "Operator report", "Print dashboard, recent artifacts, and readiness checks.", _report),
+        TUIAction("1", "Overview", "Print the latest runtime, strategy, funds, model, and recent artifacts into the activity log.", _overview),
+        TUIAction("2", "Connect", "Ping the testnet exchange and validate that the configured credentials work.", _connect),
+        TUIAction("3", "Account", "Read authenticated balances and open positions from the exchange.", _account),
+        TUIAction("4", "Readiness check", "Verify safety flags, training data, model compatibility, and optionally exchange connectivity.", _doctor),
+        TUIAction("5", "Funds", "Manage the virtual USDC / BTC allocation that caps live trading. Independent of trading itself.", _funds),
+        TUIAction("6", "Fetch candles", "Download fresh BTCUSDC klines from the testnet into a local dataset.", _fetch),
+        TUIAction("7", "Train model", "Train or retrain the model on cached candles using the current strategy features.", _train),
+        TUIAction("8", "Evaluate", "Score the saved model against cached candles (classification metrics + thresholds).", _evaluate),
+        TUIAction("9", "Backtest", "Simulate trading on cached candles using the saved model; estimates PnL, fees, and drawdown.", _backtest),
+        TUIAction("10", "Tune strategy", "Grid search execution parameters across all data, a recent lookback, or a date range.", _tune),
+        TUIAction("11", "Prepare system", "One-shot pipeline: fetch candles, train, evaluate, backtest, then readiness checks.", _prepare),
+        TUIAction("12", "Paper loop", "Run the live loop in paper mode — no real orders; supports retraining controls.", _paper),
+        TUIAction("13", "Testnet loop", "Run authenticated testnet execution with real signed orders against the testnet exchange.", _live),
+        TUIAction("14", "Spot roundtrip", "Place a minimal BUY then SELL on spot testnet; smallest signed execution check.", _roundtrip),
+        TUIAction("15", "Operator report", "Print the dashboard, recent artifacts, readiness report, and optional account state.", _report),
+        # Backwards-compatible aliases for direct configuration shortcuts.
+        TUIAction("16", "Runtime settings", "Shortcut to the Runtime panel inside Settings (API keys, market, testnet, recvWindow).", _runtime),
+        TUIAction("17", "Strategy settings", "Shortcut to the Strategy panel inside Settings (risk, thresholds, model windows, features).", _strategy),
+        TUIAction("18", "Settings", "Centralized configuration: Runtime, Strategy, Execution, Compute backend.", _settings),
+        TUIAction("19", "Help", "Detailed help: workflow, keyboard shortcuts, safety notes, configuration tour.", _help),
     ]
 
 
