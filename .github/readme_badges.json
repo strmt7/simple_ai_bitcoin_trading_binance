@@ -1,0 +1,14 @@
+{
+  "host": "github.com",
+  "owner": "strmt7",
+  "repo": "simple_ai_bitcoin_trading_binance",
+  "branch_name": "main",
+  "remote_name": "origin",
+  "badges": [
+    {
+      "alt": "andrej-karpathy-skills",
+      "image": "https://img.shields.io/static/v1?label=&message=andrej-karpathy-skills&color=555&logo=github&logoColor=white",
+      "target": "https://github.com/forrestchang/andrej-karpathy-skills"
+    }
+  ]
+}
