@@ -259,3 +259,167 @@ def test_help_action_is_last_in_action_list() -> None:
     actions = _tui_actions()
     assert actions[-1].title == "Help"
     assert actions[-2].title == "Settings"
+
+
+def test_funds_action_invokes_funds_menu(isolated_home) -> None:
+    ui = _ScriptedUI(menu_choices=["close"])
+    result = asyncio.run(_action("Funds").run(ui))
+    assert result == 0
+    assert ui.menu_calls and ui.menu_calls[0][0].startswith("Funds")
+
+
+def test_settings_action_invokes_settings_menu(isolated_home) -> None:
+    ui = _ScriptedUI(menu_choices=["close"])
+    result = asyncio.run(_action("Settings").run(ui))
+    assert result == 0
+    assert ui.menu_calls and ui.menu_calls[0][0] == "Settings"
+
+
+def test_settings_menu_execution_form_cancellation(isolated_home) -> None:
+    ui = _ScriptedUI(menu_choices=["execution", "close"], forms=[None])
+    asyncio.run(_ui_settings_menu(ui))
+    assert any("Execution settings cancelled" in line for line in ui.logs)
+
+
+def test_settings_menu_compute_form_cancellation(isolated_home) -> None:
+    ui = _ScriptedUI(menu_choices=["compute", "close"], forms=[None])
+    asyncio.run(_ui_settings_menu(ui))
+    assert any("Compute backend selection cancelled" in line for line in ui.logs)
+
+
+def test_settings_menu_runtime_saves_when_form_valid(isolated_home) -> None:
+    ui = _ScriptedUI(
+        menu_choices=["runtime", "close"],
+        forms=[
+            {
+                "market_type": "spot",
+                "interval": "1h",
+                "testnet": "yes",
+                "api_key": "",
+                "api_secret": "",
+                "dry_run": "yes",
+                "validate_account": "no",
+                "max_rate_calls_per_minute": "200",
+                "recv_window_ms": "8000",
+            }
+        ],
+    )
+    asyncio.run(_ui_settings_menu(ui))
+    runtime = load_runtime()
+    assert runtime.interval == "1h"
+    assert runtime.recv_window_ms == 8000
+    assert any("Runtime settings saved" in line for line in ui.logs)
+
+
+def test_settings_menu_runtime_invalid_value_logs_error(isolated_home, monkeypatch) -> None:
+    """If _ui_edit_runtime raises ValueError the hub must log and continue."""
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    async def _exploder(_ui, _current):
+        raise ValueError("intentionally bad")
+
+    monkeypatch.setattr(cli_mod, "_ui_edit_runtime", _exploder)
+    ui = _ScriptedUI(menu_choices=["runtime", "close"])
+    asyncio.run(_ui_settings_menu(ui))
+    assert any("Runtime settings invalid" in line for line in ui.logs)
+
+
+def test_settings_menu_strategy_invalid_value_logs_error(isolated_home, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    async def _exploder(_ui, _current):
+        raise ValueError("strategy boom")
+
+    monkeypatch.setattr(cli_mod, "_ui_edit_strategy_args", _exploder)
+    ui = _ScriptedUI(menu_choices=["strategy", "close"])
+    asyncio.run(_ui_settings_menu(ui))
+    assert any("Strategy settings invalid" in line for line in ui.logs)
+
+
+def test_settings_menu_strategy_custom_no_change_is_cancelled(isolated_home, monkeypatch) -> None:
+    """When the strategy form returns the 'no change' sentinel, the hub logs cancellation."""
+    import argparse
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    async def _no_change(_ui, _current):
+        return argparse.Namespace(
+            profile="custom",
+            leverage=None,
+            risk=None,
+            max_position=None,
+            stop=None,
+            take=None,
+            cooldown=None,
+            max_open=None,
+            max_trades_per_day=None,
+            signal_threshold=None,
+            max_drawdown=None,
+            taker_fee_bps=None,
+            slippage_bps=None,
+            label_threshold=None,
+            model_lookback=None,
+            training_epochs=None,
+            confidence_beta=None,
+            feature_window_short=None,
+            feature_window_long=None,
+            set_features=None,
+            enable_feature=None,
+            disable_feature=None,
+        )
+
+    monkeypatch.setattr(cli_mod, "_ui_edit_strategy_args", _no_change)
+    ui = _ScriptedUI(menu_choices=["strategy", "close"])
+    asyncio.run(_ui_settings_menu(ui))
+    assert any("Strategy update cancelled" in line for line in ui.logs)
+
+
+def test_settings_menu_unknown_choice_loops_to_top(isolated_home) -> None:
+    """A choice that doesn't match any known sub-menu must fall through and re-prompt."""
+    ui = _ScriptedUI(menu_choices=["mystery", "close"])
+    asyncio.run(_ui_settings_menu(ui))
+    # The hub must have re-prompted — i.e. asked the menu twice.
+    assert len(ui.menu_calls) == 2
+
+
+def test_settings_menu_strategy_with_change_runs_command(isolated_home, monkeypatch) -> None:
+    """When the strategy form returns concrete values, command_strategy runs."""
+    import argparse
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    async def _changed(_ui, _current):
+        return argparse.Namespace(
+            profile="custom",
+            leverage=None,
+            risk=None,
+            max_position=None,
+            stop=None,
+            take=None,
+            cooldown=None,
+            max_open=None,
+            max_trades_per_day=None,
+            signal_threshold=None,
+            max_drawdown=None,
+            taker_fee_bps=None,
+            slippage_bps=None,
+            label_threshold=None,
+            model_lookback=None,
+            training_epochs=None,
+            confidence_beta=None,
+            feature_window_short=None,
+            feature_window_long=None,
+            set_features="momentum_1,rsi",
+            enable_feature=None,
+            disable_feature=None,
+        )
+
+    captured: list[argparse.Namespace] = []
+
+    def _fake_command_strategy(args):
+        captured.append(args)
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_ui_edit_strategy_args", _changed)
+    monkeypatch.setattr(cli_mod, "command_strategy", _fake_command_strategy)
+    ui = _ScriptedUI(menu_choices=["strategy", "close"])
+    asyncio.run(_ui_settings_menu(ui))
+    assert captured and captured[0].set_features == "momentum_1,rsi"

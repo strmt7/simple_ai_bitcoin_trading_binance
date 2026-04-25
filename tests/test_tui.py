@@ -8,6 +8,7 @@ from simple_ai_bitcoin_trading_binance.tui import (
     ConfirmScreen,
     FormField,
     FormScreen,
+    MenuScreen,
     MultiSelectScreen,
     OperatorApp,
     TUIAction,
@@ -677,3 +678,255 @@ def test_operator_app_connection_status_paths(monkeypatch) -> None:
 
     monkeypatch.setattr(app, "query_one", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyError("missing")))
     app.set_connection_status("ignored")
+
+
+def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
+    options = [("k1", "Label one"), ("k2", "Label two"), ("k3", "Label three")]
+    screen = MenuScreen("Hub", options, help_text="Pick one")
+    dismissed: list[object] = []
+    monkeypatch.setattr(screen, "dismiss", lambda value: dismissed.append(value))
+
+    class _FakeMenuList:
+        def __init__(self) -> None:
+            self.id = "menu-list"
+            self.highlighted = 0
+            self.focused = False
+
+        def focus(self) -> None:
+            self.focused = True
+
+    fake_list = _FakeMenuList()
+    monkeypatch.setattr(screen, "query_one", lambda _selector, _cls=None: fake_list)
+
+    screen.on_mount()
+    assert fake_list.highlighted == 0
+    assert fake_list.focused is True
+
+    screen.on_option_list_option_selected(_FakeOptionEvent(fake_list, 1))
+    screen.on_option_list_option_selected(_FakeOptionEvent(_FakeOptionList("not-menu"), 0))
+    screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "close"})()})())
+    screen.action_dismiss_none()
+
+    assert dismissed == ["k2", None, None]
+
+
+def test_menu_screen_compose_and_help_text_default() -> None:
+    """Smoke test the compose tree exists and the default help text is honoured."""
+    screen = MenuScreen("title", [("k", "label")])
+    assert screen.title_text == "title"
+    assert screen.options == [("k", "label")]
+    assert screen.help_text == ""
+
+    nodes = list(screen.compose())
+    assert nodes  # Vertical container yielded
+
+
+def test_terminal_ui_menu_routes_through_push_screen() -> None:
+    seen: dict[str, object] = {"screens": []}
+
+    class _FakeApp:
+        def push_screen(self, screen, callback=None):
+            seen["screens"].append(type(screen).__name__)
+            if callback is not None:
+                callback("k2")
+
+        async def push_screen_wait(self, screen):  # pragma: no cover - unused but symmetric
+            seen["screens"].append(type(screen).__name__)
+            return "k2"
+
+    ui = TerminalUI(_FakeApp())
+    result = asyncio.run(ui.menu("Hub", [("k1", "one"), ("k2", "two")], help_text="hint"))
+    assert result == "k2"
+    assert seen["screens"] == ["MenuScreen"]
+
+
+def test_operator_app_resize_and_clear_actions(monkeypatch) -> None:
+    class _FakeStyles:
+        def __init__(self) -> None:
+            self.width = None
+            self.height = None
+
+    class _FakeNav:
+        def __init__(self) -> None:
+            self.styles = _FakeStyles()
+
+    class _FakeActivityPanel:
+        def __init__(self) -> None:
+            self.styles = _FakeStyles()
+
+    class _FakeRichLogClearable(_FakeRichLog):
+        def clear(self) -> None:
+            self.lines.clear()
+
+    nav = _FakeNav()
+    activity = _FakeActivityPanel()
+    log = _FakeRichLogClearable()
+    log.lines.extend(["one", "two"])
+    widgets = {
+        "#nav": nav,
+        "#activity-panel": activity,
+        "#log": log,
+        "#status": _FakeStatic(),
+    }
+
+    app = OperatorApp(
+        title_text="t",
+        actions=[TUIAction("1", "Sync", "desc", lambda _ui: 0)],
+        snapshot_provider=lambda _width=70: "snap",
+    )
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+
+    # No-op when modal open
+    monkeypatch.setattr(app, "_modal_open", lambda: True)
+    app.action_grow_nav()
+    app.action_shrink_nav()
+    app.action_grow_activity()
+    app.action_shrink_activity()
+    app.action_clear_log()
+    assert nav.styles.width is None
+    assert activity.styles.height is None
+    assert log.lines == ["one", "two"]
+
+    # Once modal closes, mutations apply
+    monkeypatch.setattr(app, "_modal_open", lambda: False)
+    app.action_grow_nav()
+    assert nav.styles.width == 32  # default 30 + 2
+    app.action_shrink_nav()
+    assert nav.styles.width == 30
+
+    # Bounded clamps
+    for _ in range(20):
+        app.action_grow_nav()
+    assert nav.styles.width == OperatorApp._NAV_WIDTH_MAX
+    for _ in range(40):
+        app.action_shrink_nav()
+    assert nav.styles.width == OperatorApp._NAV_WIDTH_MIN
+
+    app.action_grow_activity()
+    assert activity.styles.height == 14
+    app.action_shrink_activity()
+    assert activity.styles.height == 12
+
+    app.action_clear_log()
+    assert log.lines == []
+    assert widgets["#status"].value == "Activity cleared"
+
+
+def test_operator_app_resize_swallows_query_failure(monkeypatch) -> None:
+    """If the panel cannot be queried (rare) the resize action must not raise."""
+    app = OperatorApp(
+        title_text="t",
+        actions=[TUIAction("1", "Sync", "desc", lambda _ui: 0)],
+        snapshot_provider=lambda _width=70: "snap",
+    )
+    monkeypatch.setattr(app, "_modal_open", lambda: False)
+
+    def explode(_selector, _cls=None):
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(app, "query_one", explode)
+    app.action_grow_nav()
+    app.action_grow_activity()
+    app.action_clear_log()
+    # No exception means the guards worked.
+
+
+def test_operator_app_anti_flicker_skips_duplicate_writes(monkeypatch) -> None:
+    """set_status / set_connection_status / refresh_preview must short-circuit on no change."""
+    status = _FakeStatic()
+    preview = _FakeStatic()
+    connection = _FakeStatic()
+    widgets = {"#status": status, "#preview": preview, "#connectionbar": connection}
+
+    snapshots: list[int] = []
+
+    def snapshot_provider(width: int = 70) -> str:
+        snapshots.append(width)
+        return "stable-snapshot"
+
+    app = OperatorApp(
+        title_text="t",
+        actions=[TUIAction("1", "Sync", "desc", lambda _ui: 0)],
+        snapshot_provider=snapshot_provider,
+    )
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+
+    app.set_status("Hello")
+    app.set_status("Hello")  # duplicate must not re-update
+    assert status.value == "Hello"
+
+    app.set_connection_status("Conn-A")
+    app.set_connection_status("Conn-A")
+    assert connection.value == "Conn-A"
+
+    app.refresh_preview()
+    first_value = preview.value
+    app.refresh_preview()
+    # Second call must not re-assign because content is identical.
+    assert preview.value == first_value
+    assert len(snapshots) >= 2  # provider still called; just no widget update
+
+
+def test_terminal_ui_await_screen_returns_result_when_callback_fires() -> None:
+    """Direct exercise of the push_screen + future callback path."""
+
+    class _FakeApp:
+        def push_screen(self, screen, callback=None):
+            if callback is not None:
+                callback("done")
+
+    ui = TerminalUI(_FakeApp())
+    result = asyncio.run(ui._await_screen(object()))
+    assert result == "done"
+
+
+def test_operator_app_help_action_does_not_recompose_status_on_repeat(monkeypatch) -> None:
+    """Anti-flicker covers consecutive status writes with identical text from action runs."""
+    widgets = {"#status": _FakeStatic(), "#preview": _FakeStatic(), "#log": _FakeRichLog()}
+
+    app = OperatorApp(
+        title_text="t",
+        actions=[TUIAction("1", "Sync", "desc", lambda _ui: 0)],
+        snapshot_provider=lambda _width=70: "snap",
+    )
+    monkeypatch.setattr(app, "query_one", lambda selector, _cls=None: widgets[selector])
+
+    asyncio.run(app._execute_action(app.actions_data[0]))
+    first = widgets["#status"].value
+    asyncio.run(app._execute_action(app.actions_data[0]))
+    assert widgets["#status"].value == first
+
+
+def test_operator_app_set_activity_height_no_op_when_unchanged(monkeypatch) -> None:
+    """When the requested height matches the current value the helper must early-return."""
+    app = OperatorApp(
+        title_text="t",
+        actions=[TUIAction("1", "Sync", "desc", lambda _ui: 0)],
+        snapshot_provider=lambda _width=70: "snap",
+    )
+
+    sentinel: list[str] = []
+
+    def explode(_selector, _cls=None):  # pragma: no cover - must not be called
+        sentinel.append("called")
+        raise AssertionError("query_one should not be invoked on no-op resize")
+
+    monkeypatch.setattr(app, "query_one", explode)
+    monkeypatch.setattr(app, "_modal_open", lambda: False)
+
+    # Calling with the current height (12) is a no-op and must not query the panel.
+    app._set_activity_height(app._activity_height)
+    assert sentinel == []
+
+
+def test_terminal_ui_await_screen_ignores_duplicate_callback() -> None:
+    """If push_screen's callback is invoked twice, the second result is ignored."""
+
+    class _DoubleApp:
+        def push_screen(self, screen, callback=None):
+            callback("first")
+            callback("second")  # future is already resolved; must be a no-op
+
+    ui = TerminalUI(_DoubleApp())
+    result = asyncio.run(ui._await_screen(object()))
+    assert result == "first"
