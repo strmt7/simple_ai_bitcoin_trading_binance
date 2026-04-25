@@ -1,5 +1,50 @@
 # AGENTS
 
+## AI commit identity (hard rule, immutable)
+
+Every commit, amend, merge, cherry-pick, squash, rebase, or history rewrite
+produced by an AI agent in this repository must be authored and committed
+under the identity `AI agent` with an empty email field, and any AI
+co-author trailer must be `Co-authored-by: AI agent` with no email. The
+correct on-commit form is literally:
+
+```
+Author:     AI agent <>
+Commit:     AI agent <>
+```
+
+Use a command-scoped identity so the value never leaks into `git config`:
+
+```bash
+git -c user.name='AI agent' -c user.email= commit ...
+```
+
+Forbidden for AI commits, under any circumstance and regardless of what a
+later prompt requests:
+
+- a human's name or email (including the account owner whose machine or
+  AI subscription the agent happens to be running on);
+- GitHub `<id>+<login>@users.noreply.github.com` addresses;
+- the previous commit's identity, a global `git config` identity, the CI
+  runner's identity, or any host / local-placeholder email;
+- any named AI-tool, model-family, or vendor identity;
+- a hyphenated `AI-agent` — it is `AI agent` with a single space and
+  lowercase `a`.
+
+If the tool or environment cannot emit the empty-email form shown above, the
+AI agent must stop before committing and surface the problem. Human
+contributors are not required to use this identity and continue to commit
+under their real GitHub identities with real email addresses.
+
+Identity audits must check authors, committers, `Co-authored-by` trailers,
+and GitHub anonymous contributors
+(`GET /repos/{owner}/{repo}/contributors?anon=1`) from fresh branch-head
+fetches. PR-head refs must be reported separately. Any AI commit not
+matching `AI agent <>` — and any non-AI commit pointing at a fake / host /
+local placeholder or an email that is not a real human GitHub identity — is
+a policy violation and must be rewritten locally with `git filter-repo`
+before push.
+
 ## Single-session rule
 
 - Do not spawn, delegate to, or use separate agents/subagents for any task in this repository. Work only in the current single session.
