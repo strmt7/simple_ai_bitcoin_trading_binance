@@ -1,5 +1,36 @@
 # AGENTS
 
+## Pinned Karpathy agent baseline
+
+Adapted from
+<https://github.com/forrestchang/andrej-karpathy-skills> at
+`2c606141936f1eeef17fa3043a72095b4765b9c2`.
+Apply this agent-neutral baseline before the repo-specific rules below, but do
+not weaken stricter repository rules such as the single-session rule, commit
+identity, secret hygiene, conservative trading defaults, or required
+verification.
+
+- Think before coding: state assumptions, surface ambiguity and tradeoffs, and
+  ask when uncertainty would otherwise become a guess.
+- Simplicity first: solve the requested problem with the minimum maintainable
+  code; avoid speculative features, abstractions, configurability, or new
+  defensive branches that repo contracts prove unnecessary.
+- Compact and efficient code matters, not just lower token usage. Prefer
+  shorter, clearer implementations that preserve behavior; do not trade away
+  correctness, security, testnet safety, or measured evidence for fewer lines.
+- Surgical changes: touch only what the task requires and preserve local
+  contracts. Match existing style only when it is already clear, efficient,
+  and consistent; otherwise improve style only where the task gives evidence
+  and scope to do so. Clean up only orphans created by your change and mention
+  unrelated debt instead of editing it.
+- Goal-driven execution: turn work into verifiable success criteria, reproduce
+  bugs with a test or concrete failing check when practical, loop until the
+  relevant checks pass, and report the exact verification performed.
+- Treat upstream `EXAMPLES.md` as optional rationale for maintaining this
+  baseline only. Do not load it by default, import it wholesale, or let its
+  generic examples override this repo's trading, safety, testing, or
+  single-session rules.
+
 ## AI commit identity (hard rule, immutable)
 
 Every commit, amend, merge, cherry-pick, squash, rebase, or history rewrite
@@ -107,4 +138,3 @@ Do not expand to broad directory scans on first pass. Open more files only when 
 
 - code changes are covered by unit tests and at least one validation run relevant to behavior.
 - docs/tests/CI reflect any changed assumptions.
-

@@ -1,5 +1,7 @@
 # simple_ai_bitcoin_trading_binance
 
+[![andrej-karpathy-skills](https://img.shields.io/static/v1?label=&message=andrej-karpathy-skills&color=555&logo=github&logoColor=white)](https://github.com/forrestchang/andrej-karpathy-skills)
+
 > **Early alpha test software.** This project is experimental and incomplete. Many or most features, workflows, trading assumptions, integrations, outputs, and safeguards may not work correctly or as intended. Use it only for testing and review, preferably on Binance testnet with paper/dry-run behavior. The project authors and contributors take no responsibility for losses, incorrect behavior, missed trades, API issues, data errors, or any other consequences from using this software.
 
 Interactive BTCUSDC testnet trading console for Binance.
