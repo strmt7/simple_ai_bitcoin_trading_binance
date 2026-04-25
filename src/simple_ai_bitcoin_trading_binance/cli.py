@@ -275,6 +275,61 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--disable-feature", action="append", default=None, help="disable a feature by name")
     parser_strategy.set_defaults(func=command_strategy)
 
+    parser_shell = subparsers.add_parser("shell", help="launch the Claude-Code-inspired interactive shell")
+    parser_shell.set_defaults(func=command_shell)
+
+    parser_objectives = subparsers.add_parser("objectives", help="list registered training objectives")
+    parser_objectives.set_defaults(func=command_objectives)
+
+    parser_train_suite = subparsers.add_parser(
+        "train-suite", help="train one advanced model per objective (Conservative/Default/Risky)",
+    )
+    parser_train_suite.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_train_suite.add_argument("--output-dir", default="data")
+    parser_train_suite.add_argument("--starting-cash", type=float, default=1000.0)
+    parser_train_suite.add_argument(
+        "--objective", action="append", default=None,
+        help="restrict suite to named objective(s); repeat to list multiple.",
+    )
+    parser_train_suite.set_defaults(func=command_train_suite)
+
+    parser_backtest_panel = subparsers.add_parser(
+        "backtest-panel", help="run a user-parameterized backtest and save a tagged report",
+    )
+    parser_backtest_panel.add_argument("--interval", required=True)
+    parser_backtest_panel.add_argument("--market", default=None, help="override runtime market type")
+    parser_backtest_panel.add_argument("--from-date", default=None)
+    parser_backtest_panel.add_argument("--to-date", default=None)
+    parser_backtest_panel.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_backtest_panel.add_argument("--model", default=None)
+    parser_backtest_panel.add_argument("--objective", default=None)
+    parser_backtest_panel.add_argument("--tag", default="")
+    parser_backtest_panel.add_argument("--notes", default="")
+    parser_backtest_panel.add_argument("--starting-cash", type=float, default=1000.0)
+    parser_backtest_panel.set_defaults(func=command_backtest_panel)
+
+    parser_autonomous = subparsers.add_parser(
+        "autonomous", help="control the autonomous testnet loop (start/pause/resume/stop/status)",
+    )
+    parser_autonomous.add_argument(
+        "action", choices=["start", "pause", "resume", "stop", "status"],
+        help="autonomous action to perform",
+    )
+    parser_autonomous.add_argument("--objective", default="default")
+    parser_autonomous.set_defaults(func=command_autonomous)
+
+    parser_positions = subparsers.add_parser(
+        "positions", help="list autonomous open positions and P&L stats",
+    )
+    parser_positions.add_argument("--stats", action="store_true", help="also print realized + unrealized stats")
+    parser_positions.set_defaults(func=command_positions)
+
+    parser_close = subparsers.add_parser(
+        "close", help="close an autonomous position locally (ledger only, no exchange order)",
+    )
+    parser_close.add_argument("position_id", help="position id or 'all'")
+    parser_close.set_defaults(func=command_close)
+
     return parser.parse_args(argv)
 
 
@@ -3226,6 +3281,181 @@ def command_live(args: argparse.Namespace) -> int:
         print(f"max_drawdown observed: {max_drawdown_seen:.2%}")
     print(f"finished loop market={runtime.market_type} cash={cash:.2f}")
     return exit_code
+
+
+def command_shell(_: argparse.Namespace) -> int:
+    from .shell import run_shell
+
+    return int(run_shell([]))
+
+
+def command_objectives(_: argparse.Namespace) -> int:
+    from .objective import describe_objectives
+
+    entries = describe_objectives()
+    print(f"{'name':<14} {'label':<14} summary")
+    for entry in entries:
+        print(f"{entry['name']:<14} {entry['label']:<14} {entry['summary']}")
+    return 0
+
+
+def command_train_suite(args: argparse.Namespace) -> int:
+    from .api import Candle
+    from .objective import available_objectives
+    from .training_suite import run_training_suite
+
+    runtime = load_runtime()
+    strategy = load_strategy()
+    try:
+        raw = _load_json_candles(args.input)
+    except (OSError, ValueError) as err:
+        print(f"failed to load candles from {args.input}: {err}", file=sys.stderr)
+        return 2
+    candles = []
+    for entry in raw:
+        try:
+            candles.append(Candle(
+                open_time=int(entry["open_time"]),
+                open=float(entry["open"]),
+                high=float(entry["high"]),
+                low=float(entry["low"]),
+                close=float(entry["close"]),
+                volume=float(entry.get("volume", 0.0)),
+                close_time=int(entry["close_time"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    objectives = tuple(args.objective) if args.objective else available_objectives()
+    report = run_training_suite(
+        candles,
+        strategy,
+        objectives=objectives,
+        market_type=runtime.market_type,
+        starting_cash=args.starting_cash,
+        output_dir=Path(args.output_dir),
+    )
+    print(f"training suite complete: {len(report.outcomes)} objective(s)")
+    for outcome in report.outcomes:
+        print(
+            f"  {outcome.objective:<14} score={outcome.best_score:+.4f} "
+            f"model={outcome.model_path}"
+        )
+    print(f"summary -> {report.summary_path}")
+    return 0
+
+
+def command_backtest_panel(args: argparse.Namespace) -> int:
+    from .backtest_panel import BacktestRequest, parse_date_ms, run_panel
+
+    runtime = load_runtime()
+    strategy = load_strategy()
+    market = args.market or runtime.market_type
+    try:
+        request = BacktestRequest(
+            interval=args.interval,
+            market_type=market,
+            start_ms=parse_date_ms(args.from_date),
+            end_ms=parse_date_ms(args.to_date, end_of_day=True),
+            model_path=args.model,
+            data_path=args.input,
+            starting_cash=args.starting_cash,
+            objective=args.objective,
+            tag=args.tag,
+            notes=args.notes,
+        )
+        report = run_panel(request, strategy)
+    except ValueError as err:
+        print(f"backtest-panel: {err}", file=sys.stderr)
+        return 2
+    print(f"backtest report -> data/backtests/{report.filename}")
+    print(
+        f"  trades={report.result.closed_trades} "
+        f"realized_pnl={report.result.realized_pnl:+.2f} "
+        f"max_dd={report.result.max_drawdown:.2%}"
+    )
+    if report.objective_score is not None:
+        print(f"  objective={args.objective} score={report.objective_score:+.4f}")
+    return 0
+
+
+def command_autonomous(args: argparse.Namespace) -> int:
+    from .autonomous import (
+        STATE_PAUSED,
+        STATE_RUNNING,
+        STATE_STOPPING,
+        AutonomousControl,
+    )
+    from .objective import available_objectives
+
+    control = AutonomousControl()
+    action = args.action
+    if action == "start":
+        if args.objective not in available_objectives():
+            print(f"unknown objective {args.objective!r}", file=sys.stderr)
+            return 2
+        control.write(STATE_RUNNING, note=f"CLI start objective={args.objective}")
+        print(f"autonomous: RUNNING (objective={args.objective})")
+        return 0
+    if action == "pause":
+        control.write(STATE_PAUSED, note="CLI pause")
+        print("autonomous: PAUSED")
+        return 0
+    if action == "resume":
+        control.write(STATE_RUNNING, note="CLI resume")
+        print("autonomous: RUNNING")
+        return 0
+    if action == "stop":
+        control.write(STATE_STOPPING, note="CLI stop")
+        print("autonomous: STOPPING")
+        return 0
+    # status
+    payload = control.read()
+    print(
+        f"state={payload.get('state')} note={payload.get('note') or ''} "
+        f"ts_ms={payload.get('ts_ms')}"
+    )
+    return 0
+
+
+def command_positions(args: argparse.Namespace) -> int:
+    from .positions import (
+        PositionsStore,
+        compute_stats,
+        render_positions_table,
+        render_stats_lines,
+    )
+
+    store = PositionsStore()
+    opens = store.load_open()
+    if not opens:
+        print("(no open positions)")
+    else:
+        for row in render_positions_table(opens, mark_price=None):
+            print(row)
+    if args.stats:
+        stats = compute_stats(store, mark_price=None)
+        print("")
+        for line in render_stats_lines(stats):
+            print(line)
+    return 0
+
+
+def command_close(args: argparse.Namespace) -> int:
+    from .positions import PositionsStore
+
+    store = PositionsStore()
+    target = args.position_id
+    if target.lower() == "all":
+        opens = store.load_open()
+        for position in opens:
+            store.remove_open(position.id)
+        print(f"closed {len(opens)} positions (local ledger only)")
+        return 0
+    if store.remove_open(target):
+        print(f"closed {target} (local ledger only)")
+        return 0
+    print(f"no open position with id {target!r}", file=sys.stderr)
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
