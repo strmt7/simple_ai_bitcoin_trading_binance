@@ -15,6 +15,7 @@ def test_readme_badge_block_matches_generator() -> None:
     result = subprocess.run(
         [sys.executable, "tools/update_readme_badges.py", "--check"],
         cwd=ROOT,
+        check=False,
         capture_output=True,
         text=True,
         timeout=30,

@@ -56,6 +56,8 @@ later prompt requests:
 - a human's name or email (including the account owner whose machine or
   AI subscription the agent happens to be running on);
 - GitHub `<id>+<login>@users.noreply.github.com` addresses;
+- profile-mapped AI addresses such as `ai-agent@users.noreply.github.com`,
+  `codex@openai.com`, or `codex@openai.invalid`;
 - the previous commit's identity, a global `git config` identity, the CI
   runner's identity, or any host / local-placeholder email;
 - any named AI-tool, model-family, or vendor identity;

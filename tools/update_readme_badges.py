@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -113,9 +114,18 @@ def load_metadata(repo_root: Path) -> BadgeMetadata:
     return BadgeMetadata(repo=repo_metadata, badges=_load_badges(normalized_payload))
 
 
+def _git_executable() -> str:
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        raise RuntimeError(
+            "git executable is required to resolve README badge metadata."
+        )
+    return git_bin
+
+
 def _run_git(repo_root: Path, *args: str) -> str:
     completed = subprocess.run(
-        ["git", "-c", f"safe.directory={repo_root.resolve()}", *args],
+        [_git_executable(), "-c", f"safe.directory={repo_root.resolve()}", *args],
         cwd=repo_root,
         check=True,
         capture_output=True,
@@ -148,7 +158,7 @@ def _resolve_remote_name(repo_root: Path) -> str:
     if configured_remote:
         return configured_remote
 
-    remotes = [remote for remote in _run_git(repo_root, "remote").splitlines()]
+    remotes = _run_git(repo_root, "remote").splitlines()
     if "origin" in remotes:
         return "origin"
     if len(remotes) == 1 and remotes[0]:
