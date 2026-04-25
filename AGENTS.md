@@ -107,3 +107,4 @@ Do not expand to broad directory scans on first pass. Open more files only when 
 
 - code changes are covered by unit tests and at least one validation run relevant to behavior.
 - docs/tests/CI reflect any changed assumptions.
+
