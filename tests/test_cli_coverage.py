@@ -510,7 +510,7 @@ def test_roundtrip_helpers_cover_balances_and_sizing() -> None:
 
     quantity, parsed, notional = cli._roundtrip_quantity(_Client(), "BTCUSDC", 0.00001, 76000.0)
     assert parsed == constraints
-    assert quantity >= 0.00006
+    assert quantity >= 0.00008
     assert notional >= 5.0
     assert cli._roundtrip_second_quantity(_Client(), "BTCUSDC", "SELL", 0.0002, {"balances": [{"asset": "BTC", "free": "0.0001"}]}, 76000.0) == 0.0001
     assert cli._roundtrip_second_quantity(_Client(), "BTCUSDC", "BUY", 0.0002, {"balances": [{"asset": "USDC", "free": "5"}]}, 76000.0) > 0

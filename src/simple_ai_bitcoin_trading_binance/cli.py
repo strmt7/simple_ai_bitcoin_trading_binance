@@ -2070,7 +2070,7 @@ def _roundtrip_quantity(client, symbol: str, requested: float, price: float) -> 
     min_notional = float(constraints.min_notional)
     if min_notional > 0.0 and quantity * price < min_notional:
         step = max(0.0, _safe_float(getattr(constraints, "step_size", 0.0)))
-        target = (min_notional / price) + step
+        target = (min_notional / price) + (2.0 * step)
         quantity, constraints = client.normalize_quantity(symbol, max(target, float(constraints.min_qty)))
     notional = quantity * price
     if quantity <= 0.0:
