@@ -441,6 +441,19 @@ def test_readiness_report_and_command_doctor(tmp_path, monkeypatch, capsys) -> N
     assert "Readiness report" in output
     assert "[ok] exchange connectivity" in output
 
+    monkeypatch.setattr(
+        cli,
+        "_load_runtime_model",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            feature_dim=3,
+            quality_score=0.30,
+            quality_warnings=["weak validation"],
+        ),
+    )
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+    assert ok is False
+    assert any("[fix] model quality" in line and "weak validation" in line for line in lines)
+
     monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(ModelLoadError("bad model")))
     ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
     assert ok is False

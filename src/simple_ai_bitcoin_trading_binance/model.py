@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from statistics import mean, pstdev
 from typing import Iterable, List, Tuple
 
@@ -44,6 +44,11 @@ class TrainedModel:
     calibration_size: int = 0
     validation_size: int = 0
     training_cutoff_timestamp: int | None = None
+    best_epoch: int | None = None
+    training_loss: float | None = None
+    validation_loss: float | None = None
+    quality_score: float | None = None
+    quality_warnings: List[str] = field(default_factory=list)
 
     def _normalize(self, features: Tuple[float, ...]) -> Tuple[float, ...]:
         if len(features) != self.feature_dim:
@@ -99,6 +104,37 @@ class ClassificationReport:
 
 
 @dataclass(frozen=True)
+class ProbabilityStats:
+    minimum: float
+    maximum: float
+    mean: float
+    std: float
+
+    def asdict(self) -> dict[str, float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ModelQualityReport:
+    quality_score: float
+    status: str
+    warnings: List[str]
+    train_accuracy: float
+    validation_accuracy: float
+    validation_f1: float
+    validation_majority_baseline: float
+    train_validation_gap: float
+    validation_rows: int
+    validation_positive_rate: float
+    probability_stats: ProbabilityStats
+
+    def asdict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["probability_stats"] = self.probability_stats.asdict()
+        return payload
+
+
+@dataclass(frozen=True)
 class TemporalValidationSplit:
     train_rows: List[ModelRow]
     calibration_rows: List[ModelRow]
@@ -109,6 +145,58 @@ def _safe_division(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 0.0
     return numerator / denominator
+
+
+def validate_model_rows(
+    rows: List[ModelRow],
+    *,
+    label: str = "training rows",
+    expected_feature_dim: int | None = None,
+) -> int:
+    """Validate feature rows before fitting or scoring.
+
+    The training code intentionally accepts light duck-typed row objects in
+    tests and integrations, so this guard focuses on the contract actually used
+    by the model: fixed finite feature vectors plus binary labels.
+    """
+
+    if not rows:
+        raise ValueError(f"No {label} available")
+    try:
+        feature_dim = len(rows[0].features)
+    except (AttributeError, TypeError):
+        raise ValueError(f"{label} row 0 is missing features") from None
+    if feature_dim == 0:
+        raise ValueError("Rows must contain at least one feature")
+    if expected_feature_dim is not None and feature_dim != expected_feature_dim:
+        raise ValueError(
+            f"{label} feature dimension mismatch: row 0 has {feature_dim}, expected {expected_feature_dim}"
+        )
+
+    for index, row in enumerate(rows):
+        try:
+            features = tuple(row.features)
+        except (AttributeError, TypeError):
+            raise ValueError(f"{label} row {index} is missing features") from None
+        if len(features) != feature_dim:
+            raise ValueError(
+                f"{label} row {index} feature dimension mismatch: "
+                f"got {len(features)}, expected {feature_dim}"
+            )
+        for value_index, value in enumerate(features):
+            try:
+                feature_value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{label} row {index} feature {value_index} is not numeric") from None
+            if not math.isfinite(feature_value):
+                raise ValueError(f"{label} row {index} feature {value_index} is not finite")
+        try:
+            row_label = int(row.label)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError(f"{label} row {index} label is not binary") from None
+        if row_label not in {0, 1}:
+            raise ValueError(f"{label} row {index} label is not binary")
+    return feature_dim
 
 
 def _normalize_rows(rows: List[ModelRow], means: List[float], stds: List[float]) -> List[Tuple[float, ...]]:
@@ -153,6 +241,120 @@ def _confusion(rows: List[ModelRow], model: TrainedModel, threshold: float) -> t
         else:
             fn += 1
     return tp, fp, tn, fn
+
+
+def _log_loss(
+    rows: List[ModelRow],
+    weights: List[float],
+    bias: float,
+    means: List[float],
+    stds: List[float],
+) -> float:
+    if not rows:
+        return 0.0
+    total = 0.0
+    for row in rows:
+        score = bias
+        for weight, value, mean_, std_ in zip(weights, row.features, means, stds):
+            normalized = (value - mean_) / std_ if std_ != 0 else (value - mean_)
+            score += weight * normalized
+        probability = _clamp(_sigmoid(score), 1e-12, 1.0 - 1e-12)
+        if int(row.label) == 1:
+            total -= math.log(probability)
+        else:
+            total -= math.log(1.0 - probability)
+    return total / len(rows)
+
+
+def _positive_rate(rows: List[ModelRow]) -> float:
+    if not rows:
+        return 0.0
+    return sum(1 for row in rows if int(row.label) == 1) / len(rows)
+
+
+def _probability_stats(rows: List[ModelRow], model: TrainedModel) -> ProbabilityStats:
+    if not rows:
+        return ProbabilityStats(0.0, 0.0, 0.0, 0.0)
+    probabilities = [model.predict_proba(row.features) for row in rows]
+    return ProbabilityStats(
+        minimum=min(probabilities),
+        maximum=max(probabilities),
+        mean=mean(probabilities),
+        std=pstdev(probabilities) if len(probabilities) > 1 else 0.0,
+    )
+
+
+def _majority_baseline(rows: List[ModelRow]) -> float:
+    if not rows:
+        return 0.0
+    positives = sum(1 for row in rows if int(row.label) == 1)
+    negatives = len(rows) - positives
+    return max(positives, negatives) / len(rows)
+
+
+def build_model_quality_report(
+    train_rows: List[ModelRow],
+    validation_rows: List[ModelRow],
+    model: TrainedModel,
+    threshold: float,
+) -> ModelQualityReport:
+    """Summarize whether a fitted model is credible enough for operator review."""
+
+    if train_rows:
+        validate_model_rows(train_rows, label="quality train rows", expected_feature_dim=model.feature_dim)
+    if validation_rows:
+        validate_model_rows(validation_rows, label="quality validation rows", expected_feature_dim=model.feature_dim)
+
+    train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
+    validation_report = evaluate_classification(validation_rows, model, threshold=threshold)
+    baseline = _majority_baseline(validation_rows)
+    probability_stats = _probability_stats(validation_rows, model)
+    validation_positive_rate = _positive_rate(validation_rows)
+    train_accuracy = float(train_report.accuracy) if train_report is not None else 0.0
+    validation_accuracy = float(validation_report.accuracy)
+    gap = max(0.0, train_accuracy - validation_accuracy)
+    warnings: List[str] = []
+    penalty = 0.0
+
+    if len(validation_rows) < 20:
+        warnings.append("validation sample has fewer than 20 rows")
+        penalty += 0.20
+    if validation_rows and validation_positive_rate in {0.0, 1.0}:
+        warnings.append("validation labels contain only one class")
+        penalty += 0.20
+    if validation_rows and validation_accuracy + 0.02 < baseline:
+        warnings.append("validation accuracy is below majority-class baseline")
+        penalty += 0.25
+    if gap > 0.25:
+        warnings.append("train/validation accuracy gap suggests overfitting")
+        penalty += min(0.25, gap - 0.25)
+    if validation_rows and probability_stats.std < 0.01:
+        warnings.append("validation probabilities are nearly constant")
+        penalty += 0.15
+    if validation_rows and validation_report.f1 == 0.0 and 0.0 < validation_positive_rate < 1.0:
+        warnings.append("validation F1 is zero despite mixed labels")
+        penalty += 0.20
+
+    quality_score = _clamp(1.0 - penalty, 0.0, 1.0)
+    if quality_score >= 0.75 and not warnings:
+        status = "ok"
+    elif quality_score >= 0.45:
+        status = "warn"
+    else:
+        status = "fail"
+    return ModelQualityReport(
+        quality_score=quality_score,
+        status=status,
+        warnings=warnings,
+        train_accuracy=train_accuracy,
+        validation_accuracy=validation_accuracy,
+        validation_f1=float(validation_report.f1),
+        validation_majority_baseline=float(baseline),
+        train_validation_gap=float(gap),
+        validation_rows=len(validation_rows),
+        validation_positive_rate=float(validation_positive_rate),
+        probability_stats=probability_stats,
+    )
 
 
 def confidence_adjusted_probability(probability: float, beta: float | None) -> float:
@@ -242,12 +444,18 @@ def calibrate_threshold(rows: List[ModelRow], model: TrainedModel, *, start: flo
 
 def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.05,
           seed: int = 7, l2_penalty: float = 1e-4,
-          feature_signature: str | None = None) -> TrainedModel:
-    if not rows:
-        raise ValueError("No training rows available")
-    feature_dim = len(rows[0].features)
-    if feature_dim == 0:
-        raise ValueError("Rows must contain at least one feature")
+          feature_signature: str | None = None,
+          validation_rows: List[ModelRow] | None = None,
+          early_stopping_rounds: int | None = None,
+          min_delta: float = 1e-6) -> TrainedModel:
+    feature_dim = validate_model_rows(rows)
+    validation_rows = list(validation_rows or [])
+    if validation_rows:
+        validate_model_rows(
+            validation_rows,
+            label="validation rows",
+            expected_feature_dim=feature_dim,
+        )
 
     means, stds = _collect_feature_stats(rows)
     normalized = _normalize_rows(rows, means, stds)
@@ -261,7 +469,14 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
         class_weight_neg = 1.0
 
     indices = list(range(len(rows)))
-    for _ in range(epochs):
+    best_weights = list(weights)
+    best_bias = bias
+    best_epoch: int | None = None
+    best_validation_loss = float("inf")
+    rounds_without_improvement = 0
+    patience = int(early_stopping_rounds or 0)
+
+    for epoch_index in range(1, int(epochs) + 1):
         rng.shuffle(indices)
         for idx in indices:
             row = rows[idx]
@@ -276,6 +491,25 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
                 grad = error * xi + l2_penalty * weights[i]
                 weights[i] -= learning_rate * grad
             bias -= learning_rate * error
+        if validation_rows:
+            current_loss = _log_loss(validation_rows, weights, bias, means, stds)
+            if current_loss < best_validation_loss - float(min_delta):
+                best_validation_loss = current_loss
+                best_weights = list(weights)
+                best_bias = bias
+                best_epoch = epoch_index
+                rounds_without_improvement = 0
+            else:
+                rounds_without_improvement += 1
+                if patience > 0 and rounds_without_improvement >= patience:
+                    break
+
+    if validation_rows and best_epoch is not None:
+        weights = best_weights
+        bias = best_bias
+
+    training_loss = _log_loss(rows, weights, bias, means, stds)
+    validation_loss = _log_loss(validation_rows, weights, bias, means, stds) if validation_rows else None
 
     return TrainedModel(
         weights=weights,
@@ -290,6 +524,9 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
         seed=int(seed),
         class_weight_pos=float(class_weight_pos),
         class_weight_neg=float(class_weight_neg),
+        best_epoch=best_epoch,
+        training_loss=float(training_loss),
+        validation_loss=float(validation_loss) if validation_loss is not None else None,
     )
 
 
@@ -477,4 +714,29 @@ def load_model(
             if payload.get("training_cutoff_timestamp") is not None
             else None
         ),
+        best_epoch=(
+            int(payload["best_epoch"])
+            if payload.get("best_epoch") is not None
+            else None
+        ),
+        training_loss=(
+            float(payload["training_loss"])
+            if payload.get("training_loss") is not None
+            else None
+        ),
+        validation_loss=(
+            float(payload["validation_loss"])
+            if payload.get("validation_loss") is not None
+            else None
+        ),
+        quality_score=(
+            float(payload["quality_score"])
+            if payload.get("quality_score") is not None
+            else None
+        ),
+        quality_warnings=[
+            str(value)
+            for value in payload.get("quality_warnings", [])
+            if isinstance(value, str)
+        ],
     )

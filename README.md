@@ -223,6 +223,7 @@ The console supports:
 - `live --model PATH` loads that model before the loop; paper runs can regenerate a missing or incompatible model from current rows, but authenticated live runs fail fast instead
 - `live --sleep 0` is preserved as a real zero-delay loop for scripted paper/test runs; authenticated `--live` mode clamps this to a one-second minimum
 - `spot-roundtrip --mode auto --yes` performs the smallest signed spot testnet/demo exchange check from the CLI; it uses BUY then SELL when USDC is available, or SELL then BUY when only test BTC is available
+- training stores early-stopping loss metadata and a model-quality report; `doctor`, `train`, and `evaluate` surface weak validation, overfit, class-balance, and probability-collapse warnings
 - authenticated live runs inspect exchange account state before the loop; futures positions are resumed, while spot BTC is resumed only up to the explicit managed BTC allocation
 - configured `recvWindow` is used for signed Binance requests, and startup credential validation calls an authenticated account endpoint when keys are present
 - futures close and emergency-close orders use reduce-only market orders with result responses requested, so a close path cannot intentionally increase exposure

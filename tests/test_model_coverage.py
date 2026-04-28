@@ -9,10 +9,15 @@ from simple_ai_bitcoin_trading_binance.features import make_rows, make_rows_lega
 from simple_ai_bitcoin_trading_binance.features import _rsi as rsi_fn, _true_range
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
+    build_model_quality_report,
     evaluate,
     evaluate_classification,
     _collect_feature_stats,
+    _log_loss,
+    _majority_baseline,
     _normalize_rows,
+    _positive_rate,
+    _probability_stats,
     _sigmoid,
     _f1,
     _confusion,
@@ -22,6 +27,7 @@ from simple_ai_bitcoin_trading_binance.model import (
     evaluate_confusion,
     ModelLoadError,
     load_model,
+    validate_model_rows,
     walk_forward_report,
 )
 from simple_ai_bitcoin_trading_binance.api import Candle
@@ -53,6 +59,79 @@ def test_collect_feature_stats_and_normalize_rows() -> None:
 
     with pytest.raises(ValueError, match="No rows to collect statistics"):
         _collect_feature_stats([])
+
+
+def test_validate_model_rows_rejects_malformed_inputs() -> None:
+    good = [SimpleNamespace(features=(1.0,), label=1)]
+    assert validate_model_rows(good) == 1
+
+    bad_cases = [
+        ([SimpleNamespace(label=1)], "missing features"),
+        ([SimpleNamespace(features=(), label=1)], "at least one feature"),
+        ([SimpleNamespace(features=(1.0,), label=1)], "dimension mismatch"),
+        ([SimpleNamespace(features=(1.0,), label=1), SimpleNamespace(label=0)], "missing features"),
+        (
+            [SimpleNamespace(features=(1.0,), label=1), SimpleNamespace(features=(1.0, 2.0), label=0)],
+            "dimension mismatch",
+        ),
+        ([SimpleNamespace(features=("bad",), label=1)], "not numeric"),
+        ([SimpleNamespace(features=(float("inf"),), label=1)], "not finite"),
+        ([SimpleNamespace(features=(1.0,))], "label is not binary"),
+        ([SimpleNamespace(features=(1.0,), label=2)], "label is not binary"),
+    ]
+    for rows, message in bad_cases:
+        with pytest.raises(ValueError, match=message):
+            validate_model_rows(rows, expected_feature_dim=2 if rows is bad_cases[2][0] else None)
+
+
+def test_probability_and_quality_helpers_cover_edges() -> None:
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+    assert _log_loss([], [0.0], 0.0, [0.0], [1.0]) == 0.0
+    assert _positive_rate([]) == 0.0
+    assert _probability_stats([], model).asdict() == {"minimum": 0.0, "maximum": 0.0, "mean": 0.0, "std": 0.0}
+    assert _majority_baseline([]) == 0.0
+
+    validation = [SimpleNamespace(features=(1.0,), label=1)] * 5
+    weak = build_model_quality_report([], validation, model, threshold=0.9)
+    assert weak.status == "fail"
+    assert "validation labels contain only one class" in weak.warnings
+    assert weak.asdict()["probability_stats"]["std"] == 0.0
+
+    no_validation = build_model_quality_report(validation, [], model, threshold=0.5)
+    assert no_validation.validation_rows == 0
+
+    strong_model = TrainedModel(
+        weights=[8.0],
+        bias=-4.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+    mixed = [
+        SimpleNamespace(features=(0.0,), label=0),
+        SimpleNamespace(features=(1.0,), label=1),
+    ] * 20
+    strong = build_model_quality_report(mixed, mixed, strong_model, threshold=0.5)
+    assert strong.status == "ok"
+    assert strong.quality_score == 1.0
+
+    overfit_train = [SimpleNamespace(features=(1.0,), label=1)] * 30
+    mixed_constant = [
+        SimpleNamespace(features=(0.0,), label=0),
+        SimpleNamespace(features=(0.0,), label=1),
+    ] * 5
+    overfit = build_model_quality_report(overfit_train, mixed_constant, strong_model, threshold=0.5)
+    assert overfit.status == "fail"
+    assert any("overfitting" in warning for warning in overfit.warnings)
+    assert any("F1 is zero" in warning for warning in overfit.warnings)
 
 
 def test_normalization_and_training_edge_cases() -> None:
@@ -153,6 +232,25 @@ def test_model_train_and_calibrate_edges() -> None:
     rows = [SimpleNamespace(features=(1.0,), label=0), SimpleNamespace(features=(1.0,), label=0)]
     trained = train(rows, epochs=1, learning_rate=0.01, seed=1)
     assert trained.feature_dim == 1
+
+    early = train(
+        rows,
+        epochs=5,
+        learning_rate=0.0,
+        validation_rows=rows,
+        early_stopping_rounds=1,
+    )
+    assert early.best_epoch == 1
+    assert early.validation_loss is not None
+
+    no_patience = train(
+        rows,
+        epochs=2,
+        learning_rate=0.0,
+        validation_rows=rows,
+        early_stopping_rounds=None,
+    )
+    assert no_patience.best_epoch == 1
 
     calibrated = calibrate_threshold(rows, trained, start=-1.0, end=2.0, steps=3)
     assert 0.0 <= calibrated <= 1.0

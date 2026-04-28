@@ -18,6 +18,7 @@ from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_ena
 from .api import SymbolConstraints
 from .market_data import clean_candles
 from .model import (
+    build_model_quality_report,
     calibrate_threshold,
     confidence_adjusted_probability,
     evaluate_classification,
@@ -862,6 +863,15 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
             add(False, "model artifact", f"{model_file} is not usable with current strategy ({exc})")
         else:
             add(True, "model artifact", f"{model_file} dim={model.feature_dim}")
+            quality_score = getattr(model, "quality_score", None)
+            if quality_score is not None:
+                warnings = list(getattr(model, "quality_warnings", []) or [])
+                warning_text = "; ".join(str(item) for item in warnings[:2]) or "none"
+                add(
+                    float(quality_score) >= 0.45,
+                    "model quality",
+                    f"score={float(quality_score):.2f} warnings={warning_text}",
+                )
     else:
         add(False, "model artifact", f"missing {model_file}")
 
@@ -2672,6 +2682,8 @@ def command_train(args: argparse.Namespace) -> int:
         l2_penalty=l2_penalty,
         seed=seed,
         feature_signature=model_signature,
+        validation_rows=calibration_rows,
+        early_stopping_rounds=max(5, min(25, int(args.epochs) // 5)) if calibration_rows else None,
     )
     threshold = cfg.signal_threshold
     if args.calibrate_threshold and calibration_rows:
@@ -2683,6 +2695,9 @@ def command_train(args: argparse.Namespace) -> int:
     train_score = evaluate(train_rows, model, threshold=threshold)
     calibration_score = evaluate(calibration_rows, model, threshold=threshold) if calibration_rows else 0.0
     validation_score = evaluate(validation_rows, model, threshold=threshold) if validation_rows else 0.0
+    quality = build_model_quality_report(train_rows, validation_rows, model, threshold)
+    model.quality_score = float(quality.quality_score)
+    model.quality_warnings = list(quality.warnings)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     serialize_model(model, output)
@@ -2696,6 +2711,9 @@ def command_train(args: argparse.Namespace) -> int:
     if args.calibrate_threshold and calibration_rows:
         print(f"validated threshold: {threshold:.3f}")
         print(f"calibration directional accuracy: {calibration_score:.3f}")
+    print(f"model quality: {quality.status} score={quality.quality_score:.2f}")
+    for warning in quality.warnings[:3]:
+        print(f"model quality warning: {warning}")
     artifact = {
         "command": "train",
         "timestamp": int(time.time()),
@@ -2730,6 +2748,7 @@ def command_train(args: argparse.Namespace) -> int:
             "model_feature_version": model.feature_version,
             "model_feature_signature": model.feature_signature,
         },
+        "model_quality": quality.asdict(),
         "model": {
             "path": str(args.output),
             "feature_dim": int(model.feature_dim),
@@ -2743,6 +2762,19 @@ def command_train(args: argparse.Namespace) -> int:
             "training_cutoff_timestamp": int(model.training_cutoff_timestamp)
             if model.training_cutoff_timestamp is not None
             else None,
+            "best_epoch": int(model.best_epoch)
+            if model.best_epoch is not None
+            else None,
+            "training_loss": float(model.training_loss)
+            if model.training_loss is not None
+            else None,
+            "validation_loss": float(model.validation_loss)
+            if model.validation_loss is not None
+            else None,
+            "quality_score": float(model.quality_score)
+            if model.quality_score is not None
+            else None,
+            "quality_warnings": list(model.quality_warnings),
         },
         "market": runtime.market_type,
         "symbol": runtime.symbol,
@@ -2975,6 +3007,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
 
     report = evaluate_classification(test_rows if test_rows else rows, model, threshold=threshold)
     train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
+    quality = build_model_quality_report(train_rows, test_rows if test_rows else rows, model, threshold)
     artifact = {
         "command": "evaluate",
         "timestamp": int(time.time()),
@@ -3013,6 +3046,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
                 "false_negative": int(report.false_negative),
             },
         },
+        "model_quality": quality.asdict(),
     }
     _persist_run_artifact("evaluate", Path(args.model).parent, artifact)
 
@@ -3033,6 +3067,9 @@ def command_evaluate(args: argparse.Namespace) -> int:
             tp=report.true_positive, fp=report.false_positive, tn=report.true_negative, fn=report.false_negative
         )
     )
+    print(f"model_quality: {quality.status} score={quality.quality_score:.2f}")
+    for warning in quality.warnings[:3]:
+        print(f"quality_warning: {warning}")
     return 0
 
 
