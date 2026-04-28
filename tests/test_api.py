@@ -88,7 +88,7 @@ def test_request_signed_requires_credentials() -> None:
 
 
 def test_request_supports_unsigned_and_signed_paths(monkeypatch) -> None:
-    client = BinanceClient(api_key="k", api_secret="s", market_type="futures")
+    client = BinanceClient(api_key="k", api_secret="s", market_type="futures", recv_window_ms=12345)
     calls: list[tuple[str, str, dict]] = []
 
     class Response:
@@ -102,6 +102,7 @@ def test_request_supports_unsigned_and_signed_paths(monkeypatch) -> None:
         calls.append((method, url.split("?")[0], params or {}))
         if "?" in url:
             assert "signature=" in url
+            assert "recvWindow=12345" in url
         return Response()
 
     monkeypatch.setattr(client.session, "request", fake_request)

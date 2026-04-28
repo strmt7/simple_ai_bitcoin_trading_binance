@@ -496,6 +496,13 @@ def test_client_initialization_clamps_rate_limit_bounds() -> None:
     high = BinanceClient(api_key="k", api_secret="s", max_calls_per_minute=9999)
     assert high._call_delay == 0.03
 
+    low_recv = BinanceClient(api_key="k", api_secret="s", recv_window_ms=0)
+    high_recv = BinanceClient(api_key="k", api_secret="s", recv_window_ms=999_999)
+    bad_recv = BinanceClient(api_key="k", api_secret="s", recv_window_ms="bad")
+    assert low_recv.recv_window_ms == 1
+    assert high_recv.recv_window_ms == 60000
+    assert bad_recv.recv_window_ms == 5000
+
 
 def test_last_request_info_is_populated(monkeypatch) -> None:
     client = BinanceClient(api_key="k", api_secret="s", market_type="spot")

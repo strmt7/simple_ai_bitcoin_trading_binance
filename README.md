@@ -220,7 +220,8 @@ The console supports:
 - the live loop supports paper mode and explicit authenticated testnet execution; `--paper` forces paper mode, while `--live` forces authenticated testnet execution
 - `live --model PATH` loads that model before the loop; paper runs can regenerate a missing or incompatible model from current rows, but authenticated live runs fail fast instead
 - `live --sleep 0` is preserved as a real zero-delay loop for scripted paper/test runs; authenticated `--live` mode clamps this to a one-second minimum
-- authenticated live runs inspect exchange account state before the loop and resume a detected BTCUSDC spot or futures position into the local run state instead of assuming the previous process exited flat
+- authenticated live runs inspect exchange account state before the loop; futures positions are resumed, while spot BTC is resumed only up to the explicit managed BTC allocation
+- configured `recvWindow` is used for signed Binance requests, and startup credential validation calls an authenticated account endpoint when keys are present
 - futures close and emergency-close orders use reduce-only market orders with result responses requested, so a close path cannot intentionally increase exposure
 - exchange order rejections during entry, close, or emergency close are captured as `order_error` live artifacts instead of crashing the process
 - request telemetry redacts signed query fields such as timestamps and signatures before storing `last_request_info`

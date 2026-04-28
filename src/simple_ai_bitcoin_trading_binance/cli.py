@@ -350,7 +350,15 @@ def _build_client(runtime):
         testnet=runtime.testnet,
         market_type=runtime.market_type,
         max_calls_per_minute=runtime.max_rate_calls_per_minute,
+        recv_window_ms=getattr(runtime, "recv_window_ms", 5000),
     )
+
+
+def _validate_runtime_connection(runtime, client) -> None:
+    client.ping()
+    client.ensure_btcusdc()
+    if runtime.api_key and runtime.api_secret:
+        client.get_account()
 
 
 def _parse_form_bool(raw: str, default: bool) -> bool:
@@ -491,6 +499,8 @@ async def _ui_edit_runtime(ui, current) -> object:
         max_rate_calls_per_minute=max_rate,
         recv_window_ms=recv_window_ms,
         compute_backend=getattr(current, "compute_backend", "cpu"),
+        managed_usdc=getattr(current, "managed_usdc", 1000.0),
+        managed_btc=getattr(current, "managed_btc", 0.0),
     )
 
 
@@ -1126,8 +1136,7 @@ def _tui_actions():
         if next_runtime.validate_account and next_runtime.api_key and next_runtime.api_secret:
             client = _build_client(next_runtime)
             try:
-                await ui.run_blocking(client.ping)
-                await ui.run_blocking(client.ensure_btcusdc)
+                await ui.run_blocking(_validate_runtime_connection, next_runtime, client)
             except BinanceAPIError as exc:
                 print(f"Configuration saved, but validation failed: {exc}", file=sys.stderr)
                 return 2
@@ -1996,12 +2005,16 @@ def _detect_existing_position(runtime, client, *, leverage: float, reference_pri
         return None
 
     base_asset = runtime.symbol.removesuffix("USDC")
+    managed_btc = max(0.0, _safe_float(getattr(runtime, "managed_btc", 0.0)))
+    if managed_btc <= 0.0:
+        return None
     for item in account.get("balances", []) or []:
         if not isinstance(item, dict) or item.get("asset") != base_asset:
             continue
         qty = _safe_float(item.get("free")) + _safe_float(item.get("locked"))
         if qty <= 0.0:
             continue
+        qty = min(qty, managed_btc)
         price = reference_price
         if price is None:
             price, _timestamp = client.get_symbol_price(runtime.symbol)
@@ -2048,8 +2061,7 @@ def command_configure(_: argparse.Namespace) -> int:
     if next_runtime.validate_account and next_runtime.api_key and next_runtime.api_secret:
         client = _build_client(next_runtime)
         try:
-            client.ping()
-            client.ensure_btcusdc()
+            _validate_runtime_connection(next_runtime, client)
         except BinanceAPIError as exc:
             print(f"Configuration saved, but validation failed: {exc}", file=sys.stderr)
             return 2
@@ -2878,7 +2890,7 @@ def command_live(args: argparse.Namespace) -> int:
             print(f"Failed to set leverage: {exc}", file=sys.stderr)
             return 2
 
-    cash = 1000.0
+    cash = max(0.0, _safe_float(getattr(runtime, "managed_usdc", 1000.0)))
     position_notional = 0.0
     position_side = 0
     entry_price = 0.0

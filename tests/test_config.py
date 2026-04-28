@@ -64,7 +64,15 @@ def test_prompt_runtime_rejects_invalid_market_and_non_btc_symbol(tmp_path: Path
 
 def test_prompt_runtime_preserves_existing_credentials_on_blank_or_whitespace(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    current = RuntimeConfig(api_key="persisted-key", api_secret="persisted-secret")
+    current = RuntimeConfig(
+        api_key="persisted-key",
+        api_secret="persisted-secret",
+        max_rate_calls_per_minute=321,
+        recv_window_ms=8000,
+        compute_backend="auto",
+        managed_usdc=42.0,
+        managed_btc=0.5,
+    )
 
     inputs = iter(["", "", "", "y", "y", "y"])
 
@@ -75,6 +83,11 @@ def test_prompt_runtime_preserves_existing_credentials_on_blank_or_whitespace(tm
     out = prompt_runtime(current, key_getter=fake_input, secret_getter=lambda _: next(responses))
     assert out.api_key == "persisted-key"
     assert out.api_secret == "persisted-secret"
+    assert out.max_rate_calls_per_minute == 321
+    assert out.recv_window_ms == 8000
+    assert out.compute_backend == "auto"
+    assert out.managed_usdc == 42.0
+    assert out.managed_btc == 0.5
 
 
 def test_load_runtime_ignores_invalid_json_payload(tmp_path: Path, monkeypatch) -> None:

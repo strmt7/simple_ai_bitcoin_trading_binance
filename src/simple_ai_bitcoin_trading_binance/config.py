@@ -122,4 +122,9 @@ def prompt_runtime(current: RuntimeConfig, key_getter: Callable[[str], str] = in
         ),
         dry_run=key_getter(f"Paper-trading mode? (y/n) [{'y' if current.dry_run else 'n'}]: ").strip().lower() != "n",
         validate_account=key_getter(f"Validate API credentials at startup? (y/n) [{'y' if current.validate_account else 'n'}]: ").strip().lower() != "n",
+        max_rate_calls_per_minute=current.max_rate_calls_per_minute,
+        recv_window_ms=current.recv_window_ms,
+        compute_backend=current.compute_backend,
+        managed_usdc=current.managed_usdc,
+        managed_btc=current.managed_btc,
     )

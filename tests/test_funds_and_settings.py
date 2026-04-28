@@ -288,6 +288,7 @@ def test_settings_menu_compute_form_cancellation(isolated_home) -> None:
 
 
 def test_settings_menu_runtime_saves_when_form_valid(isolated_home) -> None:
+    save_runtime(RuntimeConfig(managed_usdc=42.0, managed_btc=0.5, compute_backend="auto"))
     ui = _ScriptedUI(
         menu_choices=["runtime", "close"],
         forms=[
@@ -308,6 +309,9 @@ def test_settings_menu_runtime_saves_when_form_valid(isolated_home) -> None:
     runtime = load_runtime()
     assert runtime.interval == "1h"
     assert runtime.recv_window_ms == 8000
+    assert runtime.compute_backend == "auto"
+    assert runtime.managed_usdc == 42.0
+    assert runtime.managed_btc == 0.5
     assert any("Runtime settings saved" in line for line in ui.logs)
 
 

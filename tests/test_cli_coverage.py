@@ -343,6 +343,38 @@ def test_resolve_futures_leverage(monkeypatch) -> None:
     assert cli._resolve_futures_leverage(runtime_spot, cfg) == 1.0
 
 
+def test_build_client_forwards_runtime_request_window(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "BinanceClient", _Client)
+    cli._build_client(RuntimeConfig(api_key="k", api_secret="s", recv_window_ms=9000))
+    assert captured["recv_window_ms"] == 9000
+    assert captured["max_calls_per_minute"] == 1100
+
+
+def test_validate_runtime_connection_skips_account_without_keys() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.account_calls = 0
+
+        def ping(self):
+            return {"ok": True}
+
+        def ensure_btcusdc(self):
+            return {"symbol": "BTCUSDC"}
+
+        def get_account(self):  # pragma: no cover - assertion checks it stays unused
+            self.account_calls += 1
+
+    client = _Client()
+    cli._validate_runtime_connection(RuntimeConfig(api_key="", api_secret=""), client)
+    assert client.account_calls == 0
+
+
 def test_connection_status_line_branches(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -477,6 +509,14 @@ def test_command_configure_validation_failure_returns_nonzero(tmp_path, monkeypa
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _BadClient())
     assert cli.command_configure(argparse.Namespace()) == 2
     assert "validation failed" in capsys.readouterr().err
+
+    class _BadAccountClient(_FakeClient):
+        def get_account(self):
+            raise BinanceAPIError("bad key")
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _BadAccountClient())
+    assert cli.command_configure(argparse.Namespace()) == 2
+    assert "bad key" in capsys.readouterr().err
 
 
 def test_command_configure_futures_prints_mode_line(tmp_path, monkeypatch, capsys) -> None:
@@ -1259,7 +1299,16 @@ def test_command_live_artifact_is_emitted(tmp_path, monkeypatch) -> None:
         return output_dir / "live.json"
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot", api_key="secret-key", api_secret="secret-value"))
+    save_runtime(
+        RuntimeConfig(
+            testnet=True,
+            dry_run=True,
+            market_type="spot",
+            api_key="secret-key",
+            api_secret="secret-value",
+            managed_usdc=2500.0,
+        )
+    )
     save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2))
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
     monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
@@ -1271,6 +1320,7 @@ def test_command_live_artifact_is_emitted(tmp_path, monkeypatch) -> None:
     kind, _output_dir, payload = captured[0]
     assert kind == "live"
     assert payload["command"] == "live"
+    assert payload["starting_cash"] == 2500.0
     assert payload["runtime"]["api_key"] == "<redacted>"
     assert payload["runtime"]["api_secret"] == "<redacted>"
 
@@ -2000,11 +2050,30 @@ def test_existing_position_detection_helpers() -> None:
         def get_symbol_price(self, symbol: str):
             return 60000.0, 123
 
-    spot = cli._detect_existing_position(RuntimeConfig(market_type="spot"), SpotAccount(), leverage=1.0, reference_price=60000.0)
+    assert cli._detect_existing_position(RuntimeConfig(market_type="spot"), SpotAccount(), leverage=1.0, reference_price=60000.0) is None
+
+    spot = cli._detect_existing_position(
+        RuntimeConfig(market_type="spot", managed_btc=0.02),
+        SpotAccount(),
+        leverage=1.0,
+        reference_price=60000.0,
+    )
     assert spot["market"] == "spot"
-    assert spot["qty"] == 0.03
+    assert spot["qty"] == 0.02
     assert spot["entry_price"] == 60000.0
-    assert cli._detect_existing_position(RuntimeConfig(market_type="spot"), SpotAccount(), leverage=1.0)["entry_price"] == 60000.0
+    assert (
+        cli._detect_existing_position(RuntimeConfig(market_type="spot", managed_btc=0.01), SpotAccount(), leverage=1.0)["entry_price"]
+        == 60000.0
+    )
+
+    assert (
+        cli._detect_existing_position(
+            RuntimeConfig(market_type="spot", managed_btc=1.0),
+            type("NoBtcAccount", (), {"get_account": lambda self: {"balances": [{"asset": "BTC", "free": "0", "locked": "0"}]}})(),
+            leverage=1.0,
+        )
+        is None
+    )
 
 
 def test_command_fetch_success_path(tmp_path, monkeypatch) -> None:

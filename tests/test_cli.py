@@ -319,7 +319,18 @@ def test_tui_runtime_action_saves_runtime(monkeypatch) -> None:
 
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: current)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_runtime", lambda cfg: saved.setdefault("cfg", cfg) or cfg)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._build_client", lambda _runtime: type("C", (), {"ping": lambda self: None, "ensure_btcusdc": lambda self: None})())
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli._build_client",
+        lambda _runtime: type(
+            "C",
+            (),
+            {
+                "ping": lambda self: None,
+                "ensure_btcusdc": lambda self: None,
+                "get_account": lambda self: {},
+            },
+        )(),
+    )
 
     ui = _AsyncUI(
         forms=[

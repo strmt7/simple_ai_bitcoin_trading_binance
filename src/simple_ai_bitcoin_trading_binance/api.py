@@ -116,6 +116,7 @@ class BinanceClient:
         timeout: int = 10,
         max_calls_per_minute: int = 1200,
         max_retries: int = 4,
+        recv_window_ms: int = 5000,
     ):
         if market_type not in {"spot", "futures"}:
             raise ValueError("market_type must be 'spot' or 'futures'")
@@ -128,6 +129,11 @@ class BinanceClient:
         self.session.headers.update({"X-MBX-APIKEY": api_key})
         self.session.headers.update({"User-Agent": "simple-ai-btcusdc-cli"})
         self.timeout = timeout
+        try:
+            recv_window_ms = int(recv_window_ms)
+        except (TypeError, ValueError):
+            recv_window_ms = 5000
+        self.recv_window_ms = max(1, min(60000, recv_window_ms))
         if max_calls_per_minute < 1:
             max_calls_per_minute = 1
         if max_calls_per_minute > 2000:
@@ -204,7 +210,7 @@ class BinanceClient:
                     raise BinanceAPIError("signed endpoint requires api_key/api_secret")
                 request_params = dict(params)
                 request_params["timestamp"] = int(time.time() * 1000)
-                request_params.setdefault("recvWindow", 5000)
+                request_params.setdefault("recvWindow", self.recv_window_ms)
                 query = urlencode(sorted((k, v) for k, v in request_params.items()))
                 signature = hmac.new(self.api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()
                 query += f"&signature={signature}"
