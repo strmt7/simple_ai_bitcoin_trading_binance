@@ -29,7 +29,7 @@ def test_save_and_load_runtime(tmp_path: Path, monkeypatch) -> None:
 def test_prompt_runtime_updates(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    inputs = iter(["spot", "BTCUSDC", "15m", "n", "n", "n"])
+    inputs = iter(["spot", "BTCUSDC", "15m", "n", "y", "n", "n"])
     def fake_input(prompt: str) -> str:
         return next(inputs)
 
@@ -38,6 +38,7 @@ def test_prompt_runtime_updates(tmp_path: Path, monkeypatch) -> None:
     assert out.symbol == "BTCUSDC"
     assert out.interval == "15m"
     assert not out.testnet
+    assert out.demo is True
     assert out.api_key == "api_key"
     assert out.api_secret == "api_secret"
     assert not out.dry_run
@@ -47,7 +48,7 @@ def test_prompt_runtime_rejects_invalid_market_and_non_btc_symbol(tmp_path: Path
     monkeypatch.setenv("HOME", str(tmp_path))
     current = RuntimeConfig(symbol="BTCUSDC", market_type="futures")
 
-    inputs = iter(["margin", "ETHUSDC", "1h", "y", "y", "y"])
+    inputs = iter(["margin", "ETHUSDC", "1h", "y", "n", "y", "y"])
 
     def fake_input(_prompt: str) -> str:
         return next(inputs)
@@ -58,6 +59,7 @@ def test_prompt_runtime_rejects_invalid_market_and_non_btc_symbol(tmp_path: Path
     assert out.symbol == "BTCUSDC"
     assert out.interval == "1h"
     assert out.testnet is True
+    assert out.demo is False
     assert out.dry_run is True
     assert out.validate_account is True
 
@@ -72,9 +74,10 @@ def test_prompt_runtime_preserves_existing_credentials_on_blank_or_whitespace(tm
         compute_backend="auto",
         managed_usdc=42.0,
         managed_btc=0.5,
+        demo=True,
     )
 
-    inputs = iter(["", "", "", "y", "y", "y"])
+    inputs = iter(["", "", "", "", "", "", ""])
 
     def fake_input(_prompt: str) -> str:
         return next(inputs)
@@ -88,6 +91,7 @@ def test_prompt_runtime_preserves_existing_credentials_on_blank_or_whitespace(tm
     assert out.compute_backend == "auto"
     assert out.managed_usdc == 42.0
     assert out.managed_btc == 0.5
+    assert out.demo is True
 
 
 def test_load_runtime_ignores_invalid_json_payload(tmp_path: Path, monkeypatch) -> None:

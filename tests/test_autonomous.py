@@ -185,6 +185,10 @@ def test_ensure_testnet_passes_when_testnet() -> None:
     ensure_testnet(_runtime(testnet=True))  # no raise
 
 
+def test_ensure_testnet_passes_when_demo() -> None:
+    ensure_testnet(RuntimeConfig(testnet=False, demo=True))  # no raise
+
+
 def test_ensure_credentials_live_requires_key() -> None:
     cfg = AutonomousConfig(dry_run=False)
     with pytest.raises(RuntimeError):

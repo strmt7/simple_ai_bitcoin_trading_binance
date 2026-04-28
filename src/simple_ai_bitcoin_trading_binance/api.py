@@ -19,8 +19,10 @@ import requests
 
 BINANCE_SPOT_TESTNET = "https://testnet.binance.vision"
 BINANCE_SPOT_LIVE = "https://api.binance.com"
+BINANCE_SPOT_DEMO = "https://demo-api.binance.com"
 BINANCE_FUTURES_TESTNET = "https://testnet.binancefuture.com"
 BINANCE_FUTURES_LIVE = "https://fapi.binance.com"
+BINANCE_FUTURES_DEMO = "https://demo-fapi.binance.com"
 _MAX_FUTURES_LEVERAGE = 125
 _RETRY_HTTP_STATUSES = {418, 429, 500, 502, 503, 504}
 _RETRY_BAPI_CODES = {-1003, -1007}
@@ -61,7 +63,7 @@ def _redact_sensitive_text(text: str, request_url: str | None = None) -> str:
     return redacted
 
 
-def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
+def _default_base_url(testnet: bool, market_type: str, *, demo: bool = False) -> tuple[str, str]:
     common_override = os.getenv("BINANCE_BASE_URL", "").strip()
     if market_type == "futures":
         futures_override = os.getenv("BINANCE_FUTURES_BASE_URL", "").strip()
@@ -69,12 +71,16 @@ def _default_base_url(testnet: bool, market_type: str) -> tuple[str, str]:
             return futures_override, "fapi"
         if common_override:
             return common_override, "fapi"
+        if demo:
+            return BINANCE_FUTURES_DEMO, "fapi"
         return (BINANCE_FUTURES_TESTNET if testnet else BINANCE_FUTURES_LIVE, "fapi")
     spot_override = os.getenv("BINANCE_SPOT_BASE_URL", "").strip()
     if spot_override:
         return spot_override, "api"
     if common_override:
         return common_override, "api"
+    if demo:
+        return BINANCE_SPOT_DEMO, "api"
     return (BINANCE_SPOT_TESTNET if testnet else BINANCE_SPOT_LIVE, "api")
 
 
@@ -112,6 +118,7 @@ class BinanceClient:
         api_secret: str,
         *,
         testnet: bool = True,
+        demo: bool = False,
         market_type: str = "spot",
         timeout: int = 10,
         max_calls_per_minute: int = 1200,
@@ -124,7 +131,8 @@ class BinanceClient:
         self.api_key = api_key
         self.api_secret = api_secret.encode("utf-8")
         self.market_type = market_type
-        self.base_url, self.api_prefix = _default_base_url(testnet, market_type)
+        self.demo = bool(demo)
+        self.base_url, self.api_prefix = _default_base_url(testnet, market_type, demo=self.demo)
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": api_key})
         self.session.headers.update({"User-Agent": "simple-ai-btcusdc-cli"})

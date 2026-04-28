@@ -28,9 +28,12 @@ def _section(title: str, lines: list[str], *, width: int) -> str:
 
 
 def _runtime_lines(runtime: dict[str, Any]) -> list[str]:
+    environment = "demo" if runtime.get("demo") else ("testnet" if runtime.get("testnet") else "mainnet")
     return [
         f"{runtime.get('symbol', '-')}  interval={runtime.get('interval', '-')}  market={runtime.get('market_type', '-')}",
-        f"testnet={runtime.get('testnet', '-')}  paper_default={runtime.get('dry_run', '-')}  validate_account={runtime.get('validate_account', '-')}",
+        f"environment={environment}  testnet={runtime.get('testnet', '-')}  demo={runtime.get('demo', '-')}",
+        f"paper_default={runtime.get('dry_run', '-')}",
+        f"validate_account={runtime.get('validate_account', '-')}",
         f"credentials: api_key={'loaded' if runtime.get('api_key') else 'missing'} api_secret={'loaded' if runtime.get('api_secret') else 'missing'}",
         f"max_rate_calls_per_minute={runtime.get('max_rate_calls_per_minute', '-')}",
     ]

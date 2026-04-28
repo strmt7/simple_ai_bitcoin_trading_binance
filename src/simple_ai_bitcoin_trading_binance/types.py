@@ -19,6 +19,7 @@ class RuntimeConfig:
     interval: str = "15m"
     market_type: str = "spot"
     testnet: bool = True
+    demo: bool = False
     api_key: str = ""
     api_secret: str = ""
     dry_run: bool = True

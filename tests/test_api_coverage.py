@@ -38,14 +38,16 @@ class _FakeResponse:
 def test_default_base_url_matches_market_and_environment() -> None:
     assert _default_base_url(True, "spot") == ("https://testnet.binance.vision", "api")
     assert _default_base_url(False, "spot") == ("https://api.binance.com", "api")
+    assert _default_base_url(True, "spot", demo=True) == ("https://demo-api.binance.com", "api")
     assert _default_base_url(True, "futures") == ("https://testnet.binancefuture.com", "fapi")
     assert _default_base_url(False, "futures") == ("https://fapi.binance.com", "fapi")
+    assert _default_base_url(False, "futures", demo=True) == ("https://demo-fapi.binance.com", "fapi")
 
 
 def test_default_base_url_honors_host_overrides(monkeypatch) -> None:
     monkeypatch.setenv("BINANCE_BASE_URL", "https://common.example")
-    assert _default_base_url(True, "spot") == ("https://common.example", "api")
-    assert _default_base_url(True, "futures") == ("https://common.example", "fapi")
+    assert _default_base_url(True, "spot", demo=True) == ("https://common.example", "api")
+    assert _default_base_url(True, "futures", demo=True) == ("https://common.example", "fapi")
 
     monkeypatch.setenv("BINANCE_SPOT_BASE_URL", "https://spot.example")
     monkeypatch.setenv("BINANCE_FUTURES_BASE_URL", "https://futures.example")
@@ -56,6 +58,12 @@ def test_default_base_url_honors_host_overrides(monkeypatch) -> None:
 def test_client_rejects_unknown_market_type() -> None:
     with pytest.raises(ValueError, match="market_type must be 'spot' or 'futures'"):
         BinanceClient("k", "s", market_type="swap")
+
+
+def test_client_can_target_demo_environment() -> None:
+    client = BinanceClient("k", "s", market_type="spot", demo=True)
+    assert client.demo is True
+    assert client.base_url == "https://demo-api.binance.com"
 
 
 def test_request_parses_json_and_raises_http_errors(monkeypatch) -> None:

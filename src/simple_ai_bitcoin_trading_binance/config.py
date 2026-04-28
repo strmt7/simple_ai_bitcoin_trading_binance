@@ -86,9 +86,18 @@ def _coalesce_prompt(value: str, current: str) -> str:
     return candidate or current
 
 
+def _prompt_bool(value: str, current: bool) -> bool:
+    token = value.strip().lower()
+    if token in {"y", "yes", "true", "1", "on"}:
+        return True
+    if token in {"n", "no", "false", "0", "off"}:
+        return False
+    return current
+
+
 def prompt_runtime(current: RuntimeConfig, key_getter: Callable[[str], str] = input,
                   secret_getter: Callable[[str], str] = getpass) -> RuntimeConfig:
-    """Collect Binance testnet credentials and safety defaults from stdin."""
+    """Collect Binance non-mainnet credentials and safety defaults from stdin."""
 
     market = _coalesce_prompt(
         key_getter(f"Market type [spot/futures] [{current.market_type}]: "),
@@ -111,7 +120,14 @@ def prompt_runtime(current: RuntimeConfig, key_getter: Callable[[str], str] = in
             current.interval,
         ),
         market_type=market,
-        testnet=key_getter(f"Use Binance testnet? (y/n) [{'y' if current.testnet else 'n'}]: ").strip().lower() != "n",
+        testnet=_prompt_bool(
+            key_getter(f"Use Binance testnet? (y/n) [{'y' if current.testnet else 'n'}]: "),
+            current.testnet,
+        ),
+        demo=_prompt_bool(
+            key_getter(f"Use Binance Demo Trading API? (y/n) [{'y' if current.demo else 'n'}]: "),
+            current.demo,
+        ),
         api_key=_coalesce_prompt(
             secret_getter("Binance API key (blank to keep): "),
             current.api_key,
@@ -120,8 +136,14 @@ def prompt_runtime(current: RuntimeConfig, key_getter: Callable[[str], str] = in
             secret_getter("Binance API secret (blank to keep): "),
             current.api_secret,
         ),
-        dry_run=key_getter(f"Paper-trading mode? (y/n) [{'y' if current.dry_run else 'n'}]: ").strip().lower() != "n",
-        validate_account=key_getter(f"Validate API credentials at startup? (y/n) [{'y' if current.validate_account else 'n'}]: ").strip().lower() != "n",
+        dry_run=_prompt_bool(
+            key_getter(f"Paper-trading mode? (y/n) [{'y' if current.dry_run else 'n'}]: "),
+            current.dry_run,
+        ),
+        validate_account=_prompt_bool(
+            key_getter(f"Validate API credentials at startup? (y/n) [{'y' if current.validate_account else 'n'}]: "),
+            current.validate_account,
+        ),
         max_rate_calls_per_minute=current.max_rate_calls_per_minute,
         recv_window_ms=current.recv_window_ms,
         compute_backend=current.compute_backend,

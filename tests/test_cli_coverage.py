@@ -355,9 +355,10 @@ def test_build_client_forwards_runtime_request_window(monkeypatch) -> None:
             captured.update(kwargs)
 
     monkeypatch.setattr(cli, "BinanceClient", _Client)
-    cli._build_client(RuntimeConfig(api_key="k", api_secret="s", recv_window_ms=9000))
+    cli._build_client(RuntimeConfig(api_key="k", api_secret="s", recv_window_ms=9000, demo=True))
     assert captured["recv_window_ms"] == 9000
     assert captured["max_calls_per_minute"] == 1100
+    assert captured["demo"] is True
 
 
 def test_validate_runtime_connection_skips_account_without_keys() -> None:
@@ -397,6 +398,11 @@ def test_connection_status_line_branches(tmp_path, monkeypatch) -> None:
     assert "online futures/testnet testnet-live-default" in line
     assert "auth ok" in line
 
+    save_runtime(RuntimeConfig(api_key="k", api_secret="s", dry_run=False, testnet=False, demo=True, market_type="spot"))
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    line = cli._connection_status_line()
+    assert "online spot/demo demo-live-default" in line
+
     class OddAuthClient(_FakeClient):
         def get_account(self):
             return "accepted"
@@ -408,6 +414,7 @@ def test_connection_status_line_branches(tmp_path, monkeypatch) -> None:
         def ping(self):
             raise BinanceAPIError("timeout")
 
+    save_runtime(RuntimeConfig(api_key="k", api_secret="s", dry_run=False, testnet=True, market_type="futures"))
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: OfflineClient())
     assert "offline futures/testnet" in cli._connection_status_line()
 
@@ -602,7 +609,7 @@ def test_command_spot_roundtrip_validation_and_success(tmp_path, monkeypatch, ca
     monkeypatch.setattr(cli, "_persist_run_artifact", lambda _kind, output_dir, payload: persisted.append(payload) or output_dir / "roundtrip.json")
     assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="auto", yes=True)) == 0
     output = capsys.readouterr().out
-    assert "Spot test roundtrip complete." in output
+    assert "Spot testnet roundtrip complete." in output
     assert persisted[-1]["mode"] == "buy-sell"
     assert persisted[-1]["runtime"]["api_key"] == "<redacted>"
 
@@ -3194,6 +3201,15 @@ def test_command_live_rejects_live_when_not_testnet(tmp_path, monkeypatch) -> No
     monkeypatch.setenv("HOME", str(tmp_path))
     save_runtime(RuntimeConfig(testnet=False, dry_run=False, api_key="k", api_secret="s"))
     assert cli.command_live(argparse.Namespace(steps=1, sleep=5, paper=False)) == 2
+
+
+def test_command_live_allows_demo_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=False, demo=True, dry_run=False, api_key="k", api_secret="s"))
+    save_strategy(StrategyConfig())
+    monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda runtime, cfg: 1.0)
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *args, **kwargs: None)
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=5, paper=False, live=False, leverage=None)) == 2
 
 
 def test_command_live_futures_set_leverage_failure_exits(tmp_path, monkeypatch) -> None:

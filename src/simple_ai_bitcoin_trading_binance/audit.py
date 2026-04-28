@@ -132,8 +132,22 @@ def build_audit_report(
 
     checks: list[AuditCheck] = []
     checks.append(_check("ok" if runtime.symbol == "BTCUSDC" else "fix", "symbol", runtime.symbol))
-    checks.append(_check("ok" if runtime.testnet else "fix", "safety target", "testnet enabled" if runtime.testnet else "testnet disabled"))
-    checks.append(_check("ok" if runtime.dry_run else "warn", "default execution", "paper mode" if runtime.dry_run else "authenticated testnet live by default"))
+    safe_env = runtime.testnet or getattr(runtime, "demo", False)
+    environment = "demo" if getattr(runtime, "demo", False) else ("testnet" if runtime.testnet else "mainnet")
+    checks.append(
+        _check(
+            "ok" if safe_env else "fix",
+            "safety target",
+            f"{environment} enabled" if safe_env else "testnet/demo disabled",
+        )
+    )
+    checks.append(
+        _check(
+            "ok" if runtime.dry_run else "warn",
+            "default execution",
+            "paper mode" if runtime.dry_run else f"authenticated {environment} live by default",
+        )
+    )
     checks.append(_check("ok" if runtime.market_type in {"spot", "futures"} else "fix", "market type", runtime.market_type))
     checks.append(_check("ok" if raw_count > 0 else "fix", "raw candles", str(raw_count)))
     checks.append(_check("ok" if len(cleaned) == raw_count else "warn", "candle cleaning", f"clean={len(cleaned)} raw={raw_count} duplicates={duplicates}"))

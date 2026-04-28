@@ -2,7 +2,7 @@
 
 The autonomous loop is deliberately conservative:
 
-* Requires ``testnet=True`` on the runtime — it refuses to start otherwise.
+* Requires ``testnet=True`` or ``demo=True`` on the runtime — it refuses to start otherwise.
 * Honors every existing risk gate (daily trade cap, drawdown limit, cooldown,
   max open positions) through the same strategy config the live CLI uses.
 * Writes a heartbeat artifact after every iteration so operators can see
@@ -127,11 +127,11 @@ class AutonomousConfig:
 
 
 def ensure_testnet(runtime: RuntimeConfig) -> None:
-    """Raise if the runtime is not configured for testnet.  No real-money execution."""
+    """Raise if the runtime is not configured for a non-mainnet exchange."""
 
-    if not runtime.testnet:
+    if not (runtime.testnet or getattr(runtime, "demo", False)):
         raise RuntimeError(
-            "Autonomous mode refuses to start unless runtime.testnet=True. "
+            "Autonomous mode refuses to start unless runtime.testnet=True or runtime.demo=True. "
             "This phase blocks real-money execution."
         )
 

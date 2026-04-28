@@ -111,7 +111,7 @@ _STRATEGY_PROFILES: dict[str, dict[str, object]] = {
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="simple-ai-trading",
-        description="BTCUSDC test-trading CLI for Binance (spot + futures).",
+        description="BTCUSDC non-mainnet trading CLI for Binance (spot + futures).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -123,7 +123,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser_roundtrip = subparsers.add_parser(
         "spot-roundtrip",
-        help="place a tiny signed spot-testnet roundtrip order with balance and filter prechecks",
+        help="place a tiny signed spot testnet/demo roundtrip order with balance and filter prechecks",
     )
     parser_roundtrip.add_argument("--quantity", type=float, default=0.00008, help="BTC quantity to test")
     parser_roundtrip.add_argument(
@@ -132,10 +132,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="order sequence; auto uses buy-sell when USDC is available, otherwise sell-buy when BTC is available",
     )
-    parser_roundtrip.add_argument("--yes", action="store_true", help="confirm signed testnet order placement")
+    parser_roundtrip.add_argument("--yes", action="store_true", help="confirm signed testnet/demo order placement")
     parser_roundtrip.set_defaults(func=command_spot_roundtrip)
 
-    parser_doctor = subparsers.add_parser("doctor", help="run local readiness checks before paper or testnet trading")
+    parser_doctor = subparsers.add_parser(
+        "doctor",
+        help="run local readiness checks before paper or non-mainnet trading",
+    )
     parser_doctor.add_argument("--input", default="data/historical_btcusdc.json")
     parser_doctor.add_argument("--model", default="data/model.json")
     parser_doctor.add_argument("--online", action="store_true", help="also check exchange connectivity")
@@ -236,7 +239,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_evaluate.add_argument("--calibrate-threshold", action="store_true")
     parser_evaluate.set_defaults(func=command_evaluate)
 
-    parser_live = subparsers.add_parser("live", help="run a conservative live loop on testnet or paper mode")
+    parser_live = subparsers.add_parser("live", help="run a conservative live loop on testnet/demo or paper mode")
     parser_live.add_argument("--model", default="data/model.json")
     parser_live.add_argument("--steps", type=int, default=20)
     parser_live.add_argument("--sleep", type=int, default=5)
@@ -333,7 +336,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_backtest_panel.set_defaults(func=command_backtest_panel)
 
     parser_autonomous = subparsers.add_parser(
-        "autonomous", help="control the autonomous testnet loop (start/pause/resume/stop/status)",
+        "autonomous", help="control the autonomous non-mainnet loop (start/pause/resume/stop/status)",
     )
     parser_autonomous.add_argument(
         "action", choices=["start", "pause", "resume", "stop", "status"],
@@ -362,10 +365,21 @@ def _build_client(runtime):
         api_key=runtime.api_key,
         api_secret=runtime.api_secret,
         testnet=runtime.testnet,
+        demo=getattr(runtime, "demo", False),
         market_type=runtime.market_type,
         max_calls_per_minute=runtime.max_rate_calls_per_minute,
         recv_window_ms=getattr(runtime, "recv_window_ms", 5000),
     )
+
+
+def _runtime_environment(runtime) -> str:
+    if getattr(runtime, "demo", False):
+        return "demo"
+    return "testnet" if runtime.testnet else "mainnet"
+
+
+def _allows_signed_execution(runtime) -> bool:
+    return bool(runtime.testnet or getattr(runtime, "demo", False))
 
 
 def _validate_runtime_connection(runtime, client) -> None:
@@ -469,6 +483,11 @@ async def _ui_edit_runtime(ui, current) -> object:
             FormField("market_type", "Market type [spot/futures]", current.market_type),
             FormField("interval", "Kline interval", current.interval),
             FormField("testnet", "Use Binance testnet [yes/no]", "yes" if current.testnet else "no"),
+            FormField(
+                "demo",
+                "Use Binance Demo Trading API [yes/no]",
+                "yes" if getattr(current, "demo", False) else "no",
+            ),
             FormField("api_key", "Binance API key [blank keeps current]", "", password=True),
             FormField("api_secret", "Binance API secret [blank keeps current]", "", password=True),
             FormField("dry_run", "Paper trading mode [yes/no]", "yes" if current.dry_run else "no"),
@@ -484,6 +503,7 @@ async def _ui_edit_runtime(ui, current) -> object:
         market_type = current.market_type
     interval = payload["interval"].strip() or current.interval
     testnet = _parse_form_bool(payload["testnet"], current.testnet)
+    demo = _parse_form_bool(payload.get("demo", ""), getattr(current, "demo", False))
     api_key = payload["api_key"].strip() or current.api_key
     api_secret = payload["api_secret"].strip() or current.api_secret
     dry_run = _parse_form_bool(payload["dry_run"], current.dry_run)
@@ -506,6 +526,7 @@ async def _ui_edit_runtime(ui, current) -> object:
         interval=interval,
         market_type=market_type,
         testnet=testnet,
+        demo=demo,
         api_key=api_key,
         api_secret=api_secret,
         dry_run=dry_run,
@@ -741,8 +762,14 @@ def _account_overview_lines(runtime) -> list[str]:
         if amount not in {"0", "0.0", "0.00000000"} or unrealized not in {"0", "0.0", "0.00000000"}:
             interesting.append(f"{symbol}: position={amount} entry={entry} unrealized={unrealized}")
     if not interesting:
-        return [f"market={runtime.market_type} testnet={runtime.testnet}", "No non-zero balances found."]
-    return [f"market={runtime.market_type} testnet={runtime.testnet}", *interesting[:20]]
+        return [
+            f"market={runtime.market_type} environment={_runtime_environment(runtime)} testnet={runtime.testnet}",
+            "No non-zero balances found.",
+        ]
+    return [
+        f"market={runtime.market_type} environment={_runtime_environment(runtime)} testnet={runtime.testnet}",
+        *interesting[:20],
+    ]
 
 
 def _show_account_overview() -> int:
@@ -776,8 +803,9 @@ def _dashboard_snapshot(*, with_account: bool) -> DashboardSnapshot:
 
 def _connection_status_line() -> str:
     runtime = load_runtime()
-    market = f"{runtime.market_type}/{'testnet' if runtime.testnet else 'mainnet'}"
-    mode = "paper-default" if runtime.dry_run else "testnet-live-default"
+    environment = _runtime_environment(runtime)
+    market = f"{runtime.market_type}/{environment}"
+    mode = "paper-default" if runtime.dry_run else f"{environment}-live-default"
     checked_at = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
     client = _build_client(runtime)
     try:
@@ -800,8 +828,14 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
     def add(ok: bool, label: str, detail: str) -> None:
         checks.append((ok, label, detail))
 
-    mode = "paper" if runtime.dry_run else "authenticated testnet"
-    add(runtime.testnet, "safety target", "testnet enabled" if runtime.testnet else "testnet is disabled")
+    environment = _runtime_environment(runtime)
+    safe_execution = _allows_signed_execution(runtime)
+    mode = "paper" if runtime.dry_run else f"authenticated {environment}"
+    add(
+        safe_execution,
+        "safety target",
+        f"{environment} enabled" if safe_execution else "testnet/demo is disabled",
+    )
     add(runtime.market_type in {"spot", "futures"}, "market type", runtime.market_type)
     add(
         runtime.dry_run or bool(runtime.api_key and runtime.api_secret),
@@ -1085,7 +1119,7 @@ def _tui_actions():
                     "Operator help — simple-ai-trading",
                     "==================================",
                     "",
-                    "Scope: BTCUSDC spot trading on the Binance testnet only.",
+                    "Scope: BTCUSDC spot trading on Binance testnet or Demo Trading only.",
                     "",
                     "First-time setup",
                     "----------------",
@@ -1131,7 +1165,7 @@ def _tui_actions():
                     "",
                     "Safety",
                     "------",
-                    "  testnet=true is the default and required for signed live execution in this build.",
+                    "  testnet=true is the default; demo=true selects Binance Demo Trading endpoints.",
                     "  Paper mode never places real orders, even when credentials are present.",
                     "  Credentials are stored at ~/.config/simple_ai_bitcoin_trading_binance/runtime.json (mode 600).",
                 ]
@@ -1155,7 +1189,10 @@ def _tui_actions():
                 print(f"Configuration saved, but validation failed: {exc}", file=sys.stderr)
                 return 2
         print("Runtime config saved to", config_paths()["runtime"])
-        print(f"market={next_runtime.market_type} testnet={next_runtime.testnet} paper={next_runtime.dry_run}")
+        print(
+            f"market={next_runtime.market_type} environment={_runtime_environment(next_runtime)} "
+            f"testnet={next_runtime.testnet} demo={getattr(next_runtime, 'demo', False)} paper={next_runtime.dry_run}"
+        )
         return 0
 
     async def _strategy(ui):
@@ -1555,11 +1592,15 @@ def _tui_actions():
             retrain_window = _parse_form_int(payload["retrain_window"], label="Retrain window", default=300, minimum=1)
             retrain_min_rows = _parse_form_int(payload["retrain_min_rows"], label="Retrain minimum rows", default=240, minimum=1)
         except ValueError as exc:
-            print(f"Testnet loop settings invalid: {exc}", file=sys.stderr)
+            print(f"Live loop settings invalid: {exc}", file=sys.stderr)
             return 2
         model = payload["model"].strip() or "data/model.json"
-        if not await ui.confirm(f"Run authenticated testnet execution with model={model}, steps={steps}, sleep={sleep}s?"):
-            print("Testnet execution cancelled.")
+        runtime = load_runtime()
+        environment = _runtime_environment(runtime)
+        if not await ui.confirm(
+            f"Run authenticated {environment} execution with model={model}, steps={steps}, sleep={sleep}s?"
+        ):
+            print(f"{environment.capitalize()} execution cancelled.")
             return 0
         return await ui.run_blocking(
             command_live,
@@ -1596,7 +1637,10 @@ def _tui_actions():
         if mode not in {"auto", "buy-sell", "sell-buy"}:
             print("Spot roundtrip mode must be auto, buy-sell, or sell-buy.", file=sys.stderr)
             return 2
-        if not await ui.confirm(f"Place {mode} spot testnet roundtrip for quantity={quantity:.8f}?"):
+        runtime = load_runtime()
+        if not await ui.confirm(
+            f"Place {mode} spot {_runtime_environment(runtime)} roundtrip for quantity={quantity:.8f}?"
+        ):
             print("Spot test order cancelled.")
             return 0
         return await ui.run_blocking(
@@ -1637,7 +1681,7 @@ def _tui_actions():
 
     return [
         TUIAction("1", "Overview", "Print the latest runtime, strategy, funds, model, and recent artifacts into the activity log.", _overview),
-        TUIAction("2", "Connect", "Ping the testnet exchange and validate that the configured credentials work.", _connect),
+        TUIAction("2", "Connect", "Ping the configured exchange and validate that the configured credentials work.", _connect),
         TUIAction("3", "Account", "Read authenticated balances and open positions from the exchange.", _account),
         TUIAction("4", "Readiness check", "Verify safety flags, training data, model compatibility, and optionally exchange connectivity.", _doctor),
         TUIAction("5", "Local audit", "Check candle quality, feature stability, model metadata, and risk posture without network calls.", _audit),
@@ -1649,8 +1693,8 @@ def _tui_actions():
         TUIAction("11", "Tune strategy", "Grid search execution parameters across all data, a recent lookback, or a date range.", _tune),
         TUIAction("12", "Prepare system", "One-shot pipeline: fetch candles, train, evaluate, backtest, audit, then readiness checks.", _prepare),
         TUIAction("13", "Paper loop", "Run the live loop in paper mode — no real orders; supports retraining controls.", _paper),
-        TUIAction("14", "Testnet loop", "Run authenticated testnet execution with real signed orders against the testnet exchange.", _live),
-        TUIAction("15", "Spot roundtrip", "Place a minimal BUY then SELL on spot testnet; smallest signed execution check.", _roundtrip),
+        TUIAction("14", "Testnet loop", "Run authenticated non-mainnet execution with real signed orders.", _live),
+        TUIAction("15", "Spot roundtrip", "Place a minimal BUY then SELL on spot testnet/demo; smallest signed execution check.", _roundtrip),
         TUIAction("16", "Operator report", "Print the dashboard, recent artifacts, readiness report, and optional account state.", _report),
         # Backwards-compatible aliases for direct configuration shortcuts.
         TUIAction("17", "Runtime settings", "Shortcut to the Runtime panel inside Settings (API keys, market, testnet, recvWindow).", _runtime),
@@ -2101,13 +2145,13 @@ def _roundtrip_second_quantity(client, symbol: str, side: str, executed_qty: flo
 def command_spot_roundtrip(args: argparse.Namespace) -> int:
     runtime = load_runtime()
     if not getattr(args, "yes", False):
-        print("Pass --yes to confirm signed spot-testnet order placement.", file=sys.stderr)
+        print("Pass --yes to confirm signed spot testnet/demo order placement.", file=sys.stderr)
         return 2
     if runtime.market_type != "spot":
         print("Spot roundtrip requires runtime.market_type=spot.", file=sys.stderr)
         return 2
-    if not runtime.testnet:
-        print("Spot roundtrip requires testnet=true.", file=sys.stderr)
+    if not _allows_signed_execution(runtime):
+        print("Spot roundtrip requires testnet=true or demo=true.", file=sys.stderr)
         return 2
     if not runtime.api_key or not runtime.api_secret:
         print("Spot roundtrip requires configured API credentials.", file=sys.stderr)
@@ -2186,7 +2230,7 @@ def command_spot_roundtrip(args: argparse.Namespace) -> int:
         },
     }
     artifact_path = _persist_run_artifact("spot_roundtrip", Path("data"), payload)
-    print("Spot test roundtrip complete.")
+    print(f"Spot {_runtime_environment(runtime)} roundtrip complete.")
     print(json.dumps({**payload, "artifact": str(artifact_path)}, indent=2))
     return 0
 
@@ -2205,7 +2249,10 @@ def command_configure(_: argparse.Namespace) -> int:
             return 2
 
     print("Runtime config saved to", config_paths()["runtime"])
-    print(f"market={next_runtime.market_type} testnet={next_runtime.testnet} paper={next_runtime.dry_run}")
+    print(
+        f"market={next_runtime.market_type} environment={_runtime_environment(next_runtime)} "
+        f"testnet={next_runtime.testnet} demo={getattr(next_runtime, 'demo', False)} paper={next_runtime.dry_run}"
+    )
     if next_runtime.market_type == "futures":
         print("futures-mode enabled; leverage can be set via strategy.leverage")
     return 0
@@ -2238,7 +2285,9 @@ def command_connect(_: argparse.Namespace) -> int:
 
         print("exchange: connected")
         print("market:", runtime.market_type)
+        print("environment:", _runtime_environment(runtime))
         print("testnet:", runtime.testnet)
+        print("demo:", getattr(runtime, "demo", False))
         print("endpoint:", client.base_url)
         print("server_time:", server_time.get("serverTime") if isinstance(server_time, dict) else server_time)
         if account is not None:
@@ -3007,8 +3056,8 @@ def command_live(args: argparse.Namespace) -> int:
         effective_dry_run = False
     else:
         effective_dry_run = runtime.dry_run or args.paper
-    if not runtime.testnet:
-        print("Real-money execution is disabled in this phase. Set testnet=true to run.")
+    if not _allows_signed_execution(runtime):
+        print("Real-money execution is disabled in this phase. Set testnet=true or demo=true to run.")
         return 2
     if not effective_dry_run and (not runtime.api_key or not runtime.api_secret):
         print("Live mode needs API key and secret. Run configure first or run with --paper.")

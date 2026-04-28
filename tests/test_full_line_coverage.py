@@ -62,6 +62,7 @@ def _runtime_form(**overrides: str) -> dict[str, str]:
         "market_type": "spot",
         "interval": "15m",
         "testnet": "yes",
+        "demo": "no",
         "api_key": "",
         "api_secret": "",
         "dry_run": "yes",

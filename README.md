@@ -4,14 +4,14 @@
 [![andrej-karpathy-skills](https://img.shields.io/static/v1?label=&message=andrej-karpathy-skills&color=555&logo=github&logoColor=white)](https://github.com/forrestchang/andrej-karpathy-skills)
 <!-- END GENERATED BADGES -->
 
-> **Early alpha test software.** This project is experimental and incomplete. Many or most features, workflows, trading assumptions, integrations, outputs, and safeguards may not work correctly or as intended. Use it only for testing and review, preferably on Binance testnet with paper/dry-run behavior. The project authors and contributors take no responsibility for losses, incorrect behavior, missed trades, API issues, data errors, or any other consequences from using this software.
+> **Early alpha test software.** This project is experimental and incomplete. Many or most features, workflows, trading assumptions, integrations, outputs, and safeguards may not work correctly or as intended. Use it only for testing and review, preferably on Binance testnet or Binance Demo Trading with paper/dry-run behavior. The project authors and contributors take no responsibility for losses, incorrect behavior, missed trades, API issues, data errors, or any other consequences from using this software.
 
-Interactive BTCUSDC testnet trading console for Binance.
+Interactive BTCUSDC non-mainnet trading console for Binance.
 
 The project is intentionally narrow and operator-focused:
 
 - `BTCUSDC` only for data, training, backtesting, and execution
-- Binance spot and futures testnet support
+- Binance spot and futures testnet support, plus explicit Binance Demo Trading endpoint selection
 - one primary interface: the interactive terminal console
 - guided runtime editing, strategy editing, feature selection, training, tuning, backtesting, and live-loop control
 - local credential storage with `600` permissions
@@ -20,10 +20,11 @@ The project is intentionally narrow and operator-focused:
 ## Safety defaults
 
 - `testnet` defaults to `true`.
+- `demo` defaults to `false`; when set to `true`, Binance Demo Trading endpoints are used.
 - Strategy can run in paper mode (`dry_run=true`) and is intended to be that way by default.
 - Real order execution happens only when `dry_run=false` in `live`.
-- This phase blocks real-money execution; live trading requires `testnet=true`.
-- Authenticated testnet live runs require API credentials and a readable model that matches the current strategy feature signature.
+- This phase blocks real-money execution; signed live execution requires `testnet=true` or `demo=true`.
+- Authenticated non-mainnet live runs require API credentials and a readable model that matches the current strategy feature signature.
 - `max_trades_per_day` can be set to `0` to disable daily caps.
 
 ## Quick start
@@ -126,15 +127,15 @@ Interval strings are validated against Binance's published enums (1s, 1m, 3m,
 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M; spot-only adds `1s`).
 A typo is rejected with a clear error listing every allowed value.
 
-### Autonomous testnet loop
+### Autonomous non-mainnet loop
 
 `autonomous start` drives an indefinite, pause-able live loop on Binance
-testnet.  Control is a tiny state file under `data/autonomous/state.json`
+testnet or Binance Demo Trading.  Control is a tiny state file under `data/autonomous/state.json`
 (`RUNNING` / `PAUSED` / `STOPPING` / `STOPPED`) so a second shell can pause or
 stop the loop without signals.  Every iteration writes a heartbeat to
 `data/autonomous/heartbeat.json`; every fill + close updates
 `data/autonomous/open_positions.json` and `data/autonomous/ledger.json`.  The
-loop refuses to start when `testnet=False` — real-money execution stays
+loop refuses to start when both `testnet=False` and `demo=False` — real-money execution stays
 blocked in this phase.
 
 ### Positions + P&L stats
@@ -218,10 +219,10 @@ The console supports:
 - evaluation and backtesting use the current saved model artifact
 - backtests report fee/slippage-aware buy-and-hold BTCUSDC P&L and
   `edge_vs_buy_hold` beside strategy P&L
-- the live loop supports paper mode and explicit authenticated testnet execution; `--paper` forces paper mode, while `--live` forces authenticated testnet execution
+- the live loop supports paper mode and explicit authenticated testnet/demo execution; `--paper` forces paper mode, while `--live` forces authenticated non-mainnet execution
 - `live --model PATH` loads that model before the loop; paper runs can regenerate a missing or incompatible model from current rows, but authenticated live runs fail fast instead
 - `live --sleep 0` is preserved as a real zero-delay loop for scripted paper/test runs; authenticated `--live` mode clamps this to a one-second minimum
-- `spot-roundtrip --mode auto --yes` performs the smallest signed spot-testnet exchange check from the CLI; it uses BUY then SELL when USDC is available, or SELL then BUY when only test BTC is available
+- `spot-roundtrip --mode auto --yes` performs the smallest signed spot testnet/demo exchange check from the CLI; it uses BUY then SELL when USDC is available, or SELL then BUY when only test BTC is available
 - authenticated live runs inspect exchange account state before the loop; futures positions are resumed, while spot BTC is resumed only up to the explicit managed BTC allocation
 - configured `recvWindow` is used for signed Binance requests, and startup credential validation calls an authenticated account endpoint when keys are present
 - futures close and emergency-close orders use reduce-only market orders with result responses requested, so a close path cannot intentionally increase exposure
@@ -252,6 +253,13 @@ with tBNB/BEP20 test tokens after an hCaptcha-backed browser request and the
 published 0.002 BNB BSC mainnet prerequisite. It does not directly fund a
 Binance Spot Testnet exchange account, so BTCUSDC exchange-order testing uses
 the Spot Testnet account balances exposed by the Binance API.
+
+Binance Demo Trading note: set `"demo": true` in runtime settings to route Spot
+requests to `https://demo-api.binance.com` and Futures requests to
+`https://demo-fapi.binance.com`. Demo Trading uses separate demo API keys from
+the regular Binance account API-key page. Binance documents it as the resettable
+virtual-funds path for user-facing Spot/Futures testing; existing Spot Testnet
+keys remain separate and cannot be reused on Demo Trading.
 
 ## Research reference
 
@@ -298,4 +306,4 @@ never appears in `argv`, remote URLs, `~/.git-credentials`, or shell history.
 - The current model backend is still intentionally lightweight and conservative; it is configurable and retrainable, but it is not a large deep-learning stack.
 - This is not production trading software; behavior is intentionally conservative and constrained to test-phase workflows.
 - API key security depends on file-system permissions and host security; do not commit secrets to version control.
-- Host selection is configurable via environment overrides, but execution scope remains BTCUSDC-only and testnet-first.
+- Host selection is configurable via environment overrides, but execution scope remains BTCUSDC-only and non-mainnet-first.
