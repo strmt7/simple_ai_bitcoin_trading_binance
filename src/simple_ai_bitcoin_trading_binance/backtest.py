@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from .features import ModelRow
-from .model import TrainedModel
+from .model import TrainedModel, confidence_adjusted_probability, model_decision_threshold
 from .types import StrategyConfig
 
 
@@ -34,14 +34,14 @@ def _fill_price(price: float, side_sign: int, slippage_bps: float) -> float:
     return price * (1.0 + side_sign * slippage)
 
 
-def _normalize_market_direction(signal_score: float, cfg: StrategyConfig, market_type: str) -> int:
+def _normalize_market_direction(signal_score: float, threshold: float, market_type: str) -> int:
     if market_type == "futures":
-        if signal_score >= cfg.signal_threshold:
+        if signal_score >= threshold:
             return 1
-        if signal_score <= (1.0 - cfg.signal_threshold):
+        if signal_score <= (1.0 - threshold):
             return -1
         return 0
-    return 1 if signal_score >= cfg.signal_threshold else 0
+    return 1 if signal_score >= threshold else 0
 
 
 def _close_position(
@@ -110,6 +110,7 @@ def run_backtest(
         leverage = 1.0
     if market_type == "futures" and leverage > 125:
         leverage = 125.0
+    decision_threshold = model_decision_threshold(model, cfg.signal_threshold)
 
     daily_trade_count: Dict[int, int] = {}
     max_daily: int | None = int(cfg.max_trades_per_day)
@@ -119,8 +120,9 @@ def run_backtest(
     max_open_positions = int(cfg.max_open_positions)
 
     for row in rows:
-        score = model.predict_proba(row.features)
-        signal = _normalize_market_direction(score, cfg, market_type)
+        raw_score = model.predict_proba(row.features)
+        score = confidence_adjusted_probability(raw_score, cfg.confidence_beta)
+        signal = _normalize_market_direction(score, decision_threshold, market_type)
         price = row.close
         day = _safe_day(row.timestamp)
         if day not in daily_trade_count:

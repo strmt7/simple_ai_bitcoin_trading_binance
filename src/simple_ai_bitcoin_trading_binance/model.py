@@ -10,6 +10,7 @@ from statistics import mean, pstdev
 from typing import Iterable, List, Tuple
 
 from .features import FEATURE_VERSION, feature_dimension, ModelRow
+from .storage import write_json_atomic
 
 
 def _clamp(x: float, low: float, high: float) -> float:
@@ -39,6 +40,10 @@ class TrainedModel:
     seed: int = 7
     class_weight_pos: float = 1.0
     class_weight_neg: float = 1.0
+    decision_threshold: float | None = None
+    calibration_size: int = 0
+    validation_size: int = 0
+    training_cutoff_timestamp: int | None = None
 
     def _normalize(self, features: Tuple[float, ...]) -> Tuple[float, ...]:
         if len(features) != self.feature_dim:
@@ -93,6 +98,13 @@ class ClassificationReport:
     false_negative: int
 
 
+@dataclass(frozen=True)
+class TemporalValidationSplit:
+    train_rows: List[ModelRow]
+    calibration_rows: List[ModelRow]
+    validation_rows: List[ModelRow]
+
+
 def _safe_division(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 0.0
@@ -141,6 +153,63 @@ def _confusion(rows: List[ModelRow], model: TrainedModel, threshold: float) -> t
         else:
             fn += 1
     return tp, fp, tn, fn
+
+
+def confidence_adjusted_probability(probability: float, beta: float | None) -> float:
+    """Shrink a probability toward neutral confidence without changing order."""
+
+    try:
+        value = float(probability)
+    except (TypeError, ValueError):
+        value = 0.5
+    value = _clamp(value, 0.0, 1.0)
+    if beta is None:
+        return value
+    try:
+        shrink = float(beta)
+    except (TypeError, ValueError):
+        shrink = 1.0
+    shrink = _clamp(shrink, 0.0, 1.0)
+    return 0.5 + (value - 0.5) * shrink
+
+
+def model_decision_threshold(model: TrainedModel, fallback: float) -> float:
+    threshold = getattr(model, "decision_threshold", None)
+    if threshold is None:
+        threshold = fallback
+    return _clamp(float(threshold), 0.0, 1.0)
+
+
+def temporal_validation_split(
+    rows: List[ModelRow],
+    *,
+    calibration_ratio: float = 0.15,
+    validation_ratio: float = 0.15,
+) -> TemporalValidationSplit:
+    """Chronologically split rows so calibration and reported validation differ."""
+
+    ordered = sorted(rows, key=lambda row: row.timestamp)
+    total = len(ordered)
+    if total < 3:
+        return TemporalValidationSplit(ordered, [], [])
+
+    calibration_ratio = _clamp(float(calibration_ratio), 0.0, 0.8)
+    validation_ratio = _clamp(float(validation_ratio), 0.0, 0.8)
+    calibration_size = max(1, int(total * calibration_ratio)) if calibration_ratio > 0.0 else 0
+    validation_size = max(1, int(total * validation_ratio)) if validation_ratio > 0.0 else 0
+    while calibration_size + validation_size >= total and (calibration_size > 0 or validation_size > 0):
+        if validation_size >= calibration_size and validation_size > 0:
+            validation_size -= 1
+        else:
+            calibration_size -= 1
+
+    train_end = total - calibration_size - validation_size
+    calibration_end = total - validation_size
+    return TemporalValidationSplit(
+        train_rows=ordered[:train_end],
+        calibration_rows=ordered[train_end:calibration_end],
+        validation_rows=ordered[calibration_end:],
+    )
 
 
 def calibrate_threshold(rows: List[ModelRow], model: TrainedModel, *, start: float = 0.1, end: float = 0.9,
@@ -319,7 +388,7 @@ def walk_forward_report(
 
 
 def serialize_model(model: TrainedModel, path) -> None:
-    path.write_text(json.dumps(asdict(model), indent=2), encoding="utf-8")
+    write_json_atomic(path, asdict(model), indent=2)
 
 
 def load_model(
@@ -387,4 +456,16 @@ def load_model(
         seed=int(payload.get("seed", 7)),
         class_weight_pos=float(payload.get("class_weight_pos", 1.0)),
         class_weight_neg=float(payload.get("class_weight_neg", 1.0)),
+        decision_threshold=(
+            float(payload["decision_threshold"])
+            if payload.get("decision_threshold") is not None
+            else None
+        ),
+        calibration_size=int(payload.get("calibration_size", 0)),
+        validation_size=int(payload.get("validation_size", 0)),
+        training_cutoff_timestamp=(
+            int(payload["training_cutoff_timestamp"])
+            if payload.get("training_cutoff_timestamp") is not None
+            else None
+        ),
     )

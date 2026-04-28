@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Dict
 
 from .features import normalize_enabled_features
+from .storage import write_json_atomic
 from .types import RuntimeConfig, StrategyConfig, config_paths
 
 SUPPORTED_SYMBOL = "BTCUSDC"
@@ -24,10 +25,7 @@ def _read_config_json(path: Path) -> Dict[str, object]:
 
 
 def _write_json(path: Path, payload: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    # keep key material local and less exposed
-    path.chmod(0o600)
+    write_json_atomic(path, payload, indent=2, sort_keys=True, mode=0o600)
 
 
 def _normalize_runtime_payload(payload: Dict[str, object]) -> Dict[str, object]:

@@ -131,3 +131,24 @@ def test_backtest_exit_fee_uses_exit_notional() -> None:
     result = run_backtest(rows, model, cfg, starting_cash=1000.0, market_type="spot")
     assert result.closed_trades == 1
     assert result.total_fees == 2.2
+
+
+def test_backtest_uses_model_threshold_and_confidence_shrinkage() -> None:
+    rows = [
+        ModelRow(timestamp=0, close=100.0, features=(1.0,), label=1),
+        ModelRow(timestamp=60_000, close=105.0, features=(1.0,), label=1),
+    ]
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.5,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+        decision_threshold=0.60,
+    )
+    active = StrategyConfig(signal_threshold=0.90, confidence_beta=1.0, risk_per_trade=0.1)
+    conservative = StrategyConfig(signal_threshold=0.90, confidence_beta=0.1, risk_per_trade=0.1)
+
+    assert run_backtest(rows, model, active, starting_cash=1000.0).closed_trades == 1
+    assert run_backtest(rows, model, conservative, starting_cash=1000.0).closed_trades == 0

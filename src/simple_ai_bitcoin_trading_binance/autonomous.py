@@ -41,6 +41,7 @@ from .positions import (
     new_position_id,
     now_ms,
 )
+from .storage import write_json_atomic
 from .types import RuntimeConfig, StrategyConfig
 
 STATE_RUNNING = "RUNNING"
@@ -65,8 +66,7 @@ class AutonomousControl:
         if state not in _VALID_STATES:
             raise ValueError(f"Invalid state {state!r}")
         payload = {"state": state, "note": note, "ts_ms": now_ms()}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        write_json_atomic(self.path, payload, indent=2, sort_keys=True)
 
     def read(self) -> dict[str, object]:
         if not self.path.exists():
@@ -100,8 +100,7 @@ class Heartbeat:
     message: str = ""
 
     def write(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2, sort_keys=True), encoding="utf-8")
+        write_json_atomic(path, asdict(self), indent=2, sort_keys=True)
 
 
 @dataclass

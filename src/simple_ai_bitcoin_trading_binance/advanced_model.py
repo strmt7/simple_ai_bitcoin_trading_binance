@@ -29,6 +29,7 @@ from .features import (
     make_rows as make_base_rows,
     normalize_enabled_features,
 )
+from .market_data import clean_candles
 from .model import TrainedModel, train as train_logistic
 
 ADVANCED_FEATURE_VERSION = "v2-advanced"
@@ -217,25 +218,7 @@ def make_advanced_rows(
 
 
 def _filter_valid(candles: Sequence[Candle]) -> list[Candle]:
-    out: list[Candle] = []
-    for c in candles:
-        if not math.isfinite(c.open) or not math.isfinite(c.high) or not math.isfinite(c.low) or not math.isfinite(c.close):
-            continue
-        if c.open <= 0.0 or c.high <= 0.0 or c.low <= 0.0 or c.close <= 0.0:
-            continue
-        if c.volume < 0.0 or c.open_time < 0 or c.close_time < 0:
-            continue
-        if c.low > c.high:
-            continue
-        if not (c.low <= c.open <= c.high):
-            continue
-        if not (c.low <= c.close <= c.high):
-            continue
-        if c.close_time < c.open_time:
-            continue
-        out.append(c)
-    out.sort(key=lambda c: c.open_time)
-    return out
+    return clean_candles(candles)
 
 
 def advanced_feature_signature(cfg: AdvancedFeatureConfig) -> str:

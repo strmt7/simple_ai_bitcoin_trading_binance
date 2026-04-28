@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 from .api import Candle
+from .market_data import clean_candles
 
 
 FEATURE_VERSION = "v1"
@@ -175,8 +176,7 @@ def make_rows(
         raise ValueError("long_window must be greater than or equal to short_window")
 
     selected_indices = _feature_indices(enabled_features)
-    candles = [c for c in candles if _valid_ohlcv(c)]
-    candles = sorted(candles, key=lambda c: c.open_time)
+    candles = [c for c in clean_candles(candles) if _valid_ohlcv(c)]
     closes = [c.close for c in candles]
     rows: List[ModelRow] = []
     min_window = max(long_window, short_window, lookahead + 2, 2 * long_window)

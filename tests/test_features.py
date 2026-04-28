@@ -141,9 +141,13 @@ def test_feature_edge_helpers_cover_short_and_nonfinite_inputs() -> None:
 
 
 def test_valid_ohlcv_rejects_invalid_shapes() -> None:
+    assert not _valid_ohlcv(Candle(0, float("nan"), 101.0, 99.0, 100.0, 1.0, 60_000))
     assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 102.0, 100.5, 1.0, 60_000))
     assert not _valid_ohlcv(Candle(0, -1.0, 101.0, 99.0, 100.0, 1.0, 60_000))
     assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 99.0, 100.0, -1.0, 60_000))
+    assert not _valid_ohlcv(Candle(0, 98.0, 101.0, 99.0, 100.0, 1.0, 60_000))
+    assert not _valid_ohlcv(Candle(0, 100.0, 101.0, 99.0, 102.0, 1.0, 60_000))
+    assert not _valid_ohlcv(Candle(60_000, 100.0, 101.0, 99.0, 100.0, 1.0, 0))
 
 
 def test_make_rows_sorts_input_and_applies_label_threshold() -> None:

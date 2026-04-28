@@ -239,7 +239,12 @@ Run artifacts are JSON files written next to the model path, normally under `dat
 
 ## Research reference
 
-For verified design comparisons against high-status trading bots, exchange SDKs, and backtesting frameworks, see `docs/SIMILAR_TRADING_REPOS_REVIEW.md`. Agent instructions in `AGENTS.md` require reading it before broad product, architecture, CLI, or workflow redesigns.
+For verified design comparisons against high-status trading bots, exchange SDKs,
+and backtesting frameworks, see `docs/SIMILAR_TRADING_REPOS_REVIEW.md`. For the
+current free external signal/API inventory, see
+`docs/FREE_SIGNAL_SOURCE_INVENTORY.md`. Agent instructions in `AGENTS.md`
+require reading the comparable-repo review before broad product, architecture,
+CLI, or workflow redesigns.
 
 ## Development
 

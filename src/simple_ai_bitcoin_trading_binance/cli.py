@@ -16,17 +16,22 @@ from .config import config_paths, load_runtime, load_strategy, prompt_runtime, s
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
 from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_enabled_features
 from .api import SymbolConstraints
+from .market_data import clean_candles
 from .model import (
     calibrate_threshold,
+    confidence_adjusted_probability,
     evaluate_classification,
     evaluate,
     ModelFeatureMismatchError,
     ModelLoadError,
     load_model,
+    model_decision_threshold,
     serialize_model,
+    temporal_validation_split,
     train,
     walk_forward_report,
 )
+from .storage import write_json_atomic
 from .types import RuntimeConfig, StrategyConfig
 
 
@@ -1740,7 +1745,7 @@ def _artifact_path(kind: str, *, output_dir: Path) -> Path:
 
 def _persist_run_artifact(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
     path = _artifact_path(kind, output_dir=output_dir)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_atomic(path, payload, indent=2, sort_keys=True)
     return path
 
 
@@ -1749,6 +1754,7 @@ def _public_runtime_payload(runtime) -> dict[str, object]:
 
 
 def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
+    candles = clean_candles(c for c in candles if hasattr(c, "open_time"))
     return make_rows(
         candles,
         strategy.feature_windows[0],
@@ -1915,14 +1921,15 @@ def _build_live_model(
     return train(train_rows, epochs=epochs, feature_signature=_strategy_feature_signature(cfg))
 
 
-def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str) -> int:
+def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str, threshold: float | None = None) -> int:
+    threshold = cfg.signal_threshold if threshold is None else _clamp(float(threshold), 0.0, 1.0)
     if market_type == "futures":
-        if score >= cfg.signal_threshold:
+        if score >= threshold:
             return 1
-        if score <= (1.0 - cfg.signal_threshold):
+        if score <= (1.0 - threshold):
             return -1
         return 0
-    return 1 if score >= cfg.signal_threshold else 0
+    return 1 if score >= threshold else 0
 
 
 def _safe_float(value: object) -> float:
@@ -2337,7 +2344,7 @@ def command_fetch(args: argparse.Namespace) -> int:
     except BinanceAPIError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    candles = sorted(candles_by_open_time.values(), key=lambda candle: candle.open_time)[-limit:]
+    candles = clean_candles(candles_by_open_time.values())[-limit:]
 
     payload = [
         {
@@ -2351,8 +2358,7 @@ def command_fetch(args: argparse.Namespace) -> int:
         }
         for c in candles
     ]
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_json_atomic(output, payload, indent=2)
     print(f"saved {len(payload)} candles to {output}")
     return 0
 
@@ -2412,9 +2418,10 @@ def command_train(args: argparse.Namespace) -> int:
 
     model_signature = _strategy_feature_signature(cfg)
 
-    split = max(2, int(len(rows) * 0.8))
-    train_rows = rows[:split]
-    test_rows = rows[split:]
+    split = temporal_validation_split(rows)
+    train_rows = split.train_rows
+    calibration_rows = split.calibration_rows
+    validation_rows = split.validation_rows
 
     model = train(
         train_rows,
@@ -2425,21 +2432,28 @@ def command_train(args: argparse.Namespace) -> int:
         feature_signature=model_signature,
     )
     threshold = cfg.signal_threshold
-    if args.calibrate_threshold and test_rows:
-        threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
+    if args.calibrate_threshold and calibration_rows:
+        threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
+    model.decision_threshold = float(threshold)
+    model.calibration_size = len(calibration_rows) if args.calibrate_threshold else 0
+    model.validation_size = len(validation_rows)
+    model.training_cutoff_timestamp = train_rows[-1].timestamp if train_rows else None
     train_score = evaluate(train_rows, model, threshold=threshold)
-    test_score = evaluate(test_rows, model, threshold=threshold) if test_rows else 0.0
-    tuned_score = evaluate(test_rows, model, threshold=threshold) if test_rows else test_score
+    calibration_score = evaluate(calibration_rows, model, threshold=threshold) if calibration_rows else 0.0
+    validation_score = evaluate(validation_rows, model, threshold=threshold) if validation_rows else 0.0
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     serialize_model(model, output)
     print(f"trained model saved to {output}")
-    print(f"rows: {len(rows)} split train={len(train_rows)} test={len(test_rows)}")
+    print(
+        f"rows: {len(rows)} split train={len(train_rows)} "
+        f"calibration={len(calibration_rows)} validation={len(validation_rows)}"
+    )
     print(f"in-sample directional accuracy: {train_score:.3f}")
-    print(f"out-of-sample directional accuracy: {test_score:.3f}")
-    if args.calibrate_threshold and test_rows:
+    print(f"out-of-sample directional accuracy: {validation_score:.3f}")
+    if args.calibrate_threshold and calibration_rows:
         print(f"validated threshold: {threshold:.3f}")
-        print(f"out-of-sample directional accuracy (calibrated): {tuned_score:.3f}")
+        print(f"calibration directional accuracy: {calibration_score:.3f}")
     artifact = {
         "command": "train",
         "timestamp": int(time.time()),
@@ -2451,7 +2465,8 @@ def command_train(args: argparse.Namespace) -> int:
             "output": str(args.output),
             "rows_total": len(rows),
             "rows_train": len(train_rows),
-            "rows_test": len(test_rows),
+            "rows_calibration": len(calibration_rows),
+            "rows_validation": len(validation_rows),
             "epochs": int(args.epochs),
             "learning_rate": float(learning_rate),
             "l2_penalty": float(l2_penalty),
@@ -2463,10 +2478,13 @@ def command_train(args: argparse.Namespace) -> int:
         "walk_forward": wf if wf is not None else None,
         "metrics": {
             "in_sample_accuracy": float(train_score),
-            "out_of_sample_accuracy": float(test_score),
+            "out_of_sample_accuracy": float(validation_score),
+            "calibration_accuracy": float(calibration_score),
             "threshold": float(threshold),
-            "tuned_threshold": float(threshold) if args.calibrate_threshold and test_rows else None,
-            "calibrated_out_of_sample_accuracy": float(tuned_score) if args.calibrate_threshold and test_rows else None,
+            "tuned_threshold": float(threshold) if args.calibrate_threshold and calibration_rows else None,
+            "calibrated_out_of_sample_accuracy": float(validation_score)
+            if args.calibrate_threshold and validation_rows
+            else None,
             "model_feature_version": model.feature_version,
             "model_feature_signature": model.feature_signature,
         },
@@ -2475,6 +2493,14 @@ def command_train(args: argparse.Namespace) -> int:
             "feature_dim": int(model.feature_dim),
             "feature_version": str(model.feature_version),
             "feature_signature": model.feature_signature,
+            "decision_threshold": float(model.decision_threshold)
+            if model.decision_threshold is not None
+            else None,
+            "calibration_size": int(model.calibration_size),
+            "validation_size": int(model.validation_size),
+            "training_cutoff_timestamp": int(model.training_cutoff_timestamp)
+            if model.training_cutoff_timestamp is not None
+            else None,
         },
         "market": runtime.market_type,
         "symbol": runtime.symbol,
@@ -2606,6 +2632,7 @@ def command_backtest(args: argparse.Namespace) -> int:
     except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
+    decision_threshold = model_decision_threshold(model, cfg.signal_threshold)
     result = run_backtest(rows, model, cfg, starting_cash=args.start_cash, market_type=runtime.market_type)
     artifact = {
         "command": "backtest",
@@ -2614,6 +2641,7 @@ def command_backtest(args: argparse.Namespace) -> int:
         "strategy": cfg.asdict(),
         "input": str(args.input),
         "model": str(model_path),
+        "decision_threshold": float(decision_threshold),
         "starting_cash": float(args.start_cash),
         "rows": len(rows),
         "market": runtime.market_type,
@@ -2679,24 +2707,25 @@ def command_evaluate(args: argparse.Namespace) -> int:
         print(f"Model file not found: {model_path}")
         return 2
 
-    split = max(1, int(len(rows) * 0.8))
-    train_rows = rows[:split]
-    test_rows = rows[split:]
+    split = temporal_validation_split(rows)
+    train_rows = split.train_rows
+    calibration_rows = split.calibration_rows
+    test_rows = split.validation_rows
 
     try:
         model = _load_runtime_model(model_path, cfg)
     except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
-    threshold = cfg.signal_threshold
+    threshold = model_decision_threshold(model, cfg.signal_threshold)
     if args.threshold is not None:
         threshold = float(args.threshold)
     elif test_rows:
         # make default threshold robust against short samples and class imbalance
-        threshold = cfg.signal_threshold
+        threshold = model_decision_threshold(model, cfg.signal_threshold)
 
-    if args.calibrate_threshold and test_rows:
-        threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
+    if args.calibrate_threshold and calibration_rows:
+        threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
 
     report = evaluate_classification(test_rows if test_rows else rows, model, threshold=threshold)
     train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
@@ -2711,6 +2740,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
         "symbol": runtime.symbol,
         "split": {
             "train_rows": len(train_rows),
+            "calibration_rows": len(calibration_rows),
             "test_rows": len(test_rows),
         },
         "threshold": float(report.threshold),
@@ -2974,7 +3004,9 @@ def command_live(args: argparse.Namespace) -> int:
             model_loads += 1
         latest = rows[-1]
         try:
-            score = model.predict_proba(latest.features)
+            raw_score = model.predict_proba(latest.features)
+            threshold = model_decision_threshold(model, cfg.signal_threshold)
+            score = confidence_adjusted_probability(raw_score, cfg.confidence_beta)
         except ValueError as exc:
             if not effective_dry_run:
                 print(f"Live model incompatible with current rows: {exc}", file=sys.stderr)
@@ -2985,8 +3017,10 @@ def command_live(args: argparse.Namespace) -> int:
             print(f"paper model incompatible; retraining: {exc}", file=sys.stderr)
             model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
             model_loads += 1
-            score = model.predict_proba(latest.features)
-        direction = _score_to_direction(score, cfg, runtime.market_type)
+            raw_score = model.predict_proba(latest.features)
+            threshold = model_decision_threshold(model, cfg.signal_threshold)
+            score = confidence_adjusted_probability(raw_score, cfg.confidence_beta)
+        direction = _score_to_direction(score, cfg, runtime.market_type, threshold)
 
         # cooldown reduces immediate flip-flopping in choppy conditions
         if cooldown_left > 0:

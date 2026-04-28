@@ -9,11 +9,14 @@ from pathlib import Path
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
     ClassificationReport,
+    confidence_adjusted_probability,
     feature_dimension,
     ModelFeatureMismatchError,
     load_model,
+    model_decision_threshold,
     evaluate_classification,
     evaluate,
+    temporal_validation_split,
     train,
     walk_forward_report,
 )
@@ -58,6 +61,9 @@ def test_load_model_backwards_compatibility(tmp_path: Path) -> None:
     assert model.l2_penalty == 1e-4
     assert model.class_weight_pos == 1.0
     assert model.class_weight_neg == 1.0
+    assert model.decision_threshold is None
+    assert model.calibration_size == 0
+    assert model.validation_size == 0
 
 
 def test_load_model_rejects_mismatched_version(tmp_path: Path) -> None:
@@ -165,3 +171,56 @@ def test_walk_forward_report_runs() -> None:
     assert report["test_window"] == 20
     assert report["step"] == 20
     assert report["average_score"] >= 0.0
+
+
+def test_temporal_validation_split_keeps_calibration_out_of_validation() -> None:
+    rows = list(reversed(_rows()))
+    split = temporal_validation_split(rows, calibration_ratio=0.2, validation_ratio=0.2)
+    assert len(split.train_rows) == 72
+    assert len(split.calibration_rows) == 24
+    assert len(split.validation_rows) == 24
+    assert split.train_rows[-1].timestamp < split.calibration_rows[0].timestamp
+    assert split.calibration_rows[-1].timestamp < split.validation_rows[0].timestamp
+
+
+def test_temporal_validation_split_caps_oversized_holdouts() -> None:
+    rows = [
+        ModelRow(timestamp=2, close=102.0, features=(1.0,), label=1),
+        ModelRow(timestamp=0, close=100.0, features=(0.0,), label=0),
+        ModelRow(timestamp=1, close=101.0, features=(0.5,), label=1),
+    ]
+
+    split = temporal_validation_split(rows, calibration_ratio=1.0, validation_ratio=1.0)
+
+    assert [row.timestamp for row in split.train_rows] == [0]
+    assert [row.timestamp for row in split.calibration_rows] == [1]
+    assert [row.timestamp for row in split.validation_rows] == [2]
+
+
+def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -> None:
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+        decision_threshold=0.65,
+        calibration_size=12,
+        validation_size=8,
+        training_cutoff_timestamp=123,
+    )
+    from simple_ai_bitcoin_trading_binance.model import serialize_model
+
+    path = tmp_path / "model.json"
+    serialize_model(model, path)
+    loaded = load_model(path, expected_feature_dim=1)
+    assert model_decision_threshold(loaded, 0.55) == 0.65
+    assert loaded.calibration_size == 12
+    assert loaded.validation_size == 8
+    assert loaded.training_cutoff_timestamp == 123
+    assert confidence_adjusted_probability(0.9, 0.5) == 0.7
+    assert confidence_adjusted_probability(0.1, 0.5) == 0.3
+    assert confidence_adjusted_probability("bad", 0.5) == 0.5
+    assert confidence_adjusted_probability(0.8, None) == 0.8
+    assert confidence_adjusted_probability(0.8, "bad") == 0.8

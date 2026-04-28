@@ -24,6 +24,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .storage import write_json_atomic
+
 
 @dataclass
 class OpenPosition:
@@ -133,8 +135,7 @@ class PositionsStore:
         return [entry for entry in payload if isinstance(entry, dict)]
 
     def _write(self, path: Path, payload: list[dict[str, Any]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        write_json_atomic(path, payload, indent=2, sort_keys=True)
 
     # ---- public API ---------------------------------------------------------
 
