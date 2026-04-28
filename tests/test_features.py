@@ -166,3 +166,14 @@ def test_make_rows_legacy_matches_default_feature_shape() -> None:
     assert len(legacy_rows) == len(default_rows)
     assert legacy_rows[0].features == default_rows[0].features
     assert legacy_rows[0].label == default_rows[0].label
+
+
+def test_latest_features_are_stable_across_cache_depths() -> None:
+    candles = _fake_candles()
+    full = make_rows(candles, short_window=10, long_window=30)
+    tail = make_rows(candles[-90:], short_window=10, long_window=30)
+
+    assert full
+    assert tail
+    assert full[-1].timestamp == tail[-1].timestamp
+    assert full[-1].features == pytest.approx(tail[-1].features)

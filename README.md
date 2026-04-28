@@ -89,6 +89,7 @@ simple-ai-trading close <id|all>            # local ledger close (no exchange or
 simple-ai-trading prepare --preset balanced --epochs 180 --learning-rate 0.05 --l2-penalty 0.0001 --batch-size 1000 --online-doctor
 simple-ai-trading report
 simple-ai-trading doctor --online
+simple-ai-trading audit
 simple-ai-trading train --preset balanced
 simple-ai-trading strategy --profile conservative
 simple-ai-trading live --paper --model data/model.json --steps 20 --sleep 0
@@ -207,10 +208,15 @@ The console supports:
 - training uses the current feature selection from strategy settings
 - training supports `custom`, `quick`, `balanced`, and `thorough` presets
 - `fetch --batch-size N` pages kline downloads into request sizes up to Binance's spot 1000-candle limit or USD-M futures 1500-candle limit; live and signed order calls stay sequential to preserve exchange state and rate-limit safety
-- `prepare` runs the normal offline sequence: fetch candles, train, evaluate, backtest, then readiness checks; it stops at the first failed step
+- `prepare` runs the normal offline sequence: fetch candles, train, evaluate, backtest, local audit, then readiness checks; it stops at the first failed step
+- `audit` runs no-network diagnostics for candle quality, feature stability,
+  model metadata, and risk posture; `prepare` runs it before the final
+  readiness check
 - `prepare` exposes fetch batch size, preset, epochs, learning rate, L2 penalty, seed, walk-forward windows, threshold calibration, and backtest starting cash so one command can reproduce many training configurations
 - `report` prints the current dashboard, recent artifacts, and readiness checks by default; add `--no-doctor`, `--online`, or `--account` when you need to omit readiness, check connectivity, or include authenticated account state
 - evaluation and backtesting use the current saved model artifact
+- backtests report fee/slippage-aware buy-and-hold BTCUSDC P&L and
+  `edge_vs_buy_hold` beside strategy P&L
 - the live loop supports paper mode and explicit authenticated testnet execution; `--paper` forces paper mode, while `--live` forces authenticated testnet execution
 - `live --model PATH` loads that model before the loop; paper runs can regenerate a missing or incompatible model from current rows, but authenticated live runs fail fast instead
 - `live --sleep 0` is preserved as a real zero-delay loop for scripted paper/test runs; authenticated `--live` mode clamps this to a one-second minimum
@@ -242,9 +248,10 @@ Run artifacts are JSON files written next to the model path, normally under `dat
 For verified design comparisons against high-status trading bots, exchange SDKs,
 and backtesting frameworks, see `docs/SIMILAR_TRADING_REPOS_REVIEW.md`. For the
 current free external signal/API inventory, see
-`docs/FREE_SIGNAL_SOURCE_INVENTORY.md`. Agent instructions in `AGENTS.md`
-require reading the comparable-repo review before broad product, architecture,
-CLI, or workflow redesigns.
+`docs/FREE_SIGNAL_SOURCE_INVENTORY.md`. The 2026-04-28 design pass is recorded
+in `docs/DESIGN_RESEARCH_NOTES_2026-04-28.md`. Agent instructions in
+`AGENTS.md` require reading the comparable-repo review before broad product,
+architecture, CLI, or workflow redesigns.
 
 ## Development
 

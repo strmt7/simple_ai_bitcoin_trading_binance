@@ -23,6 +23,8 @@ class BacktestResult:
     stopped_by_drawdown: bool
     max_exposure: float
     trades_per_day_cap_hit: int
+    buy_hold_pnl: float = 0.0
+    edge_vs_buy_hold: float = 0.0
 
 
 def _bps_to_rate(bps: float) -> float:
@@ -64,6 +66,29 @@ def _safe_day(ts_ms: int) -> int:
     return int(ts_ms // (24 * 60 * 60 * 1000))
 
 
+def _buy_hold_pnl(rows: List[ModelRow], starting_cash: float, cfg: StrategyConfig) -> float:
+    """Return fee/slippage-aware buy-and-hold BTCUSDC baseline P&L."""
+
+    if not rows or starting_cash <= 0:
+        return 0.0
+    first = rows[0].close
+    last = rows[-1].close
+    if first <= 0 or last <= 0:
+        return 0.0
+    fee_rate = _bps_to_rate(cfg.taker_fee_bps)
+    entry = _fill_price(first, 1, cfg.slippage_bps)
+    exit_price = _fill_price(last, -1, cfg.slippage_bps)
+    if entry <= 0 or exit_price <= 0:
+        return 0.0
+    entry_notional = starting_cash / (1.0 + fee_rate)
+    qty = entry_notional / entry
+    entry_fee = entry_notional * fee_rate
+    cash = starting_cash - entry_notional - entry_fee
+    exit_notional = qty * exit_price
+    exit_fee = exit_notional * fee_rate
+    return cash + exit_notional - exit_fee - starting_cash
+
+
 def run_backtest(
     rows: List[ModelRow],
     model: TrainedModel,
@@ -86,6 +111,8 @@ def run_backtest(
             total_fees=0.0,
             max_exposure=0.0,
             trades_per_day_cap_hit=0,
+            buy_hold_pnl=0.0,
+            edge_vs_buy_hold=0.0,
         )
 
     cash = float(starting_cash)
@@ -251,6 +278,8 @@ def run_backtest(
 
     trades = closed_trades
 
+    buy_hold_pnl = _buy_hold_pnl(rows, starting_cash, cfg)
+
     return BacktestResult(
         starting_cash=starting_cash,
         ending_cash=cash,
@@ -264,4 +293,6 @@ def run_backtest(
         total_fees=total_fees,
         max_exposure=max_exposure,
         trades_per_day_cap_hit=cap_hits,
+        buy_hold_pnl=buy_hold_pnl,
+        edge_vs_buy_hold=realized_pnl - buy_hold_pnl,
     )

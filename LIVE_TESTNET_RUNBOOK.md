@@ -71,8 +71,14 @@ Optional host override checks:
 4. Backtest sanity
    - Run `Backtest`
    - Confirm no obvious instability or immediate drawdown-limit termination
+   - Compare strategy P&L with `buy_hold_pnl` and `edge_vs_buy_hold`
 
-5. Dry-run live session
+5. Local audit
+   - Run `Local audit`
+   - Resolve every `[fix]` item before moving to paper or testnet execution
+   - Investigate `[warn]` items before increasing risk or loop length
+
+6. Dry-run live session
    - Run `Paper loop`
    - Verify:
      - no runtime exceptions
@@ -80,7 +86,7 @@ Optional host override checks:
      - generated live artifact under `data/`
      - entries/closes/skips are plausible
 
-6. Controlled testnet order session
+7. Controlled testnet order session
    - Only after dry-run behavior is understood
    - Use the smallest reasonable exposure
    - Prefer a short `Testnet loop`
@@ -123,6 +129,7 @@ Stop immediately if any of the following occur:
 - `Train model`
 - `Evaluate`
 - `Backtest`
+- `Local audit`
 - `Paper loop`
 
 ## Decision gate before any non-paper testnet order
@@ -132,5 +139,6 @@ Proceed only if:
 - local tests are green
 - PR workflow is green
 - `connect` confirms testnet
+- `audit` has no `[fix]` findings
 - dry-run live loop behaves as expected
 - generated artifacts are internally consistent

@@ -320,8 +320,8 @@ def test_feature_model_dashboard_and_backtest_edges(tmp_path, monkeypatch) -> No
     assert trained.class_weight_neg == 1.0
 
     rows = [ModelRow(i, 100.0 + i, (float(i),), i % 2) for i in range(26)]
-    report = walk_forward_report(rows, train_window=8, test_window=10, step=4, epochs=1, calibrate=True)
-    assert report["thresholds"] != [0.5] * report["folds"]
+    report = walk_forward_report(rows, train_window=12, test_window=5, step=4, epochs=1, calibrate=True)
+    assert report["calibration_sizes"] == [2, 2, 2]
 
     model_payload = {
         "weights": [0.1],

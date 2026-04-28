@@ -23,6 +23,8 @@ from simple_ai_bitcoin_trading_binance.autonomous import (
     STATE_STOPPING,
     _close_to_trade,
     _default_decision,
+    _directional_confidence,
+    _entry_gate,
     _evaluate_auto_close,
     _open_position_from_decision,
     ensure_credentials,
@@ -32,6 +34,7 @@ from simple_ai_bitcoin_trading_binance.autonomous import (
 from simple_ai_bitcoin_trading_binance.logging_ext import reset as reset_logger
 from simple_ai_bitcoin_trading_binance.objective import get_objective
 from simple_ai_bitcoin_trading_binance.positions import (
+    ClosedTrade,
     OpenPosition,
     PositionsStore,
     new_position_id,
@@ -322,6 +325,12 @@ def test_default_decision_returns_flat(tmp_path: Path) -> None:
     assert decision.confidence == 0.0
 
 
+def test_directional_confidence_handles_short_and_invalid_values() -> None:
+    assert _directional_confidence(Decision(side="LONG", confidence=0.8, mark_price=1.0)) == 0.8
+    assert _directional_confidence(Decision(side="SHORT", confidence=0.2, mark_price=1.0)) == 0.8
+    assert _directional_confidence(Decision(side="LONG", confidence="bad", mark_price=1.0)) == 0.0
+
+
 # ----- run_loop: integration-ish branches ----------------------------------
 
 
@@ -542,6 +551,103 @@ def test_run_loop_respects_max_open_positions(tmp_path: Path) -> None:
     # No new opens despite LONG signal
     assert result.opened_trades == 0
     assert len(PositionsStore(root=cfg.positions_root).load_open()) == 1
+
+
+def test_run_loop_respects_zero_max_open_positions(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path, stop_after_iterations=1)
+    strat = replace(StrategyConfig(), max_open_positions=0)
+
+    result = run_loop(
+        FakeClient(), _runtime(), strat, cfg,
+        decision_fn=lambda *_: Decision(side="LONG", confidence=0.9, mark_price=100.0),
+        sleep=lambda _d: None,
+        clock=_tick_clock(),
+    )
+
+    assert result.opened_trades == 0
+    assert result.skipped_entries == 1
+    assert PositionsStore(root=cfg.positions_root).load_open() == []
+
+
+def test_entry_gate_blocks_daily_cap_cooldown_drawdown_and_low_confidence(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path, starting_reference_cash=1000.0)
+    store = PositionsStore(root=cfg.positions_root)
+    strategy = replace(
+        StrategyConfig(),
+        max_trades_per_day=1,
+        cooldown_minutes=5,
+        max_drawdown_limit=0.10,
+    )
+    trade = ClosedTrade(
+        id="t1",
+        symbol="BTCUSDC",
+        market_type="spot",
+        side="LONG",
+        qty=1.0,
+        entry_price=100.0,
+        exit_price=90.0,
+        leverage=1.0,
+        opened_at_ms=1_000,
+        closed_at_ms=2_000,
+        realized_pnl=-150.0,
+        realized_pnl_pct=-0.15,
+    )
+    store.record_close(trade)
+
+    gate = _entry_gate(
+        store,
+        Decision(side="LONG", confidence=0.9, mark_price=100.0),
+        strategy,
+        cfg,
+        get_objective("default"),
+        now_ms_value=3_000,
+    )
+    assert gate.allowed is False
+    assert gate.reason.startswith("daily-cap-reached")
+
+    no_cap = replace(strategy, max_trades_per_day=0)
+    gate = _entry_gate(
+        store,
+        Decision(side="LONG", confidence=0.9, mark_price=100.0),
+        no_cap,
+        cfg,
+        get_objective("default"),
+        now_ms_value=3_000,
+    )
+    assert gate.reason.startswith("cooldown-active")
+
+    no_cooldown = replace(no_cap, cooldown_minutes=0)
+    gate = _entry_gate(
+        store,
+        Decision(side="LONG", confidence=0.9, mark_price=100.0),
+        no_cooldown,
+        cfg,
+        get_objective("default"),
+        now_ms_value=3_000,
+    )
+    assert gate.reason.startswith("drawdown-lockout")
+
+    no_drawdown = replace(no_cooldown, max_drawdown_limit=0.0)
+    gate = _entry_gate(
+        store,
+        Decision(side="LONG", confidence=0.51, mark_price=100.0),
+        no_drawdown,
+        cfg,
+        get_objective("default"),
+        now_ms_value=3_000,
+    )
+    assert gate.reason.startswith("low-confidence")
+
+    zero_reference = _entry_gate(
+        PositionsStore(root=tmp_path / "zero-reference"),
+        Decision(side="LONG", confidence=0.9, mark_price=100.0),
+        replace(no_drawdown, max_open_positions=1),
+        _make_config(tmp_path / "zero-cfg", starting_reference_cash=0.0),
+        get_objective("default"),
+        now_ms_value=3_000,
+    )
+    assert zero_reference.allowed is True
+    assert zero_reference.drawdown == 0.0
 
 
 def test_run_loop_custom_logger_is_honored(tmp_path: Path) -> None:

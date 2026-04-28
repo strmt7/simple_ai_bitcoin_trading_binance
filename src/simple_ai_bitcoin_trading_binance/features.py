@@ -187,7 +187,9 @@ def make_rows(
         window = closes[: i + 1]
         short = _sma(window, short_window)
         long = _sma(window, long_window)
-        ema = _ema(window, long_window)
+        # Bound EMA history so training, backtests, and live runs agree when
+        # they use different candle-cache depths.
+        ema = _ema(window[-(2 * long_window):], long_window)
         rsi = _rsi(window, 14)
 
         if not all(math.isfinite(v) for v in (short, long, ema, rsi)):

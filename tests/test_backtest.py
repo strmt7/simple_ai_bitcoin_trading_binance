@@ -28,6 +28,8 @@ def test_backtest_runs() -> None:
     result = run_backtest(rows, model, cfg, starting_cash=1000.0)
     assert result.trades >= 0
     assert result.starting_cash == 1000.0
+    assert result.buy_hold_pnl > 0.0
+    assert result.edge_vs_buy_hold == result.realized_pnl - result.buy_hold_pnl
 
 
 def test_backtest_tracks_fees_and_cap_hits() -> None:
@@ -152,3 +154,43 @@ def test_backtest_uses_model_threshold_and_confidence_shrinkage() -> None:
 
     assert run_backtest(rows, model, active, starting_cash=1000.0).closed_trades == 1
     assert run_backtest(rows, model, conservative, starting_cash=1000.0).closed_trades == 0
+
+
+def test_backtest_buy_hold_baseline_handles_invalid_inputs() -> None:
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+    cfg = StrategyConfig()
+    zero_cash = run_backtest(
+        [ModelRow(timestamp=0, close=100.0, features=(0.0,), label=0)],
+        model,
+        cfg,
+        starting_cash=0.0,
+    )
+    zero_price = run_backtest(
+        [
+            ModelRow(timestamp=0, close=0.0, features=(0.0,), label=0),
+            ModelRow(timestamp=1, close=100.0, features=(0.0,), label=0),
+        ],
+        model,
+        cfg,
+        starting_cash=1000.0,
+    )
+    impossible_exit = run_backtest(
+        [
+            ModelRow(timestamp=0, close=100.0, features=(0.0,), label=0),
+            ModelRow(timestamp=1, close=100.0, features=(0.0,), label=0),
+        ],
+        model,
+        StrategyConfig(slippage_bps=20_000.0),
+        starting_cash=1000.0,
+    )
+
+    assert zero_cash.buy_hold_pnl == 0.0
+    assert zero_price.buy_hold_pnl == 0.0
+    assert impossible_exit.buy_hold_pnl == 0.0

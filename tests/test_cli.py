@@ -471,6 +471,27 @@ def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypat
     assert captured["backtest"].start_cash == 1500.0
 
 
+def test_tui_local_audit_action_builds_expected_args(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_audit", lambda args: captured.__setitem__("audit", args) or 0)
+
+    result = asyncio.run(
+        _action("Local audit").run(
+            _AsyncUI(forms=[{"input": "data/history.json", "model": "data/model.json"}])
+        )
+    )
+
+    assert result == 0
+    assert captured["audit"].input == "data/history.json"
+    assert captured["audit"].model == "data/model.json"
+
+
+def test_tui_local_audit_action_cancelled(capsys) -> None:
+    result = asyncio.run(_action("Local audit").run(_AsyncUI(forms=[None])))
+    assert result == 0
+    assert "Audit cancelled." in capsys.readouterr().out
+
+
 def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
     captured = {"order": []}
     monkeypatch.setattr(

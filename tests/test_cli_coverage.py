@@ -79,6 +79,9 @@ def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     assert doctor_args.input == "i.json"
     assert doctor_args.model == "m.json"
     assert doctor_args.online is True
+    audit_args = cli._parse_args(["audit", "--input", "i.json", "--model", "m.json"])
+    assert audit_args.input == "i.json"
+    assert audit_args.model == "m.json"
     train_args = cli._parse_args(["train", "--preset", "quick"])
     assert train_args.preset == "quick"
     report_default = cli._parse_args(["report"])
@@ -175,6 +178,38 @@ def test_command_report_renders_dashboard_and_readiness(tmp_path, monkeypatch, c
     assert "Readiness report" not in plain
 
 
+def test_command_audit_success_and_load_failure(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+
+    class _Report:
+        ok = True
+        checks = ()
+        raw_candles = 0
+        clean_candles = 0
+        feature_rows = 0
+        duplicate_open_times = 0
+        gap_count = 0
+        max_feature_delta = 0.0
+
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: _simple_candles())
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.audit.build_audit_report", lambda *_args, **_kwargs: _Report())
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.audit.render_audit_report", lambda _report: "audit ok")
+
+    assert cli.command_audit(argparse.Namespace(input="i.json", model="m.json")) == 0
+    assert "audit ok" in capsys.readouterr().out
+
+    class _BadReport(_Report):
+        ok = False
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.audit.build_audit_report", lambda *_args, **_kwargs: _BadReport())
+    assert cli.command_audit(argparse.Namespace(input="i.json", model="m.json")) == 2
+
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: None)
+    assert cli.command_audit(argparse.Namespace(input="bad.json", model="m.json")) == 2
+
+
 def test_command_prepare_success_failure_and_validation(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     save_runtime(RuntimeConfig(symbol="BTCUSDC", interval="15m"))
@@ -191,6 +226,7 @@ def test_command_prepare_success_failure_and_validation(tmp_path, monkeypatch, c
     monkeypatch.setattr(cli, "command_train", step("train"))
     monkeypatch.setattr(cli, "command_evaluate", step("evaluate"))
     monkeypatch.setattr(cli, "command_backtest", step("backtest"))
+    monkeypatch.setattr(cli, "command_audit", step("audit"))
     monkeypatch.setattr(cli, "command_doctor", step("doctor"))
 
     args = argparse.Namespace(
@@ -204,7 +240,7 @@ def test_command_prepare_success_failure_and_validation(tmp_path, monkeypatch, c
         online_doctor=True,
     )
     assert cli.command_prepare(args) == 0
-    assert [name for name, _args in calls] == ["fetch", "train", "evaluate", "backtest", "doctor"]
+    assert [name for name, _args in calls] == ["fetch", "train", "evaluate", "backtest", "audit", "doctor"]
     assert calls[1][1].preset == "custom"
     assert calls[1][1].requested_preset == "quick"
     assert calls[1][1].epochs == 9
@@ -212,6 +248,7 @@ def test_command_prepare_success_failure_and_validation(tmp_path, monkeypatch, c
     assert calls[1][1].l2_penalty == 1e-4
     assert calls[1][1].walk_forward is False
     assert calls[2][1].calibrate_threshold is False
+    assert calls[-2][1].model == str(tmp_path / "model.json")
     assert calls[-1][1].online is True
 
     calls.clear()

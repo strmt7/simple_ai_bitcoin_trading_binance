@@ -171,6 +171,22 @@ def test_walk_forward_report_runs() -> None:
     assert report["test_window"] == 20
     assert report["step"] == 20
     assert report["average_score"] >= 0.0
+    assert report["calibration_sizes"] == [0, 0, 0]
+
+
+def test_walk_forward_calibrates_inside_training_window() -> None:
+    rows = _rows()
+    report = walk_forward_report(rows, train_window=50, test_window=10, step=30, epochs=3, calibrate=True)
+    assert report["folds"] == 3
+    assert report["calibration_sizes"] == [10, 10, 10]
+    assert len(report["thresholds"]) == 3
+
+
+def test_walk_forward_skips_calibration_when_train_window_too_small() -> None:
+    rows = _rows()[:20]
+    report = walk_forward_report(rows, train_window=8, test_window=3, step=3, epochs=2, calibrate=True)
+    assert report["calibration_sizes"]
+    assert all(size == 0 for size in report["calibration_sizes"])
 
 
 def test_temporal_validation_split_keeps_calibration_out_of_validation() -> None:

@@ -54,6 +54,8 @@ def test_backtest_empty_rows_returns_identity_state() -> None:
     assert result.trades == 0
     assert result.closed_trades == 0
     assert result.trades_per_day_cap_hit == 0
+    assert result.buy_hold_pnl == 0.0
+    assert result.edge_vs_buy_hold == 0.0
 
 
 def test_backtest_enforces_entry_filters_and_cap_hits() -> None:

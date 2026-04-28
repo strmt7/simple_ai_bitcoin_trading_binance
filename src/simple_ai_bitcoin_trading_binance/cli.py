@@ -127,6 +127,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_doctor.add_argument("--online", action="store_true", help="also check exchange connectivity")
     parser_doctor.set_defaults(func=command_doctor)
 
+    parser_audit = subparsers.add_parser("audit", help="run local data/model/risk diagnostics without network calls")
+    parser_audit.add_argument("--input", default="data/historical_btcusdc.json")
+    parser_audit.add_argument("--model", default="data/model.json")
+    parser_audit.set_defaults(func=command_audit)
+
     parser_report = subparsers.add_parser("report", help="show dashboard, artifacts, and optional readiness checks")
     parser_report.add_argument("--account", action="store_true", help="include authenticated account state")
     parser_report.add_argument("--doctor", action="store_true", help="include readiness checks")
@@ -1168,6 +1173,25 @@ def _tui_actions():
     async def _account(ui):
         return await ui.run_blocking(_show_account_overview)
 
+    async def _audit(ui):
+        payload = await ui.form(
+            "Local audit",
+            [
+                FormField("input", "Training input path", "data/historical_btcusdc.json"),
+                FormField("model", "Model path", "data/model.json"),
+            ],
+        )
+        if payload is None:
+            print("Audit cancelled.")
+            return 0
+        return await ui.run_blocking(
+            command_audit,
+            argparse.Namespace(
+                input=payload["input"].strip() or "data/historical_btcusdc.json",
+                model=payload["model"].strip() or "data/model.json",
+            ),
+        )
+
     async def _fetch(ui):
         runtime = load_runtime()
         max_batch_size = 1500 if runtime.market_type == "futures" else 1000
@@ -1616,22 +1640,23 @@ def _tui_actions():
         TUIAction("2", "Connect", "Ping the testnet exchange and validate that the configured credentials work.", _connect),
         TUIAction("3", "Account", "Read authenticated balances and open positions from the exchange.", _account),
         TUIAction("4", "Readiness check", "Verify safety flags, training data, model compatibility, and optionally exchange connectivity.", _doctor),
-        TUIAction("5", "Funds", "Manage the virtual USDC / BTC allocation that caps live trading. Independent of trading itself.", _funds),
-        TUIAction("6", "Fetch candles", "Download fresh BTCUSDC klines from the testnet into a local dataset.", _fetch),
-        TUIAction("7", "Train model", "Train or retrain the model on cached candles using the current strategy features.", _train),
-        TUIAction("8", "Evaluate", "Score the saved model against cached candles (classification metrics + thresholds).", _evaluate),
-        TUIAction("9", "Backtest", "Simulate trading on cached candles using the saved model; estimates PnL, fees, and drawdown.", _backtest),
-        TUIAction("10", "Tune strategy", "Grid search execution parameters across all data, a recent lookback, or a date range.", _tune),
-        TUIAction("11", "Prepare system", "One-shot pipeline: fetch candles, train, evaluate, backtest, then readiness checks.", _prepare),
-        TUIAction("12", "Paper loop", "Run the live loop in paper mode — no real orders; supports retraining controls.", _paper),
-        TUIAction("13", "Testnet loop", "Run authenticated testnet execution with real signed orders against the testnet exchange.", _live),
-        TUIAction("14", "Spot roundtrip", "Place a minimal BUY then SELL on spot testnet; smallest signed execution check.", _roundtrip),
-        TUIAction("15", "Operator report", "Print the dashboard, recent artifacts, readiness report, and optional account state.", _report),
+        TUIAction("5", "Local audit", "Check candle quality, feature stability, model metadata, and risk posture without network calls.", _audit),
+        TUIAction("6", "Funds", "Manage the virtual USDC / BTC allocation that caps live trading. Independent of trading itself.", _funds),
+        TUIAction("7", "Fetch candles", "Download fresh BTCUSDC klines from the testnet into a local dataset.", _fetch),
+        TUIAction("8", "Train model", "Train or retrain the model on cached candles using the current strategy features.", _train),
+        TUIAction("9", "Evaluate", "Score the saved model against cached candles (classification metrics + thresholds).", _evaluate),
+        TUIAction("10", "Backtest", "Simulate trading on cached candles using the saved model; estimates PnL, fees, and drawdown.", _backtest),
+        TUIAction("11", "Tune strategy", "Grid search execution parameters across all data, a recent lookback, or a date range.", _tune),
+        TUIAction("12", "Prepare system", "One-shot pipeline: fetch candles, train, evaluate, backtest, audit, then readiness checks.", _prepare),
+        TUIAction("13", "Paper loop", "Run the live loop in paper mode — no real orders; supports retraining controls.", _paper),
+        TUIAction("14", "Testnet loop", "Run authenticated testnet execution with real signed orders against the testnet exchange.", _live),
+        TUIAction("15", "Spot roundtrip", "Place a minimal BUY then SELL on spot testnet; smallest signed execution check.", _roundtrip),
+        TUIAction("16", "Operator report", "Print the dashboard, recent artifacts, readiness report, and optional account state.", _report),
         # Backwards-compatible aliases for direct configuration shortcuts.
-        TUIAction("16", "Runtime settings", "Shortcut to the Runtime panel inside Settings (API keys, market, testnet, recvWindow).", _runtime),
-        TUIAction("17", "Strategy settings", "Shortcut to the Strategy panel inside Settings (risk, thresholds, model windows, features).", _strategy),
-        TUIAction("18", "Settings", "Centralized configuration: Runtime, Strategy, Execution, Compute backend.", _settings),
-        TUIAction("19", "Help", "Detailed help: workflow, keyboard shortcuts, safety notes, configuration tour.", _help),
+        TUIAction("17", "Runtime settings", "Shortcut to the Runtime panel inside Settings (API keys, market, testnet, recvWindow).", _runtime),
+        TUIAction("18", "Strategy settings", "Shortcut to the Strategy panel inside Settings (risk, thresholds, model windows, features).", _strategy),
+        TUIAction("19", "Settings", "Centralized configuration: Runtime, Strategy, Execution, Compute backend.", _settings),
+        TUIAction("20", "Help", "Detailed help: workflow, keyboard shortcuts, safety notes, configuration tour.", _help),
     ]
 
 
@@ -2082,6 +2107,19 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def command_audit(args: argparse.Namespace) -> int:
+    from .audit import build_audit_report, render_audit_report
+
+    runtime = load_runtime()
+    strategy = load_strategy()
+    candles = _load_rows_for_command(args.input, label="Audit data load failed")
+    if candles is None:
+        return 2
+    report = build_audit_report(candles, runtime, strategy, model_path=Path(args.model))
+    print(render_audit_report(report))
+    return 0 if report.ok else 2
+
+
 def command_report(args: argparse.Namespace) -> int:
     print(
         _render_operator_report(
@@ -2204,6 +2242,11 @@ def command_prepare(args: argparse.Namespace) -> int:
             "Backtest",
             command_backtest,
             argparse.Namespace(input=historical, model=model, start_cash=start_cash),
+        ),
+        (
+            "Local audit",
+            command_audit,
+            argparse.Namespace(input=historical, model=model),
         ),
         (
             "Readiness check",
@@ -2658,6 +2701,8 @@ def command_backtest(args: argparse.Namespace) -> int:
             "trades_per_day_cap_hit": int(result.trades_per_day_cap_hit),
             "closed_trades": int(result.closed_trades),
             "gross_exposure": float(result.gross_exposure),
+            "buy_hold_pnl": float(result.buy_hold_pnl),
+            "edge_vs_buy_hold": float(result.edge_vs_buy_hold),
         },
     }
     _persist_run_artifact("backtest", model_path.parent, artifact)
@@ -2671,6 +2716,8 @@ def command_backtest(args: argparse.Namespace) -> int:
     print(f"max_exposure: {result.max_exposure:.2f}")
     print(f"starting_cash: {result.starting_cash:.2f}")
     print(f"ending_cash: {result.ending_cash:.2f}")
+    print(f"buy_hold_pnl: {result.buy_hold_pnl:.2f}")
+    print(f"edge_vs_buy_hold: {result.edge_vs_buy_hold:.2f}")
     print(f"max_drawdown: {result.max_drawdown:.2%}")
     print(f"stopped_by_drawdown: {result.stopped_by_drawdown}")
     return 0

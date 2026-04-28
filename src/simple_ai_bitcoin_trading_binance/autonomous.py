@@ -269,6 +269,114 @@ class LoopResult:
     closed_trades: int
     opened_trades: int
     exit_reason: str
+    skipped_entries: int = 0
+
+
+@dataclass(frozen=True)
+class EntryGate:
+    """Pre-entry risk decision used by the autonomous loop."""
+
+    allowed: bool
+    reason: str
+    open_positions: int
+    daily_entries: int
+    cooldown_remaining_ms: int
+    drawdown: float
+    directional_confidence: float
+
+
+def _safe_day_ms(timestamp_ms: int) -> int:
+    return int(timestamp_ms // (24 * 60 * 60 * 1000))
+
+
+def _directional_confidence(decision: Decision) -> float:
+    """Convert model probability-like confidence into side confidence."""
+
+    try:
+        raw_confidence = float(decision.confidence)
+    except (TypeError, ValueError):
+        raw_confidence = 0.0
+    confidence = max(0.0, min(1.0, raw_confidence))
+    if decision.side == "SHORT":
+        return 1.0 - confidence
+    return confidence
+
+
+def _daily_entry_count(store: PositionsStore, day: int) -> int:
+    opened = sum(1 for position in store.load_open() if _safe_day_ms(position.opened_at_ms) == day)
+    closed = sum(1 for trade in store.load_ledger() if _safe_day_ms(trade.opened_at_ms) == day)
+    return opened + closed
+
+
+def _last_activity_ms(store: PositionsStore) -> int:
+    candidates = [position.opened_at_ms for position in store.load_open()]
+    candidates.extend(trade.closed_at_ms for trade in store.load_ledger())
+    return max(candidates, default=0)
+
+
+def _entry_gate(
+    store: PositionsStore,
+    decision: Decision,
+    strategy: StrategyConfig,
+    cfg: AutonomousConfig,
+    objective: ObjectiveSpec,
+    *,
+    now_ms_value: int,
+) -> EntryGate:
+    """Return the deterministic pre-entry gate decision for a signal."""
+
+    opens = store.load_open()
+    max_open = int(strategy.max_open_positions)
+    day = _safe_day_ms(now_ms_value)
+    daily_entries = _daily_entry_count(store, day)
+    stats = compute_stats(
+        store,
+        mark_price=decision.mark_price,
+        starting_reference_cash=cfg.starting_reference_cash,
+    )
+    drawdown = 0.0
+    if cfg.starting_reference_cash > 0:
+        equity_delta = stats.realized_pnl + stats.unrealized_pnl
+        drawdown = max(0.0, -equity_delta / cfg.starting_reference_cash)
+    confidence = _directional_confidence(decision)
+    min_confidence = (
+        objective.training.signal_threshold
+        if objective.training is not None
+        else strategy.signal_threshold
+    )
+
+    cooldown_ms = max(0, int(strategy.cooldown_minutes)) * 60 * 1000
+    last_activity = _last_activity_ms(store)
+    cooldown_remaining = 0
+    if cooldown_ms > 0 and last_activity > 0:
+        cooldown_remaining = max(0, cooldown_ms - max(0, now_ms_value - last_activity))
+
+    if decision.side not in {"LONG", "SHORT"}:
+        reason = "flat-signal"
+    elif confidence < min_confidence:
+        reason = f"low-confidence<{min_confidence:.3f}"
+    elif max_open <= 0:
+        reason = "max-open-disabled"
+    elif len(opens) >= max_open:
+        reason = f"max-open-reached:{len(opens)}/{max_open}"
+    elif int(strategy.max_trades_per_day) > 0 and daily_entries >= int(strategy.max_trades_per_day):
+        reason = f"daily-cap-reached:{daily_entries}/{int(strategy.max_trades_per_day)}"
+    elif cooldown_remaining > 0:
+        reason = f"cooldown-active:{cooldown_remaining}ms"
+    elif strategy.max_drawdown_limit > 0.0 and drawdown >= strategy.max_drawdown_limit:
+        reason = f"drawdown-lockout:{drawdown:.2%}"
+    else:
+        reason = "allowed"
+
+    return EntryGate(
+        allowed=reason == "allowed",
+        reason=reason,
+        open_positions=len(opens),
+        daily_entries=daily_entries,
+        cooldown_remaining_ms=cooldown_remaining,
+        drawdown=drawdown,
+        directional_confidence=confidence,
+    )
 
 
 def run_loop(
@@ -297,6 +405,7 @@ def run_loop(
     heartbeats = 0
     closed = 0
     opened = 0
+    skipped = 0
     exit_reason = "requested-stop"
     try:
         while True:
@@ -337,9 +446,17 @@ def run_loop(
                         iteration, trade.id, reason, trade.realized_pnl, trade.realized_pnl_pct,
                     )
 
-            # Open new position if flat and decision is directional
-            opens = store.load_open()
-            if decision.side in {"LONG", "SHORT"} and len(opens) < max(1, strategy.max_open_positions):
+            # Open new position only after the same risk gates used in operator
+            # readiness checks approve it.
+            gate = _entry_gate(
+                store,
+                decision,
+                strategy,
+                cfg,
+                objective,
+                now_ms_value=int(clock() * 1000),
+            )
+            if decision.side in {"LONG", "SHORT"} and gate.allowed:
                 position = _open_position_from_decision(
                     decision, runtime, strategy, objective, cfg, clock=clock,
                 )
@@ -348,6 +465,17 @@ def run_loop(
                 logger.info(
                     "autonomous iter=%d open id=%s side=%s qty=%.6f entry=%.2f",
                     iteration, position.id, position.side, position.qty, position.entry_price,
+                )
+            elif decision.side in {"LONG", "SHORT"}:
+                skipped += 1
+                logger.info(
+                    "autonomous iter=%d skip-entry reason=%s open=%d daily=%d conf=%.4f drawdown=%.4f",
+                    iteration,
+                    gate.reason,
+                    gate.open_positions,
+                    gate.daily_entries,
+                    gate.directional_confidence,
+                    gate.drawdown,
                 )
 
             if iteration % max(1, cfg.heartbeat_every) == 0:
@@ -364,6 +492,7 @@ def run_loop(
                     unrealized_pnl=stats.unrealized_pnl,
                     objective=objective.name,
                     updated_at_ms=int(clock() * 1000),
+                    message="" if gate.allowed or decision.side == "FLAT" else gate.reason,
                 )
                 heartbeat.write(cfg.heartbeat_path)
                 heartbeats += 1
@@ -382,4 +511,5 @@ def run_loop(
         closed_trades=closed,
         opened_trades=opened,
         exit_reason=exit_reason,
+        skipped_entries=skipped,
     )

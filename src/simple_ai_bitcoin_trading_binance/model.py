@@ -363,22 +363,31 @@ def walk_forward_report(
 
     scores: List[float] = []
     thresholds: List[float] = []
+    calibration_sizes: List[int] = []
     for start in range(0, len(rows) - train_window - test_window + 1, step):
         train_rows = rows[start : start + train_window]
         test_rows = rows[start + train_window : start + train_window + test_window]
-        model = train(train_rows, epochs=epochs, learning_rate=learning_rate, l2_penalty=l2_penalty)
+        fit_rows = train_rows
+        calibration_rows: List[ModelRow] = []
+        if calibrate and len(train_rows) >= 10:
+            calibration_size = max(1, int(len(train_rows) * 0.2))
+            fit_rows = train_rows[:-calibration_size]
+            calibration_rows = train_rows[-calibration_size:]
+        model = train(fit_rows, epochs=epochs, learning_rate=learning_rate, l2_penalty=l2_penalty)
         threshold = 0.5
-        if calibrate and len(test_rows) >= 10:
-            threshold = calibrate_threshold(test_rows, model, start=0.05, end=0.95, steps=31)
+        if calibration_rows:
+            threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
         score = evaluate(test_rows, model, threshold=threshold)
         scores.append(score)
         thresholds.append(threshold)
+        calibration_sizes.append(len(calibration_rows))
 
     return {
         "folds": len(scores),
         "average_score": mean(scores) if scores else 0.0,
         "scores": scores,
         "thresholds": thresholds,
+        "calibration_sizes": calibration_sizes,
         "train_window": train_window,
         "test_window": test_window,
         "step": step,
