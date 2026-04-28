@@ -549,19 +549,9 @@ def test_tui_evaluate_and_pipeline_actions(monkeypatch) -> None:
 
 def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
     calls = []
+    roundtrip_calls = []
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_live", lambda args: calls.append(args) or 0)
-    monkeypatch.setattr(
-        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
-        lambda: type("R", (), {"market_type": "spot", "testnet": True, "api_key": "k", "api_secret": "s", "symbol": "BTCUSDC"})(),
-    )
-    monkeypatch.setattr(
-        "simple_ai_bitcoin_trading_binance.cli._build_client",
-        lambda _runtime: type(
-            "C",
-            (),
-            {"place_order": lambda self, symbol, side, quantity, dry_run=False: {"status": "FILLED", "orderId": 1 if side == "BUY" else 2, "executedQty": quantity}},
-        )(),
-    )
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_spot_roundtrip", lambda args: roundtrip_calls.append(args) or 0)
 
     asyncio.run(
         _action("Paper loop").run(
@@ -615,14 +605,15 @@ def test_tui_live_and_roundtrip_actions(monkeypatch, capsys) -> None:
     )
     asyncio.run(
         _action("Spot roundtrip").run(
-            _AsyncUI(forms=[{"quantity": "0.00008"}], confirms=[True])
+            _AsyncUI(forms=[{"quantity": "0.00008", "mode": "sell-buy"}], confirms=[True])
         )
     )
 
     assert calls[0].paper is True and calls[0].steps == 3
     assert calls[1].live is True and calls[1].steps == 2
     assert calls[0].model == "data/model.json"
-    assert "Spot test roundtrip complete." in capsys.readouterr().out
+    assert roundtrip_calls[0].mode == "sell-buy"
+    assert roundtrip_calls[0].yes is True
 
 
 def test_tui_help_action_writes_operator_help() -> None:

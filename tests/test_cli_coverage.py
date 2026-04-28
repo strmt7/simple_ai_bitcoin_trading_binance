@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from simple_ai_bitcoin_trading_binance import cli
-from simple_ai_bitcoin_trading_binance.api import BinanceAPIError, Candle
+from simple_ai_bitcoin_trading_binance.api import BinanceAPIError, Candle, SymbolConstraints
 from simple_ai_bitcoin_trading_binance.config import RuntimeConfig, load_strategy, save_runtime, save_strategy
 from simple_ai_bitcoin_trading_binance.model import ModelLoadError, TrainedModel
 from simple_ai_bitcoin_trading_binance.features import feature_signature
@@ -82,6 +82,10 @@ def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     audit_args = cli._parse_args(["audit", "--input", "i.json", "--model", "m.json"])
     assert audit_args.input == "i.json"
     assert audit_args.model == "m.json"
+    roundtrip_args = cli._parse_args(["spot-roundtrip", "--quantity", "0.0002", "--mode", "sell-buy", "--yes"])
+    assert roundtrip_args.quantity == 0.0002
+    assert roundtrip_args.mode == "sell-buy"
+    assert roundtrip_args.yes is True
     train_args = cli._parse_args(["train", "--preset", "quick"])
     assert train_args.preset == "quick"
     report_default = cli._parse_args(["report"])
@@ -486,6 +490,146 @@ def test_paper_order_is_logged(tmp_path, monkeypatch) -> None:
     cli._paper_or_live_order(client, RuntimeConfig(), cfg, side="BUY", size=0.1, dry_run=True, leverage=3.0)
     cli._paper_or_live_order(client, RuntimeConfig(), cfg, side="SELL", size=0.2, dry_run=False, leverage=2.0)
     assert client.orders[0][0] == "BTCUSDC"
+
+
+def test_roundtrip_helpers_cover_balances_and_sizing() -> None:
+    account = {"balances": [{"asset": "USDC", "free": "10"}, {"asset": "USDC", "free": "2.5"}, {"asset": "BTC", "free": "bad"}]}
+    assert cli._asset_free_balance(account, "USDC") == 12.5
+    assert cli._asset_free_balance([], "USDC") == 0.0
+    assert cli._order_executed_qty({"executedQty": "0.01"}) == 0.01
+    assert cli._order_executed_qty({"origQty": "0.02"}) == 0.02
+    assert cli._order_executed_qty([]) == 0.0
+
+    constraints = SymbolConstraints("BTCUSDC", 0.00001, 1.0, 0.00001, 5.0, 1000.0)
+
+    class _Client:
+        def normalize_quantity(self, symbol: str, quantity: float):
+            assert symbol == "BTCUSDC"
+            rounded = math.floor(quantity * 100000) / 100000
+            return rounded, constraints
+
+    quantity, parsed, notional = cli._roundtrip_quantity(_Client(), "BTCUSDC", 0.00001, 76000.0)
+    assert parsed == constraints
+    assert quantity >= 0.00006
+    assert notional >= 5.0
+    assert cli._roundtrip_second_quantity(_Client(), "BTCUSDC", "SELL", 0.0002, {"balances": [{"asset": "BTC", "free": "0.0001"}]}, 76000.0) == 0.0001
+    assert cli._roundtrip_second_quantity(_Client(), "BTCUSDC", "BUY", 0.0002, {"balances": [{"asset": "USDC", "free": "5"}]}, 76000.0) > 0
+
+    with pytest.raises(ValueError):
+        cli._roundtrip_quantity(_Client(), "BTCUSDC", 0.0, 76000.0)
+    with pytest.raises(BinanceAPIError, match="positive"):
+        cli._roundtrip_quantity(_Client(), "BTCUSDC", 0.0001, 0.0)
+
+    tight = SymbolConstraints("BTCUSDC", 0.00001, 1.0, 0.00001, 0.0, 1.0)
+
+    class _TightClient:
+        def normalize_quantity(self, _symbol: str, quantity: float):
+            return quantity, tight
+
+    with pytest.raises(BinanceAPIError, match="exceeds"):
+        cli._roundtrip_quantity(_TightClient(), "BTCUSDC", 0.1, 76000.0)
+
+    zero = SymbolConstraints("BTCUSDC", 0.00001, 1.0, 0.00001, 0.0, 1000.0)
+
+    class _ZeroClient:
+        def normalize_quantity(self, _symbol: str, _quantity: float):
+            return 0.0, zero
+
+    with pytest.raises(BinanceAPIError, match="below BTCUSDC exchange filters"):
+        cli._roundtrip_quantity(_ZeroClient(), "BTCUSDC", 0.00001, 76000.0)
+
+    class _StickyMinNotionalClient:
+        def normalize_quantity(self, _symbol: str, _quantity: float):
+            return 0.00001, constraints
+
+    with pytest.raises(BinanceAPIError, match="below exchange minimum"):
+        cli._roundtrip_quantity(_StickyMinNotionalClient(), "BTCUSDC", 0.00001, 76000.0)
+
+
+def test_command_spot_roundtrip_validation_and_success(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(market_type="futures", testnet=True, api_key="k", api_secret="s"))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.0001, mode="auto", yes=True)) == 2
+    save_runtime(RuntimeConfig(market_type="spot", testnet=False, api_key="k", api_secret="s"))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.0001, mode="auto", yes=True)) == 2
+    save_runtime(RuntimeConfig(market_type="spot", testnet=True, api_key="", api_secret=""))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.0001, mode="auto", yes=True)) == 2
+    save_runtime(RuntimeConfig(market_type="spot", testnet=True, api_key="k", api_secret="s"))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.0001, mode="auto", yes=False)) == 2
+
+    constraints = SymbolConstraints("BTCUSDC", 0.00001, 1.0, 0.00001, 5.0, 1000.0)
+
+    class _RoundtripClient:
+        def __init__(self, *, usdc: float = 20.0, btc: float = 0.5, fail_order: bool = False) -> None:
+            self.usdc = usdc
+            self.btc = btc
+            self.fail_order = fail_order
+            self.orders: list[str] = []
+
+        def ensure_btcusdc(self):
+            return {"symbol": "BTCUSDC"}
+
+        def get_symbol_price(self, _symbol: str):
+            return 76000.0, 1
+
+        def normalize_quantity(self, _symbol: str, quantity: float):
+            rounded = math.floor(quantity * 100000) / 100000
+            return rounded, constraints
+
+        def get_account(self):
+            return {
+                "balances": [
+                    {"asset": "USDC", "free": str(self.usdc), "locked": "0"},
+                    {"asset": "BTC", "free": str(self.btc), "locked": "0"},
+                ]
+            }
+
+        def place_order(self, _symbol: str, side: str, quantity: float, *, dry_run: bool, leverage: float = 1.0):
+            assert dry_run is False
+            if self.fail_order:
+                raise BinanceAPIError("order failed")
+            self.orders.append(side)
+            if side == "BUY":
+                self.btc += quantity
+                self.usdc -= quantity * 76000.0
+            else:
+                self.btc -= quantity
+                self.usdc += quantity * 76000.0
+            return {"status": "FILLED", "orderId": len(self.orders), "executedQty": f"{quantity:.8f}"}
+
+    persisted: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _RoundtripClient(usdc=20.0, btc=0.5))
+    monkeypatch.setattr(cli, "_persist_run_artifact", lambda _kind, output_dir, payload: persisted.append(payload) or output_dir / "roundtrip.json")
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="auto", yes=True)) == 0
+    output = capsys.readouterr().out
+    assert "Spot test roundtrip complete." in output
+    assert persisted[-1]["mode"] == "buy-sell"
+    assert persisted[-1]["runtime"]["api_key"] == "<redacted>"
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _RoundtripClient(usdc=0.0, btc=0.5))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="auto", yes=True)) == 0
+    assert persisted[-1]["mode"] == "sell-buy"
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _RoundtripClient(usdc=0.0, btc=0.5))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="buy-sell", yes=True)) == 2
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _RoundtripClient(usdc=0.0, btc=0.0))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="sell-buy", yes=True)) == 2
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _RoundtripClient(usdc=20.0, btc=0.5))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="bad-mode", yes=True)) == 2
+
+    class _NoSecondLegBalanceClient(_RoundtripClient):
+        def place_order(self, _symbol: str, side: str, quantity: float, *, dry_run: bool, leverage: float = 1.0):
+            assert dry_run is False
+            self.orders.append(side)
+            return {"status": "FILLED", "orderId": len(self.orders), "executedQty": f"{quantity:.8f}"}
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _NoSecondLegBalanceClient(usdc=20.0, btc=0.0))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="buy-sell", yes=True)) == 2
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _RoundtripClient(usdc=20.0, btc=0.5, fail_order=True))
+    assert cli.command_spot_roundtrip(argparse.Namespace(quantity=0.00008, mode="buy-sell", yes=True)) == 2
 
 
 def test_command_status_prints_masked_secret(tmp_path, monkeypatch, capsys) -> None:

@@ -90,6 +90,7 @@ simple-ai-trading prepare --preset balanced --epochs 180 --learning-rate 0.05 --
 simple-ai-trading report
 simple-ai-trading doctor --online
 simple-ai-trading audit
+simple-ai-trading spot-roundtrip --mode auto --quantity 0.00008 --yes
 simple-ai-trading train --preset balanced
 simple-ai-trading strategy --profile conservative
 simple-ai-trading live --paper --model data/model.json --steps 20 --sleep 0
@@ -220,6 +221,7 @@ The console supports:
 - the live loop supports paper mode and explicit authenticated testnet execution; `--paper` forces paper mode, while `--live` forces authenticated testnet execution
 - `live --model PATH` loads that model before the loop; paper runs can regenerate a missing or incompatible model from current rows, but authenticated live runs fail fast instead
 - `live --sleep 0` is preserved as a real zero-delay loop for scripted paper/test runs; authenticated `--live` mode clamps this to a one-second minimum
+- `spot-roundtrip --mode auto --yes` performs the smallest signed spot-testnet exchange check from the CLI; it uses BUY then SELL when USDC is available, or SELL then BUY when only test BTC is available
 - authenticated live runs inspect exchange account state before the loop; futures positions are resumed, while spot BTC is resumed only up to the explicit managed BTC allocation
 - configured `recvWindow` is used for signed Binance requests, and startup credential validation calls an authenticated account endpoint when keys are present
 - futures close and emergency-close orders use reduce-only market orders with result responses requested, so a close path cannot intentionally increase exposure
@@ -243,6 +245,13 @@ Use `simple-ai-trading strategy --profile NAME` to apply a saved profile, then a
 ### Live artifacts
 
 Run artifacts are JSON files written next to the model path, normally under `data/`. `train`, `evaluate`, `backtest`, and started `live` loops persist run context with redacted runtime credentials. A started live loop still writes a `live_run_*.json` when it halts from market errors, exchange order rejections, drawdown limits, or model incompatibility during signal generation. Preflight rejections before the loop starts, such as missing credentials or an invalid model for authenticated live mode, return an error without a loop artifact.
+
+BNB Smart Chain faucet note: the official BNB Chain faucet at
+https://www.bnbchain.org/en/testnet-faucet funds BSC testnet wallet addresses
+with tBNB/BEP20 test tokens after an hCaptcha-backed browser request and the
+published 0.002 BNB BSC mainnet prerequisite. It does not directly fund a
+Binance Spot Testnet exchange account, so BTCUSDC exchange-order testing uses
+the Spot Testnet account balances exposed by the Binance API.
 
 ## Research reference
 

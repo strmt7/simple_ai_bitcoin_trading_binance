@@ -121,6 +121,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_connect = subparsers.add_parser("connect", help="validate credentials and connectivity")
     parser_connect.set_defaults(func=command_connect)
 
+    parser_roundtrip = subparsers.add_parser(
+        "spot-roundtrip",
+        help="place a tiny signed spot-testnet roundtrip order with balance and filter prechecks",
+    )
+    parser_roundtrip.add_argument("--quantity", type=float, default=0.00008, help="BTC quantity to test")
+    parser_roundtrip.add_argument(
+        "--mode",
+        choices=["auto", "buy-sell", "sell-buy"],
+        default="auto",
+        help="order sequence; auto uses buy-sell when USDC is available, otherwise sell-buy when BTC is available",
+    )
+    parser_roundtrip.add_argument("--yes", action="store_true", help="confirm signed testnet order placement")
+    parser_roundtrip.set_defaults(func=command_spot_roundtrip)
+
     parser_doctor = subparsers.add_parser("doctor", help="run local readiness checks before paper or testnet trading")
     parser_doctor.add_argument("--input", default="data/historical_btcusdc.json")
     parser_doctor.add_argument("--model", default="data/model.json")
@@ -1567,6 +1581,7 @@ def _tui_actions():
             "Spot roundtrip",
             [
                 FormField("quantity", "Order quantity", "0.00008"),
+                FormField("mode", "Mode [auto/buy-sell/sell-buy]", "auto"),
             ],
         )
         if payload is None:
@@ -1577,41 +1592,17 @@ def _tui_actions():
         except ValueError as exc:
             print(f"Spot roundtrip settings invalid: {exc}", file=sys.stderr)
             return 2
-        if not await ui.confirm(f"Place BUY then SELL on spot testnet for quantity={quantity:.8f}?"):
+        mode = payload["mode"].strip().lower() or "auto"
+        if mode not in {"auto", "buy-sell", "sell-buy"}:
+            print("Spot roundtrip mode must be auto, buy-sell, or sell-buy.", file=sys.stderr)
+            return 2
+        if not await ui.confirm(f"Place {mode} spot testnet roundtrip for quantity={quantity:.8f}?"):
             print("Spot test order cancelled.")
             return 0
-        runtime = load_runtime()
-        if runtime.market_type != "spot":
-            print("Spot test order is only available when runtime.market_type=spot.")
-            return 2
-        if not runtime.testnet:
-            print("Spot test order requires testnet=true.")
-            return 2
-        if not runtime.api_key or not runtime.api_secret:
-            print("Spot test order requires configured API credentials.")
-            return 2
-        client = _build_client(runtime)
-        try:
-            buy = await ui.run_blocking(client.place_order, runtime.symbol, "BUY", quantity, dry_run=False)
-            sell = await ui.run_blocking(client.place_order, runtime.symbol, "SELL", quantity, dry_run=False)
-        except BinanceAPIError as exc:
-            print(f"Spot test order failed: {exc}", file=sys.stderr)
-            return 2
-        print("Spot test roundtrip complete.")
-        print(
-            json.dumps(
-                {
-                    "buy_status": buy.get("status"),
-                    "buy_orderId": buy.get("orderId"),
-                    "buy_executedQty": buy.get("executedQty"),
-                    "sell_status": sell.get("status"),
-                    "sell_orderId": sell.get("orderId"),
-                    "sell_executedQty": sell.get("executedQty"),
-                },
-                indent=2,
-            )
+        return await ui.run_blocking(
+            command_spot_roundtrip,
+            argparse.Namespace(quantity=quantity, mode=mode, yes=True),
         )
-        return 0
 
     async def _report(ui):
         payload = await ui.form(
@@ -2051,6 +2042,153 @@ def _paper_or_live_order(
         return
     print(f"live order: {side} {size:.8f} {runtime.symbol}")
     print(json.dumps(response, indent=2))
+
+
+def _asset_free_balance(account: object, asset: str) -> float:
+    if not isinstance(account, dict):
+        return 0.0
+    total = 0.0
+    for item in account.get("balances", []) or []:
+        if not isinstance(item, dict) or item.get("asset") != asset:
+            continue
+        total += _safe_float(item.get("free"))
+    return total
+
+
+def _order_executed_qty(order: object) -> float:
+    if not isinstance(order, dict):
+        return 0.0
+    return _safe_float(order.get("executedQty") or order.get("origQty"))
+
+
+def _roundtrip_quantity(client, symbol: str, requested: float, price: float) -> tuple[float, SymbolConstraints, float]:
+    if requested <= 0.0:
+        raise ValueError("Roundtrip quantity must be > 0.")
+    if price <= 0.0:
+        raise BinanceAPIError("Cannot resolve a positive BTCUSDC mark price")
+    quantity, constraints = client.normalize_quantity(symbol, requested)
+    min_notional = float(constraints.min_notional)
+    if min_notional > 0.0 and quantity * price < min_notional:
+        step = max(0.0, _safe_float(getattr(constraints, "step_size", 0.0)))
+        target = (min_notional / price) + step
+        quantity, constraints = client.normalize_quantity(symbol, max(target, float(constraints.min_qty)))
+    notional = quantity * price
+    if quantity <= 0.0:
+        raise BinanceAPIError("Requested quantity is below BTCUSDC exchange filters")
+    if min_notional > 0.0 and notional < min_notional:
+        raise BinanceAPIError(
+            f"Requested quantity notional {notional:.2f} is below exchange minimum {min_notional:.2f}"
+        )
+    if constraints.max_notional > 0.0 and notional > constraints.max_notional:
+        raise BinanceAPIError(
+            f"Requested quantity notional {notional:.2f} exceeds exchange maximum {constraints.max_notional:.2f}"
+        )
+    return quantity, constraints, notional
+
+
+def _roundtrip_second_quantity(client, symbol: str, side: str, executed_qty: float, account: object, price: float) -> float:
+    base_asset = symbol.removesuffix("USDC")
+    if side == "SELL":
+        available = _asset_free_balance(account, base_asset)
+        target = min(max(0.0, executed_qty), available)
+    else:
+        available_quote = _asset_free_balance(account, "USDC")
+        target = min(max(0.0, executed_qty), (available_quote / price) * 0.995 if price > 0.0 else 0.0)
+    quantity, _constraints = client.normalize_quantity(symbol, target)
+    return quantity
+
+
+def command_spot_roundtrip(args: argparse.Namespace) -> int:
+    runtime = load_runtime()
+    if not getattr(args, "yes", False):
+        print("Pass --yes to confirm signed spot-testnet order placement.", file=sys.stderr)
+        return 2
+    if runtime.market_type != "spot":
+        print("Spot roundtrip requires runtime.market_type=spot.", file=sys.stderr)
+        return 2
+    if not runtime.testnet:
+        print("Spot roundtrip requires testnet=true.", file=sys.stderr)
+        return 2
+    if not runtime.api_key or not runtime.api_secret:
+        print("Spot roundtrip requires configured API credentials.", file=sys.stderr)
+        return 2
+
+    mode = str(getattr(args, "mode", "auto"))
+    quantity_requested = float(getattr(args, "quantity", 0.0))
+    client = _build_client(runtime)
+    try:
+        client.ensure_btcusdc()
+        price, _timestamp = client.get_symbol_price(runtime.symbol)
+        quantity, _constraints, notional = _roundtrip_quantity(
+            client,
+            runtime.symbol,
+            quantity_requested,
+            float(price),
+        )
+        before = client.get_account()
+        btc_free = _asset_free_balance(before, "BTC")
+        usdc_free = _asset_free_balance(before, "USDC")
+        if mode == "auto":
+            mode = "buy-sell" if usdc_free >= notional * 1.01 else "sell-buy"
+        if mode == "buy-sell":
+            if usdc_free < notional * 1.01:
+                raise BinanceAPIError(f"Insufficient USDC for BUY leg: need about {notional:.2f}, have {usdc_free:.2f}")
+            first_side, second_side = "BUY", "SELL"
+        elif mode == "sell-buy":
+            if btc_free < quantity:
+                raise BinanceAPIError(f"Insufficient BTC for SELL leg: need {quantity:.8f}, have {btc_free:.8f}")
+            first_side, second_side = "SELL", "BUY"
+        else:
+            raise ValueError(f"Unsupported roundtrip mode: {mode}")
+
+        first = client.place_order(runtime.symbol, first_side, quantity, dry_run=False)
+        executed = _order_executed_qty(first) or quantity
+        mid = client.get_account()
+        second_quantity = _roundtrip_second_quantity(client, runtime.symbol, second_side, executed, mid, float(price))
+        if second_quantity <= 0.0:
+            raise BinanceAPIError(f"Could not size {second_side} leg from post-{first_side} balances")
+        second = client.place_order(runtime.symbol, second_side, second_quantity, dry_run=False)
+        after = client.get_account()
+    except (BinanceAPIError, ValueError) as exc:
+        print(f"Spot roundtrip failed: {exc}", file=sys.stderr)
+        return 2
+
+    payload = {
+        "command": "spot-roundtrip",
+        "timestamp": int(time.time()),
+        "runtime": _public_runtime_payload(runtime),
+        "symbol": runtime.symbol,
+        "mode": mode,
+        "price_reference": float(price),
+        "quantity_requested": float(quantity_requested),
+        "quantity_first": float(quantity),
+        "quantity_second": float(second_quantity),
+        "notional_reference": float(notional),
+        "balances_before": {
+            "BTC": _asset_free_balance(before, "BTC"),
+            "USDC": _asset_free_balance(before, "USDC"),
+        },
+        "balances_after": {
+            "BTC": _asset_free_balance(after, "BTC"),
+            "USDC": _asset_free_balance(after, "USDC"),
+        },
+        "first_order": {
+            "side": first_side,
+            "status": first.get("status") if isinstance(first, dict) else None,
+            "orderId": first.get("orderId") if isinstance(first, dict) else None,
+            "executedQty": first.get("executedQty") if isinstance(first, dict) else None,
+        },
+        "second_order": {
+            "side": second_side,
+            "status": second.get("status") if isinstance(second, dict) else None,
+            "orderId": second.get("orderId") if isinstance(second, dict) else None,
+            "executedQty": second.get("executedQty") if isinstance(second, dict) else None,
+        },
+    }
+    artifact_path = _persist_run_artifact("spot_roundtrip", Path("data"), payload)
+    print("Spot test roundtrip complete.")
+    print(json.dumps({**payload, "artifact": str(artifact_path)}, indent=2))
+    return 0
 
 
 def command_configure(_: argparse.Namespace) -> int:

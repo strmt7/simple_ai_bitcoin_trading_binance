@@ -733,29 +733,18 @@ def test_cli_tui_actions_cover_cancel_invalid_and_success_paths(tmp_path, monkey
     assert asyncio.run(_action("Testnet loop").run(_ScriptedUI(confirms=[True], forms=[{**live_form, "steps": "1"}]))) == 0
 
     assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(forms=[None]))) == 0
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[False], forms=[{"quantity": "0.1"}]))) == 0
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0"}]))) == 2
-    save_runtime(RuntimeConfig(market_type="futures", api_key="k", api_secret="s"))
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 2
-    save_runtime(RuntimeConfig(market_type="spot", testnet=False, api_key="k", api_secret="s"))
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 2
-    save_runtime(RuntimeConfig(market_type="spot", testnet=True, api_key="", api_secret=""))
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 2
+    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[False], forms=[{"quantity": "0.1", "mode": "auto"}]))) == 0
+    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0", "mode": "auto"}]))) == 2
+    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1", "mode": "bad"}]))) == 2
 
-    class OrderClient:
-        def __init__(self, *, fail: bool = False) -> None:
-            self.fail = fail
+    captured_roundtrip = {}
+    def capture_roundtrip(args):
+        captured_roundtrip["args"] = args
+        return 0
 
-        def place_order(self, _symbol, _side, _quantity, *, dry_run):
-            if self.fail:
-                raise BinanceAPIError("order failed")
-            return {"status": "FILLED", "orderId": 1, "executedQty": "0.1"}
-
-    save_runtime(RuntimeConfig(market_type="spot", testnet=True, api_key="k", api_secret="s"))
-    monkeypatch.setattr(cli, "_build_client", lambda _runtime: OrderClient(fail=True))
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 2
-    monkeypatch.setattr(cli, "_build_client", lambda _runtime: OrderClient())
-    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1"}]))) == 0
+    monkeypatch.setattr(cli, "command_spot_roundtrip", capture_roundtrip)
+    assert asyncio.run(_action("Spot roundtrip").run(_ScriptedUI(confirms=[True], forms=[{"quantity": "0.1", "mode": "buy-sell"}]))) == 0
+    assert captured_roundtrip["args"].mode == "buy-sell"
 
     monkeypatch.setattr(cli, "command_report", capture("report"))
     assert asyncio.run(_action("Operator report").run(_ScriptedUI(forms=[None]))) == 0
