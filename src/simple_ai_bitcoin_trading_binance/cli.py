@@ -6,6 +6,7 @@ import argparse
 import builtins
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import subprocess  # nosec B404
 import sys
 import time
@@ -545,6 +546,8 @@ def _parse_form_float(
     maximum: float | None = None,
 ) -> float:
     value = default if not raw.strip() else float(raw.strip())
+    if not math.isfinite(value):
+        raise ValueError(f"{label} must be finite.")
     if minimum is not None and value < minimum:
         raise ValueError(f"{label} must be >= {minimum}.")
     if maximum is not None and value > maximum:
@@ -1905,6 +1908,8 @@ def _load_json_candles(path: str) -> list[dict[str, object]]:
 
 
 def _clamp(value: float, low: float, high: float) -> float:
+    if not math.isfinite(float(value)):
+        return low
     if value < low:
         return low
     if value > high:
@@ -2015,7 +2020,10 @@ def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
 def _effective_leverage(cfg: StrategyConfig, market_type: str) -> float:
     if market_type != "futures":
         return 1.0
-    return float(max(1.0, min(125.0, cfg.leverage)))
+    leverage = float(cfg.leverage)
+    if not math.isfinite(leverage):
+        return 1.0
+    return float(max(1.0, min(125.0, leverage)))
 
 
 def _resolve_futures_leverage(runtime, cfg: StrategyConfig) -> float:
@@ -2091,10 +2099,12 @@ def _target_notional(
     *,
     leverage: float | None = None,
 ) -> float:
-    if cash <= 0:
+    if not math.isfinite(float(cash)) or cash <= 0:
         return 0.0
     if leverage is None:
         leverage = _effective_leverage(strategy, market_type)
+    if not math.isfinite(float(leverage)):
+        return 0.0
     risk_exposure = strategy.risk_per_trade * leverage
     risk_exposure = min(risk_exposure, strategy.max_position_pct * leverage)
     risk_exposure = min(risk_exposure, 1.0)
@@ -2115,6 +2125,8 @@ def _build_order_notional(
 
     Returns (notional, qty) after constraints are enforced.
     """
+    if not all(math.isfinite(float(value)) for value in (cash, price, leverage)):
+        return 0.0, 0.0
     if price <= 0:
         return 0.0, 0.0
 

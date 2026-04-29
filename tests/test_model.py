@@ -252,6 +252,13 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
     assert confidence_adjusted_probability("bad", 0.5) == 0.5
     assert confidence_adjusted_probability(0.8, None) == 0.8
     assert confidence_adjusted_probability(0.8, "bad") == 0.8
+    assert confidence_adjusted_probability(float("nan"), 0.5) == 0.5
+    assert confidence_adjusted_probability(0.8, float("nan")) == 0.8
+    loaded.decision_threshold = float("nan")
+    assert model_decision_threshold(loaded, 0.55) == 0.55
+    assert model_decision_threshold(loaded, float("nan")) == 0.5
+    loaded.decision_threshold = "bad"
+    assert model_decision_threshold(loaded, 0.55) == 0.55
 
 
 def test_temperature_calibration_softens_overconfident_probabilities() -> None:

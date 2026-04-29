@@ -70,6 +70,17 @@ def test_risk_policy_warns_on_aggressive_but_possible_settings(tmp_path) -> None
     )
     assert any(check.label == "drawdown stop" and check.status == "warn" for check in disabled_drawdown.checks)
 
+    strategy = StrategyConfig()
+    strategy.leverage = float("nan")
+    strategy.risk_per_trade = object()
+    coerced = build_risk_policy_report(
+        RuntimeConfig(market_type="futures"),
+        strategy,
+        effective_dry_run=True,
+    )
+    assert coerced.leverage == 1.0
+    assert any(check.label == "risk per trade" and check.status == "block" for check in coerced.checks)
+
 
 def test_entry_risk_decision_explains_each_block() -> None:
     allowed = assess_entry_risk(
@@ -94,6 +105,8 @@ def test_entry_risk_decision_explains_each_block() -> None:
         (dict(cash=0.0), "cash"),
         (dict(price=0.0), "price"),
         (dict(drawdown=0.2, drawdown_limit=0.2), "drawdown"),
+        (dict(price=float("nan")), "nonfinite"),
+        (dict(cash=object()), "nonfinite"),
     ]
     base = dict(
         direction=1,

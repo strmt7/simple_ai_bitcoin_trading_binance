@@ -75,6 +75,8 @@ def test_effective_leverage_clamps_by_market() -> None:
     cfg = StrategyConfig(leverage=250.0)
     assert _effective_leverage(cfg, "spot") == 1.0
     assert _effective_leverage(cfg, "futures") == 125.0
+    cfg.leverage = float("nan")
+    assert _effective_leverage(cfg, "futures") == 1.0
 
 
 def test_target_notional_scales_with_futures_leverage() -> None:
@@ -83,6 +85,8 @@ def test_target_notional_scales_with_futures_leverage() -> None:
     futures_notional = _target_notional(1000.0, cfg, "futures")
     assert spot_notional == 10.0
     assert futures_notional == 200.0
+    assert _target_notional(float("nan"), cfg, "futures") == 0.0
+    assert _target_notional(1000.0, cfg, "futures", leverage=float("nan")) == 0.0
 
 
 class _ConstraintClient:
@@ -148,6 +152,16 @@ def test_build_order_notional_respects_symbol_constraints() -> None:
     )
     assert notional == 0.0
     assert qty == 0.0
+
+    assert _build_order_notional(
+        cash=1000.0,
+        price=float("nan"),
+        cfg=cfg,
+        market_type="futures",
+        leverage=2.0,
+        client=client,
+        constraints=constraints,
+    ) == (0.0, 0.0)
 
 
 def test_command_strategy_updates_risk_and_rate_limits(tmp_path, monkeypatch) -> None:

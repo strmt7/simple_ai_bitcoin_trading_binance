@@ -350,6 +350,7 @@ def test_feature_model_dashboard_and_backtest_edges(tmp_path, monkeypatch) -> No
 
     always_buy = _flat_model(0.99, feature_dim=1)
     cfg = StrategyConfig(leverage=0.5, risk_per_trade=0.5, max_position_pct=0.5)
+    cfg.leverage = 0.5
     result = run_backtest([ModelRow(1, 100.0, (0.0,), 1)], always_buy, cfg, market_type="futures")
     assert result.trades == 1
 
@@ -362,6 +363,8 @@ def test_feature_model_dashboard_and_backtest_edges(tmp_path, monkeypatch) -> No
 
 
 def test_cli_form_parsers_and_ui_edit_helpers() -> None:
+    assert model._clamp(float("nan"), 0.0, 1.0) == 0.0
+    assert cli._clamp(float("nan"), 0.0, 1.0) == 0.0
     assert cli._parse_form_bool("maybe", True) is True
     with pytest.raises(ValueError, match="Count"):
         cli._parse_form_int("0", label="Count", default=1, minimum=1)
@@ -371,6 +374,8 @@ def test_cli_form_parsers_and_ui_edit_helpers() -> None:
         cli._parse_form_float("-1", label="Ratio", default=0.0, minimum=0.0)
     with pytest.raises(ValueError, match="Ratio"):
         cli._parse_form_float("2", label="Ratio", default=0.0, maximum=1.0)
+    with pytest.raises(ValueError, match="finite"):
+        cli._parse_form_float("nan", label="Ratio", default=0.0)
 
     current = RuntimeConfig(market_type="spot", interval="15m", api_key="old", api_secret="secret")
     unchanged = asyncio.run(cli._ui_edit_runtime(_ScriptedUI(forms=[None]), current))

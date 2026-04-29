@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 
 from simple_ai_bitcoin_trading_binance.config import (
@@ -13,7 +15,7 @@ from simple_ai_bitcoin_trading_binance.config import (
 from simple_ai_bitcoin_trading_binance.config import (
     config_paths,
 )
-from simple_ai_bitcoin_trading_binance.types import RuntimeConfig
+from simple_ai_bitcoin_trading_binance.types import RuntimeConfig, StrategyConfig
 
 
 def test_save_and_load_runtime(tmp_path: Path, monkeypatch) -> None:
@@ -175,3 +177,67 @@ def test_save_strategy_and_read_back(tmp_path: Path, monkeypatch) -> None:
     save_strategy(load_strategy())
     loaded = load_strategy()
     assert loaded == load_strategy()
+
+
+def test_runtime_and_strategy_configs_coerce_nonfinite_and_string_values(tmp_path: Path, monkeypatch) -> None:
+    runtime = RuntimeConfig(
+        symbol="ETHUSDC",
+        interval="",
+        market_type="margin",
+        testnet="false",
+        demo="yes",
+        dry_run="off",
+        validate_account="no",
+        max_rate_calls_per_minute="bad",
+        recv_window_ms=999_999,
+        managed_usdc=object(),
+        managed_btc=-1.0,
+    )
+
+    assert runtime.symbol == "BTCUSDC"
+    assert runtime.interval == "15m"
+    assert runtime.market_type == "margin"
+    assert runtime.testnet is False
+    assert runtime.demo is True
+    assert runtime.dry_run is False
+    assert runtime.validate_account is False
+    assert runtime.max_rate_calls_per_minute == 1100
+    assert runtime.recv_window_ms == 60000
+    assert runtime.managed_usdc == 1000.0
+    assert runtime.managed_btc == 0.0
+
+    fallback_bool_runtime = RuntimeConfig(testnet=object())
+    assert fallback_bool_runtime.testnet is True
+    unknown_token_runtime = RuntimeConfig(testnet="maybe")
+    assert unknown_token_runtime.testnet is True
+
+    strategy = StrategyConfig(
+        leverage=float("nan"),
+        risk_per_trade=float("nan"),
+        max_position_pct=float("inf"),
+        feature_windows=("bad", "worse", "extra"),
+        signal_threshold=float("-inf"),
+        max_open_positions="bad",
+        cooldown_minutes=-5,
+        confidence_beta=float("nan"),
+        external_signals_enabled="yes",
+        external_signal_timeout_seconds=float("inf"),
+    )
+    assert strategy.leverage == 1.0
+    assert strategy.risk_per_trade == 0.01
+    assert strategy.max_position_pct == 0.20
+    assert strategy.feature_windows == (10, 40)
+    assert strategy.signal_threshold == 0.58
+    assert strategy.max_open_positions == 1
+    assert strategy.cooldown_minutes == 0
+    assert strategy.confidence_beta == 0.85
+    assert strategy.external_signals_enabled is True
+    assert strategy.external_signal_timeout_seconds == 3.0
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["strategy"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(json.dumps({"risk_per_trade": math.nan, "signal_threshold": math.inf}), encoding="utf-8")
+    loaded = load_strategy()
+    assert loaded.risk_per_trade == 0.01
+    assert loaded.signal_threshold == 0.58

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -81,7 +82,24 @@ def _effective_leverage(strategy: StrategyConfig, market_type: str, requested: f
     if market_type != "futures":
         return 1.0
     raw = float(strategy.leverage if requested is None else requested)
+    if not math.isfinite(raw):
+        return 1.0
     return max(1.0, min(125.0, raw))
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _metric_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float("nan")
 
 
 def build_risk_policy_report(
@@ -97,11 +115,11 @@ def build_risk_policy_report(
     dry_run = bool(runtime.dry_run if effective_dry_run is None else effective_dry_run)
     effective_leverage = _effective_leverage(strategy, runtime.market_type, leverage)
     notional_cap_pct = min(
-        max(0.0, float(strategy.risk_per_trade)) * effective_leverage,
-        max(0.0, float(strategy.max_position_pct)) * effective_leverage,
+        max(0.0, _finite(strategy.risk_per_trade)) * effective_leverage,
+        max(0.0, _finite(strategy.max_position_pct)) * effective_leverage,
         1.0,
     )
-    max_loss_per_trade_pct = notional_cap_pct * max(0.0, float(strategy.stop_loss_pct))
+    max_loss_per_trade_pct = notional_cap_pct * max(0.0, _finite(strategy.stop_loss_pct))
     checks: list[RiskCheck] = []
 
     checks.append(_check("ok" if runtime.symbol == "BTCUSDC" else "block", "symbol", runtime.symbol))
@@ -133,7 +151,7 @@ def build_risk_policy_report(
             )
         )
 
-    cash = float(getattr(runtime, "managed_usdc", 0.0) or 0.0)
+    cash = _finite(getattr(runtime, "managed_usdc", 0.0))
     checks.append(_check("ok" if cash > 0.0 else "block", "managed USDC", f"{cash:.2f}", metric=cash, limit=">0"))
     checks.append(
         _check(
@@ -144,7 +162,7 @@ def build_risk_policy_report(
             limit=25.0,
         )
     )
-    risk_per_trade = float(strategy.risk_per_trade)
+    risk_per_trade = _finite(strategy.risk_per_trade)
     checks.append(
         _check(
             "block" if risk_per_trade <= 0.0 else ("ok" if risk_per_trade <= 0.02 else "warn"),
@@ -154,7 +172,7 @@ def build_risk_policy_report(
             limit=0.02,
         )
     )
-    max_position = float(strategy.max_position_pct)
+    max_position = _finite(strategy.max_position_pct)
     checks.append(
         _check(
             "block" if max_position <= 0.0 else ("ok" if max_position <= 0.50 else "warn"),
@@ -173,8 +191,8 @@ def build_risk_policy_report(
             limit=0.50,
         )
     )
-    stop_loss = float(strategy.stop_loss_pct)
-    take_profit = float(strategy.take_profit_pct)
+    stop_loss = _finite(strategy.stop_loss_pct)
+    take_profit = _finite(strategy.take_profit_pct)
     checks.append(
         _check(
             "warn" if stop_loss <= 0.0 else "ok",
@@ -209,33 +227,36 @@ def build_risk_policy_report(
         checks.append(
             _check("ok", "daily trade cap", str(strategy.max_trades_per_day), metric=strategy.max_trades_per_day)
         )
-    if strategy.max_drawdown_limit <= 0.0:
+    drawdown_limit = _finite(strategy.max_drawdown_limit)
+    if drawdown_limit <= 0.0:
         checks.append(_check("warn", "drawdown stop", "disabled", metric=0.0, limit=">0"))
     else:
         checks.append(
             _check(
-                "ok" if strategy.max_drawdown_limit <= 0.50 else "warn",
+                "ok" if drawdown_limit <= 0.50 else "warn",
                 "drawdown stop",
-                f"{strategy.max_drawdown_limit:.2%}",
-                metric=strategy.max_drawdown_limit,
+                f"{drawdown_limit:.2%}",
+                metric=drawdown_limit,
                 limit=0.50,
             )
         )
+    slippage_bps = _finite(strategy.slippage_bps)
     checks.append(
         _check(
-            "ok" if strategy.slippage_bps <= 100.0 else "warn",
+            "ok" if slippage_bps <= 100.0 else "warn",
             "slippage assumption",
-            f"{strategy.slippage_bps:.1f} bps",
-            metric=strategy.slippage_bps,
+            f"{slippage_bps:.1f} bps",
+            metric=slippage_bps,
             limit=100.0,
         )
     )
+    taker_fee_bps = _finite(strategy.taker_fee_bps)
     checks.append(
         _check(
-            "ok" if strategy.taker_fee_bps <= 100.0 else "warn",
+            "ok" if taker_fee_bps <= 100.0 else "warn",
             "fee assumption",
-            f"{strategy.taker_fee_bps:.1f} bps",
-            metric=strategy.taker_fee_bps,
+            f"{taker_fee_bps:.1f} bps",
+            metric=taker_fee_bps,
             limit=100.0,
         )
     )
@@ -288,11 +309,13 @@ def assess_entry_risk(
         "max_open_positions": int(max_open_positions),
         "max_daily_trades": int(max_daily_trades),
         "daily_trade_count": int(daily_trade_count),
-        "cash": float(cash),
-        "price": float(price),
-        "drawdown": float(drawdown),
-        "drawdown_limit": float(drawdown_limit),
+        "cash": _metric_float(cash),
+        "price": _metric_float(price),
+        "drawdown": _metric_float(drawdown),
+        "drawdown_limit": _metric_float(drawdown_limit),
     }
+    if not all(math.isfinite(float(metrics[key])) for key in ("cash", "price", "drawdown", "drawdown_limit")):
+        return EntryRiskDecision(False, "nonfinite", "non-finite risk input", metrics)
     if direction == 0:
         return EntryRiskDecision(False, "no_signal", "no actionable entry signal", metrics)
     if position_side != 0:

@@ -7,13 +7,15 @@ import math
 import random
 from dataclasses import asdict, dataclass, field
 from statistics import mean, pstdev
-from typing import Iterable, List, Tuple
+from typing import Any, Iterable, List, Tuple
 
 from .features import FEATURE_VERSION, ModelRow, feature_dimension as feature_dimension
 from .storage import write_json_atomic
 
 
 def _clamp(x: float, low: float, high: float) -> float:
+    if not math.isfinite(x):
+        return low
     return low if x < low else (high if x > high else x)
 
 
@@ -312,7 +314,7 @@ def _log_loss(
     return total / len(rows)
 
 
-def _coerce_temperature(temperature: object) -> float:
+def _coerce_temperature(temperature: Any) -> float:
     try:
         value = float(temperature)
     except (TypeError, ValueError):
@@ -685,12 +687,16 @@ def confidence_adjusted_probability(probability: float, beta: float | None) -> f
         value = float(probability)
     except (TypeError, ValueError):
         value = 0.5
+    if not math.isfinite(value):
+        value = 0.5
     value = _clamp(value, 0.0, 1.0)
     if beta is None:
         return value
     try:
         shrink = float(beta)
     except (TypeError, ValueError):
+        shrink = 1.0
+    if not math.isfinite(shrink):
         shrink = 1.0
     shrink = _clamp(shrink, 0.0, 1.0)
     return 0.5 + (value - 0.5) * shrink
@@ -700,7 +706,15 @@ def model_decision_threshold(model: TrainedModel, fallback: float) -> float:
     threshold = getattr(model, "decision_threshold", None)
     if threshold is None:
         threshold = fallback
-    return _clamp(float(threshold), 0.0, 1.0)
+    try:
+        parsed = float(threshold)
+    except (TypeError, ValueError):
+        parsed = float(fallback)
+    if not math.isfinite(parsed):
+        parsed = float(fallback)
+    if not math.isfinite(parsed):
+        parsed = 0.5
+    return _clamp(parsed, 0.0, 1.0)
 
 
 def temporal_validation_split(
