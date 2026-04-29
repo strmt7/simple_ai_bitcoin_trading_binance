@@ -759,6 +759,67 @@ def test_command_connect_failure_returns_nonzero(tmp_path, monkeypatch, capsys) 
     assert "Connection failed" in capsys.readouterr().err
 
 
+def test_command_risk_reports_json_text_and_conflicting_modes(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    assert cli.command_risk(argparse.Namespace(model=str(tmp_path / "missing.json"), paper=True, live=True, leverage=None, json=False)) == 2
+    assert "Choose either" in capsys.readouterr().out
+
+    assert cli.command_risk(argparse.Namespace(model=str(tmp_path / "missing.json"), paper=True, live=False, leverage=None, json=False)) == 0
+    assert "Risk policy report" in capsys.readouterr().out
+
+    assert cli.command_risk(argparse.Namespace(model=str(tmp_path / "missing.json"), paper=False, live=False, leverage=3.0, json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effective_dry_run"] is True
+    assert payload["leverage"] == 1.0
+
+    save_runtime(RuntimeConfig(dry_run=False, api_key="", api_secret=""))
+    assert cli.command_risk(argparse.Namespace(model=str(tmp_path / "missing.json"), paper=False, live=True, leverage=3.0, json=True)) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["allowed"] is False
+    assert payload["block_count"] >= 1
+
+
+def test_command_live_risk_policy_and_generic_entry_gate(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_runtime(RuntimeConfig(managed_usdc=0.0, dry_run=True))
+    save_strategy(StrategyConfig())
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    args = argparse.Namespace(
+        steps=1,
+        sleep=0,
+        paper=True,
+        live=False,
+        model=str(tmp_path / "missing.json"),
+        leverage=None,
+        retrain_interval=0,
+        retrain_window=1,
+        retrain_min_rows=1,
+        external_signals=None,
+    )
+    assert cli.command_live(args) == 2
+    assert "Risk policy report" in capsys.readouterr().err
+
+    class _RiskModel:
+        feature_signature = "sig"
+
+        def predict_proba(self, _features) -> float:
+            return 0.99
+
+    save_runtime(RuntimeConfig(managed_usdc=1000.0, dry_run=True))
+    save_strategy(StrategyConfig(enabled_features=("momentum_1",)))
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [SimpleNamespace(timestamp=1, close=0.0, features=(0.0,))])
+    monkeypatch.setattr(cli, "_build_live_model", lambda *_args, **_kwargs: _RiskModel())
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    assert cli.command_live(args) == 0
+    assert "risk gate blocked entry (price)" in capsys.readouterr().out
+    artifact = next(tmp_path.glob("live_*.json"))
+    events = json.loads(artifact.read_text(encoding="utf-8"))["events"]
+    assert any(event["status"] == "skip_risk_price" for event in events)
+
+
 def test_command_fetch_handles_binar_errors(tmp_path, monkeypatch) -> None:
     from simple_ai_bitcoin_trading_binance.api import BinanceAPIError
 

@@ -89,6 +89,7 @@ simple-ai-trading positions --stats         # open positions + realized/unrealiz
 simple-ai-trading close <id|all>            # local ledger close (no exchange order)
 simple-ai-trading prepare --preset balanced --epochs 180 --learning-rate 0.05 --l2-penalty 0.0001 --batch-size 1000 --online-doctor
 simple-ai-trading report
+simple-ai-trading risk --paper
 simple-ai-trading doctor --online
 simple-ai-trading audit
 simple-ai-trading data-sync --rows 1000 --db data/market_data.sqlite
@@ -261,6 +262,10 @@ The console supports:
 - `signals` and `live --external-signals` add cached free-provider confirmation
   without blocking the exchange loop on slow non-Binance APIs
 - `prepare` runs the normal offline sequence: fetch candles, train, evaluate, backtest, local audit, then readiness checks; it stops at the first failed step
+- `risk --paper` or `risk --live` prints the local risk policy before an
+  operator loop: endpoint safety, credentials, managed cash, leverage,
+  position sizing, stop-loss exposure, daily caps, drawdown stops,
+  fee/slippage assumptions, external-signal quorum, and model path status
 - `audit` runs no-network diagnostics for candle quality, feature stability,
   model metadata, and risk posture; `prepare` runs it before the final
   readiness check

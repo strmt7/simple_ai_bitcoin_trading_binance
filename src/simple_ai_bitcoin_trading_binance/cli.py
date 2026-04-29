@@ -21,6 +21,7 @@ from .data_downloader import MarketDataSyncConfig, render_sync_result, sync_mark
 from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_enabled_features
 from .api import SymbolConstraints
 from .external_signals import ExternalSignalReport, collect_external_signals, render_external_signal_report
+from .live_artifacts import build_live_run_payload
 from .market_data import clean_candles
 from .model import (
     assess_probability_calibration,
@@ -40,6 +41,8 @@ from .model import (
     train,
     walk_forward_report,
 )
+from .risk_controls import EntryRiskDecision, assess_entry_risk, build_risk_policy_report, render_risk_policy_report
+from . import risk_workflows
 from .storage import write_json_atomic
 from .types import RuntimeConfig, StrategyConfig
 
@@ -166,6 +169,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_audit.add_argument("--input", default="data/historical_btcusdc.json")
     parser_audit.add_argument("--model", default="data/model.json")
     parser_audit.set_defaults(func=command_audit)
+
+    parser_risk = subparsers.add_parser("risk", help="show local risk policy before paper or live trading")
+    parser_risk.add_argument("--model", default="data/model.json")
+    parser_risk.add_argument("--paper", action="store_true", help="assess paper/dry-run execution")
+    parser_risk.add_argument("--live", action="store_true", help="assess authenticated testnet/demo execution")
+    parser_risk.add_argument("--leverage", type=float, default=None, help="optional futures leverage override")
+    parser_risk.add_argument("--json", action="store_true")
+    parser_risk.set_defaults(func=command_risk)
 
     parser_report = subparsers.add_parser("report", help="show dashboard, artifacts, and optional readiness checks")
     parser_report.add_argument("--account", action="store_true", help="include authenticated account state")
@@ -2051,6 +2062,28 @@ def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
     )
 
 
+def _load_live_start_model(
+    model_path: Path,
+    strategy: StrategyConfig,
+    *,
+    effective_dry_run: bool,
+) -> tuple[object | None, str | None, str | None]:
+    if model_path.exists():
+        try:
+            return _load_runtime_model(model_path, strategy), None, None
+        except (ModelLoadError, ModelFeatureMismatchError) as exc:
+            if not effective_dry_run:
+                return None, f"Live mode requires a compatible model: {exc}", None
+            return None, None, f"Model load failed; regenerating: {exc}"
+        except Exception:
+            if not effective_dry_run:
+                return None, f"Live mode requires a readable model: {model_path}", None
+            return None, None, None
+    if not effective_dry_run:
+        return None, f"Live mode needs model file: {model_path}", None
+    return None, None, None
+
+
 def _target_notional(
     cash: float,
     strategy: StrategyConfig,
@@ -2166,6 +2199,31 @@ def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str, thr
             return -1
         return 0
     return 1 if score >= threshold else 0
+
+
+def _live_entry_risk_skip(
+    *,
+    step: int,
+    day: int,
+    score: float,
+    entry_risk: EntryRiskDecision,
+    max_daily_trades: int,
+    max_open_positions: int,
+) -> tuple[str, dict[str, object]]:
+    if entry_risk.code == "trade_cap":
+        message = f"step {step:>2}: trade cap reached ({max_daily_trades}/day), skipping entry"
+        status = "skip_trade_cap"
+        event = {"step": step, "status": status, "day": day, "score": float(score)}
+    elif entry_risk.code == "max_open_positions":
+        message = f"step {step:>2}: max open positions reached ({max_open_positions}), skipping entry"
+        status = "skip_max_open_positions"
+        event = {"step": step, "status": status, "score": float(score)}
+    else:
+        message = f"step {step:>2}: risk gate blocked entry ({entry_risk.code})"
+        status = f"skip_risk_{entry_risk.code}"
+        event = {"step": step, "status": status, "score": float(score)}
+    event["risk_check"] = entry_risk.asdict()
+    return message, event
 
 
 def _safe_float(value: object) -> float:
@@ -2484,6 +2542,14 @@ def command_audit(args: argparse.Namespace) -> int:
     report = build_audit_report(candles, runtime, strategy, model_path=Path(args.model))
     print(render_audit_report(report))
     return 0 if report.ok else 2
+
+
+def command_risk(args: argparse.Namespace) -> int:
+    return risk_workflows.command_risk(
+        args,
+        load_runtime_fn=load_runtime,
+        load_strategy_fn=load_strategy,
+    )
 
 
 def command_report(args: argparse.Namespace) -> int:
@@ -3471,26 +3537,22 @@ def command_live(args: argparse.Namespace) -> int:
         leverage = 1.0
     equity_peak = cash
     max_drawdown_seen = 0.0
+    risk_policy = build_risk_policy_report(
+        runtime,
+        cfg,
+        effective_dry_run=effective_dry_run,
+        leverage=leverage,
+    )
+    if not risk_policy.allowed:
+        print(render_risk_policy_report(risk_policy), file=sys.stderr)
+        return 2
 
-    if model_path.exists():
-        try:
-            model = _load_runtime_model(model_path, cfg)
-        except (ModelLoadError, ModelFeatureMismatchError) as exc:
-            if not effective_dry_run:
-                print(f"Live mode requires a compatible model: {exc}", file=sys.stderr)
-                return 2
-            print(f"Model load failed; regenerating: {exc}", file=sys.stderr)
-            model = None
-        except Exception:
-            if not effective_dry_run:
-                print(f"Live mode requires a readable model: {model_path}", file=sys.stderr)
-                return 2
-            model = None
-    else:
-        if not effective_dry_run:
-            print(f"Live mode needs model file: {model_path}", file=sys.stderr)
-            return 2
-        model = None
+    model, model_error, model_notice = _load_live_start_model(model_path, cfg, effective_dry_run=effective_dry_run)
+    if model_error is not None:
+        print(model_error, file=sys.stderr)
+        return 2
+    if model_notice is not None:
+        print(model_notice, file=sys.stderr)
 
     mode_label = "paper" if effective_dry_run else "live"
     print(f"Starting {mode_label} loop for {args.steps} steps on {runtime.symbol} {runtime.interval} [{runtime.market_type}]")
@@ -3511,20 +3573,20 @@ def command_live(args: argparse.Namespace) -> int:
         max_daily_trades = 0
     daily_trade_count: dict[int, int] = {}
     max_open_positions = int(cfg.max_open_positions)
-    live_run = {
-        "command": "live",
-        "timestamp": int(time.time()),
-        "runtime": _public_runtime_payload(runtime),
-        "strategy": cfg.asdict(),
-        "steps_total": int(args.steps),
-        "market": runtime.market_type,
-        "symbol": runtime.symbol,
-        "model_path": str(model_path),
-        "events": [],
-        "model_signature": str(getattr(model, "feature_signature", "")) or None,
-        "starting_cash": float(cash),
-        "external_signal_cache": str(_external_signal_cache_path(model_path)),
-    }
+    live_run = build_live_run_payload(
+        runtime_public=_public_runtime_payload(runtime),
+        strategy=cfg,
+        steps_total=int(args.steps),
+        market=runtime.market_type,
+        symbol=runtime.symbol,
+        model_path=model_path,
+        model=model,
+        starting_cash=cash,
+        external_signal_cache=_external_signal_cache_path(model_path),
+        risk_policy=risk_policy,
+    )
+    if risk_policy.warning_count:
+        print(f"risk policy warnings: {risk_policy.warning_count}")
     if not effective_dry_run:
         try:
             detected_position = _detect_existing_position(runtime, client, leverage=leverage)
@@ -3741,31 +3803,31 @@ def command_live(args: argparse.Namespace) -> int:
 
         price = latest.close
         day = _safe_day_ms(latest.timestamp)
-        trade_cap_reached = max_daily_trades > 0 and daily_trade_count.get(day, 0) >= max_daily_trades
         if position_side == 0 and direction != 0:
-            if trade_cap_reached:
-                print(f"step {i + 1:>2}: trade cap reached ({max_daily_trades}/day), skipping entry")
-                skipped_entries += 1
-                live_run["events"].append(
-                    {
-                        "step": i + 1,
-                        "status": "skip_trade_cap",
-                        "day": day,
-                        "score": float(score),
-                    }
+            current_drawdown = (equity_peak - cash) / equity_peak if equity_peak else 0.0
+            entry_risk = assess_entry_risk(
+                direction=direction,
+                position_side=position_side,
+                max_open_positions=max_open_positions,
+                max_daily_trades=max_daily_trades,
+                daily_trade_count=daily_trade_count.get(day, 0),
+                cash=cash,
+                price=price,
+                drawdown=current_drawdown,
+                drawdown_limit=drawdown_limit,
+            )
+            if not entry_risk.allowed:
+                message, event = _live_entry_risk_skip(
+                    step=i + 1,
+                    day=day,
+                    score=score,
+                    entry_risk=entry_risk,
+                    max_daily_trades=max_daily_trades,
+                    max_open_positions=max_open_positions,
                 )
-                time.sleep(sleep_seconds)
-                continue
-            if max_open_positions <= 0:
-                print(f"step {i + 1:>2}: max open positions reached ({max_open_positions}), skipping entry")
+                print(message)
                 skipped_entries += 1
-                live_run["events"].append(
-                    {
-                        "step": i + 1,
-                        "status": "skip_max_open_positions",
-                        "score": float(score),
-                    }
-                )
+                live_run["events"].append(event)
                 time.sleep(sleep_seconds)
                 continue
 
