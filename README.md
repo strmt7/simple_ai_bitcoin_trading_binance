@@ -94,6 +94,7 @@ simple-ai-trading audit
 simple-ai-trading data-sync --rows 1000 --db data/market_data.sqlite
 simple-ai-trading data-sync --background --rows 1000 --sleep 300
 simple-ai-trading signals --refresh
+python tools/quality_metrics.py --compare-ref HEAD
 simple-ai-trading spot-roundtrip --mode auto --quantity 0.00008 --yes
 simple-ai-trading train --source auto --preset balanced --download-missing
 simple-ai-trading strategy --profile conservative --external-signals
@@ -114,7 +115,16 @@ auxiliary Binance metrics to SQLite (`data/market_data.sqlite` by default):
 The downloader uses the same client throttle/backoff path as the rest of the
 app, so `max_rate_calls_per_minute`, retry handling, and `Retry-After` support
 remain centralized. Run it once for a bounded backfill or with `--background`
-to start a detached loop that writes a PID and log file.
+to start a detached loop that writes a PID and log file. Once the requested
+history window is present, later runs switch to incremental mode and request
+only candles after the latest stored open time. Sync output includes the mode,
+net new candle count, coverage ratio, and gap count so repeated no-new-data
+runs are visible instead of silently rewriting the same rows.
+
+`python tools/quality_metrics.py --compare-ref <sha>` prints deterministic
+before/after metrics for source lines, test lines, CLI command count, function
+length, and approximate cyclomatic complexity. Use it before accepting a broad
+refinement pass so changes can be judged by measured behavior, not intuition.
 
 Training can now use `--source auto|file|db`. In `auto` mode the CLI trains
 from the JSON file when present, otherwise it checks the SQLite store for the
@@ -243,8 +253,9 @@ The console supports:
 - training uses the current feature selection from strategy settings
 - training supports `custom`, `quick`, `balanced`, and `thorough` presets
 - `fetch --batch-size N` pages kline downloads into request sizes up to Binance's spot 1000-candle limit or USD-M futures 1500-candle limit; live and signed order calls stay sequential to preserve exchange state and rate-limit safety
-- `data-sync` persists closed candles and auxiliary market metrics into SQLite
-  for repeatable training and future feature enrichment
+- `data-sync` persists closed candles and auxiliary market metrics into SQLite,
+  skips duplicate latest-window rewrites after the requested window is present,
+  and reports coverage quality for repeatable training and future enrichment
 - `train --source auto` falls back to the SQLite store for the selected
   market/interval and can prompt or `--download-missing` when history is absent
 - `signals` and `live --external-signals` add cached free-provider confirmation

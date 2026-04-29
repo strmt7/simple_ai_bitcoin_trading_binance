@@ -101,11 +101,23 @@ def test_market_data_store_roundtrip_snapshots_and_sync_runs(tmp_path) -> None:
         Candle(60_000, 101, 102, 100, 101, 2, 119_000, quote_volume=202, trade_count=4),
     ]
     assert store.upsert_candles("BTCUSDC", "spot", "15m", candles, ingested_at_ms=123) == 2
+    assert store.upsert_candles("BTCUSDC", "spot", "15m", candles, ingested_at_ms=456) == 0
+    changed = [
+        Candle(0, 100, 101, 99, 100, 1, 59_000, quote_volume=100, trade_count=3),
+        Candle(60_000, 101, 103, 100, 102, 2, 119_000, quote_volume=204, trade_count=5),
+    ]
+    assert store.upsert_candles("BTCUSDC", "spot", "15m", changed, ingested_at_ms=789) == 1
     assert [c.open_time for c in store.fetch_candles("btcusdc", "spot", "15m")] == [0, 60_000]
     latest = store.fetch_candles("BTCUSDC", "spot", "15m", limit=1)
-    assert latest[0].quote_volume == 202
+    assert latest[0].quote_volume == 204
     coverage = store.coverage("BTCUSDC", "spot", "15m")
     assert coverage.asdict()["count"] == 2
+    quality = store.coverage_quality("BTCUSDC", "spot", "15m", 60_000)
+    assert quality.expected_count == 2
+    assert quality.gap_count == 0
+    assert quality.coverage_ratio == 1.0
+    assert quality.asdict()["coverage"]["count"] == 2
+    assert store.coverage_quality("BTCUSDC", "spot", "15m", 0).coverage_ratio == 1.0
     assert store.latest_open_time("BTCUSDC", "spot", "15m") == 60_000
     assert store.insert_snapshot("binance", "btcusdc", "spot", "ticker_24h", {"closeTime": 5}, ts_ms=5) == 1
     assert store.latest_snapshot("BTCUSDC", "spot", "ticker_24h") == {"closeTime": 5}
@@ -121,6 +133,20 @@ def test_market_data_store_roundtrip_snapshots_and_sync_runs(tmp_path) -> None:
     store.close()
     with MarketDataStore(db) as reopened:
         assert reopened.coverage("BTCUSDC", "spot", "15m").count == 2
+    with MarketDataStore(tmp_path / "empty.sqlite") as empty_store:
+        empty = empty_store.coverage_quality("BTCUSDC", "spot", "15m", 60_000)
+        assert empty.expected_count == 0
+        assert empty.coverage_ratio == 0.0
+
+
+def test_market_data_store_reports_coverage_gaps(tmp_path) -> None:
+    with MarketDataStore(tmp_path / "gaps.sqlite") as store:
+        store.upsert_candles("BTCUSDC", "spot", "1m", [_candle(0), _candle(180_000)])
+        quality = store.coverage_quality("BTCUSDC", "spot", "1m", 60_000)
+
+    assert quality.expected_count == 4
+    assert quality.gap_count == 2
+    assert quality.coverage_ratio == 0.5
 
 
 class _SyncClient:
@@ -168,8 +194,117 @@ def test_sync_market_data_paginates_and_stores_metrics(tmp_path) -> None:
     )
     assert result.status == "ok"
     assert result.candles_inserted == 3
+    assert result.candles_added == 3
+    assert result.sync_mode == "backfill"
+    assert result.gap_count == 0
+    assert result.coverage_ratio == 1.0
+    assert result.kline_requests == 2
+    assert result.kline_rows_received == 3
     assert result.snapshots_inserted == 5
     assert "candles_available=3" in render_sync_result(result)
+    assert "kline_requests=2 kline_rows=3" in render_sync_result(result)
+
+
+def test_sync_market_data_incremental_mode_skips_duplicate_candle_writes(tmp_path) -> None:
+    class IncrementalClient(_SyncClient):
+        def __init__(self, *, fail_incremental: bool = False) -> None:
+            super().__init__()
+            self.fail_incremental = fail_incremental
+            self.requests: list[dict[str, int | None]] = []
+
+        def get_klines(self, _symbol, _interval, *, limit, end_time=None, start_time=None):
+            self.requests.append({"limit": limit, "end_time": end_time, "start_time": start_time})
+            if start_time is not None:
+                if self.fail_incremental:
+                    from simple_ai_bitcoin_trading_binance.api import BinanceAPIError
+
+                    raise BinanceAPIError("incremental down")
+                assert start_time == 180_000
+                return []
+            return [_candle(0), _candle(60_000), _candle(120_000)][:limit]
+
+    client = IncrementalClient()
+    config = MarketDataSyncConfig(
+        db_path=tmp_path / "incremental.sqlite",
+        interval="1m",
+        rows=3,
+        batch_size=3,
+        include_futures_metrics=False,
+        now_ms=999_999,
+    )
+    first = sync_market_data(client, config)  # type: ignore[arg-type]
+    second = sync_market_data(client, config)  # type: ignore[arg-type]
+
+    assert first.sync_mode == "backfill"
+    assert first.candles_inserted == 3
+    assert first.candles_added == 3
+    assert second.status == "ok"
+    assert second.sync_mode == "incremental"
+    assert second.candles_inserted == 0
+    assert second.candles_added == 0
+    assert second.coverage_ratio == 1.0
+    assert second.kline_requests == 1
+    assert second.kline_rows_received == 0
+    assert client.requests[-1] == {"limit": 3, "end_time": None, "start_time": 180_000}
+    rendered = render_sync_result(second)
+    assert "mode=incremental" in rendered
+    assert "candles_added=0" in rendered
+    assert "coverage_ratio=1.0000 gap_count=0" in rendered
+
+    failing_client = IncrementalClient(fail_incremental=True)
+    failing_config = MarketDataSyncConfig(
+        db_path=tmp_path / "incremental-error.sqlite",
+        interval="1m",
+        rows=3,
+        batch_size=3,
+        include_futures_metrics=False,
+    )
+    assert sync_market_data(failing_client, failing_config).status == "ok"  # type: ignore[arg-type]
+    warned = sync_market_data(failing_client, failing_config)  # type: ignore[arg-type]
+    assert warned.status == "warn"
+    assert warned.kline_requests == 1
+    assert warned.kline_rows_received == 0
+    assert any("incremental down" in error for error in warned.errors)
+
+
+def test_sync_market_data_backfill_counts_closed_rows_not_open_latest_page(tmp_path) -> None:
+    class LatestOpenClient(_SyncClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests: list[dict[str, int | None]] = []
+
+        def get_klines(self, _symbol, _interval, *, limit, end_time=None, start_time=None):
+            self.requests.append({"limit": limit, "end_time": end_time, "start_time": start_time})
+            if end_time is None:
+                assert limit == 2
+                return [
+                    _candle(60_000, close_time=119_000),
+                    _candle(120_000, close_time=999_999),
+                ]
+            assert limit == 1
+            return [_candle(0, close_time=59_000)]
+
+    client = LatestOpenClient()
+    result = sync_market_data(
+        client,  # type: ignore[arg-type]
+        MarketDataSyncConfig(
+            db_path=tmp_path / "latest-open.sqlite",
+            interval="1m",
+            rows=2,
+            batch_size=2,
+            include_futures_metrics=False,
+            now_ms=120_000,
+        ),
+    )
+
+    assert result.candles_inserted == 2
+    assert result.candles_available == 2
+    assert result.kline_requests == 2
+    assert result.kline_rows_received == 3
+    assert client.requests == [
+        {"limit": 2, "end_time": None, "start_time": None},
+        {"limit": 1, "end_time": 59_999, "start_time": None},
+    ]
 
 
 def test_sync_market_data_reports_snapshot_warnings_and_failures(tmp_path) -> None:
@@ -223,6 +358,8 @@ def test_sync_market_data_handles_kline_error_empty_and_short_page(tmp_path) -> 
         MarketDataSyncConfig(db_path=tmp_path / "error.sqlite", rows=2, include_futures_metrics=False),
     )
     assert errored.status == "fail"
+    assert errored.kline_requests == 1
+    assert errored.kline_rows_received == 0
     assert any("klines" in error for error in errored.errors)
 
     class EmptyClient(_SyncClient):
@@ -234,6 +371,8 @@ def test_sync_market_data_handles_kline_error_empty_and_short_page(tmp_path) -> 
         MarketDataSyncConfig(db_path=tmp_path / "empty.sqlite", rows=2, include_futures_metrics=False),
     )
     assert empty.candles_inserted == 0
+    assert empty.kline_requests == 1
+    assert empty.kline_rows_received == 0
 
     class ShortClient(_SyncClient):
         def get_klines(self, _symbol, _interval, *, limit, end_time=None):
@@ -245,3 +384,5 @@ def test_sync_market_data_handles_kline_error_empty_and_short_page(tmp_path) -> 
         MarketDataSyncConfig(db_path=tmp_path / "short.sqlite", rows=3, batch_size=3, include_futures_metrics=False),
     )
     assert short.candles_inserted == 1
+    assert short.kline_requests == 1
+    assert short.kline_rows_received == 1

@@ -63,6 +63,15 @@ def test_interval_minutes_known_values():
     assert intervals.interval_minutes("1s") == 1  # the special "budgeting" value
 
 
+def test_interval_milliseconds_uses_exact_exchange_cadence():
+    assert intervals.interval_milliseconds("1s") == 1_000
+    assert intervals.interval_milliseconds("1m") == 60_000
+    assert intervals.interval_milliseconds("15m") == 900_000
+    assert intervals.interval_milliseconds("1M") == 2_592_000_000
+    with pytest.raises(ValueError, match="banana"):
+        intervals.interval_milliseconds("banana")
+
+
 def test_minutes_between_end_leq_start_returns_zero():
     assert intervals.minutes_between(1000, 1000) == 0
     assert intervals.minutes_between(2000, 1000) == 0

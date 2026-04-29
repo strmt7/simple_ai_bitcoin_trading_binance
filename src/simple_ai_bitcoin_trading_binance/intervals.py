@@ -79,6 +79,25 @@ _MINUTES_BY_INTERVAL: dict[str, int] = {
     "1M": 43200,
 }
 
+_MILLISECONDS_BY_INTERVAL: dict[str, int] = {
+    "1s": 1_000,
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "6h": 21_600_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+    "3d": 259_200_000,
+    "1w": 604_800_000,
+    "1M": 2_592_000_000,
+}
+
 
 def supported_intervals(market_type: str) -> tuple[str, ...]:
     """Return the intervals Binance actually accepts for ``market_type``."""
@@ -126,6 +145,14 @@ def interval_minutes(interval: str) -> int:
     if interval not in _MINUTES_BY_INTERVAL:
         raise ValueError(f"Unknown interval: {interval!r}")
     return _MINUTES_BY_INTERVAL[interval]
+
+
+def interval_milliseconds(interval: str) -> int:
+    """Exact millisecond duration for a Binance kline interval."""
+
+    if interval not in _MILLISECONDS_BY_INTERVAL:
+        raise ValueError(f"Unknown interval: {interval!r}")
+    return _MILLISECONDS_BY_INTERVAL[interval]
 
 
 def minutes_between(start_ms: int, end_ms: int) -> int:

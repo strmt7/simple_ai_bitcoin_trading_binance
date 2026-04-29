@@ -144,6 +144,36 @@ def test_command_data_sync_background_builds_detached_process(tmp_path, monkeypa
     assert "--no-include-futures-metrics" not in captured["command"]
 
 
+def test_data_sync_compatibility_wrappers_delegate_to_structured_module(tmp_path, monkeypatch) -> None:
+    runtime = RuntimeConfig(market_type="spot", interval="15m")
+    futures_runtime = cli._runtime_with_market(runtime, "futures")
+    config = cli._data_sync_config_from_args(_sync_args(db=str(tmp_path / "m.sqlite"), interval="1m"), runtime)
+    captured: dict[str, object] = {}
+
+    class _Process:
+        pid = 9876
+
+    def fake_popen(command, *, stdout, stderr, start_new_session):
+        captured["command"] = command
+        stdout.write(b"")
+        return _Process()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    assert futures_runtime.market_type == "futures"
+    assert config.interval == "1m"
+    assert config.db_path == str(tmp_path / "m.sqlite")
+    assert cli._start_background_data_sync(
+        _sync_args(
+            db=str(tmp_path / "m.sqlite"),
+            background=True,
+            pid_file=str(tmp_path / "sync.pid"),
+            log_file=str(tmp_path / "sync.log"),
+        )
+    ) == 0
+    assert "data-sync" in captured["command"]
+
+
 def test_training_data_loader_uses_db_and_download_prompt(tmp_path, monkeypatch) -> None:
     save_runtime(RuntimeConfig(market_type="spot", interval="15m"))
     db = tmp_path / "m.sqlite"
@@ -191,6 +221,23 @@ def test_training_data_loader_uses_db_and_download_prompt(tmp_path, monkeypatch)
     args.db = str(tmp_path / "still-empty.sqlite")
     monkeypatch.setattr(cli, "command_data_sync", no_write_sync)
     assert cli._load_training_candles(args, RuntimeConfig(market_type="spot", interval="15m")) == (None, "missing")
+
+
+def test_training_db_loader_warns_about_coverage_gaps(tmp_path, capsys) -> None:
+    db = tmp_path / "gappy.sqlite"
+    with MarketDataStore(db) as store:
+        store.upsert_candles("BTCUSDC", "spot", "1m", [_candle(0), _candle(2)])
+
+    candles = cli._load_training_candles_from_db(
+        db,
+        RuntimeConfig(market_type="spot", interval="1m"),
+        interval="1m",
+        market_type="spot",
+        min_rows=2,
+    )
+
+    assert candles is not None and len(candles) == 2
+    assert "missing intervals" in capsys.readouterr().err
 
 
 def test_command_signals_and_external_score_helpers(tmp_path, monkeypatch, capsys) -> None:
