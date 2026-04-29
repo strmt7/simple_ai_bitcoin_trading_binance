@@ -49,6 +49,14 @@ class TrainedModel:
     validation_loss: float | None = None
     quality_score: float | None = None
     quality_warnings: List[str] = field(default_factory=list)
+    probability_temperature: float = 1.0
+    probability_calibration_size: int = 0
+    probability_log_loss_before: float | None = None
+    probability_log_loss_after: float | None = None
+    probability_brier_before: float | None = None
+    probability_brier_after: float | None = None
+    probability_ece_before: float | None = None
+    probability_ece_after: float | None = None
 
     def _normalize(self, features: Tuple[float, ...]) -> Tuple[float, ...]:
         if len(features) != self.feature_dim:
@@ -60,13 +68,17 @@ class TrainedModel:
             for x, mean_, std_ in zip(features, self.feature_means, self.feature_stds)
         )
 
-    def predict_proba(self, features: Tuple[float, ...]) -> float:
+    def _linear_score(self, features: Tuple[float, ...]) -> float:
         score = self.bias
         normed = self._normalize(features)
         for w, x in zip(self.weights, normed):
             score += w * x
         score = max(-50.0, min(50.0, score))
-        return 1.0 / (1.0 + math.exp(-score))
+        return score
+
+    def predict_proba(self, features: Tuple[float, ...]) -> float:
+        score = _temperature_scaled_score(self._linear_score(features), self.probability_temperature)
+        return _sigmoid(score)
 
     def predict(self, features: Tuple[float, ...], threshold: float) -> int:
         threshold = _clamp(threshold, 0.0, 1.0)
@@ -132,6 +144,24 @@ class ModelQualityReport:
         payload = asdict(self)
         payload["probability_stats"] = self.probability_stats.asdict()
         return payload
+
+
+@dataclass(frozen=True)
+class ProbabilityCalibrationReport:
+    status: str
+    warnings: List[str]
+    rows: int
+    temperature: float
+    log_loss_before: float
+    log_loss_after: float
+    brier_before: float
+    brier_after: float
+    expected_calibration_error_before: float
+    expected_calibration_error_after: float
+    improved: bool
+
+    def asdict(self) -> dict[str, object]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -280,6 +310,197 @@ def _log_loss(
         else:
             total -= math.log(1.0 - probability)
     return total / len(rows)
+
+
+def _coerce_temperature(temperature: object) -> float:
+    try:
+        value = float(temperature)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(value) or value <= 1e-6:
+        return 1.0
+    return value
+
+
+def _temperature_scaled_score(score: float, temperature: object) -> float:
+    value = _coerce_temperature(temperature)
+    return max(-50.0, min(50.0, score / value))
+
+
+def _model_probability(model: TrainedModel, features: Tuple[float, ...], *, temperature: float | None = None) -> float:
+    chosen_temperature = model.probability_temperature if temperature is None else temperature
+    return _sigmoid(_temperature_scaled_score(model._linear_score(features), chosen_temperature))
+
+
+def _model_log_loss(rows: List[ModelRow], model: TrainedModel, *, temperature: float | None = None) -> float:
+    if not rows:
+        return 0.0
+    total = 0.0
+    for row in rows:
+        probability = _clamp(_model_probability(model, row.features, temperature=temperature), 1e-12, 1.0 - 1e-12)
+        if int(row.label) == 1:
+            total -= math.log(probability)
+        else:
+            total -= math.log(1.0 - probability)
+    return total / len(rows)
+
+
+def _brier_score(rows: List[ModelRow], model: TrainedModel, *, temperature: float | None = None) -> float:
+    if not rows:
+        return 0.0
+    total = 0.0
+    for row in rows:
+        probability = _model_probability(model, row.features, temperature=temperature)
+        total += (probability - float(int(row.label))) ** 2
+    return total / len(rows)
+
+
+def _expected_calibration_error(
+    rows: List[ModelRow],
+    model: TrainedModel,
+    *,
+    temperature: float | None = None,
+    bins: int = 5,
+) -> float:
+    if not rows:
+        return 0.0
+    bins = max(1, int(bins))
+    buckets: list[list[tuple[float, int]]] = [[] for _ in range(bins)]
+    for row in rows:
+        probability = _clamp(_model_probability(model, row.features, temperature=temperature), 0.0, 1.0)
+        index = min(bins - 1, int(probability * bins))
+        buckets[index].append((probability, int(row.label)))
+    error = 0.0
+    for bucket in buckets:
+        if not bucket:
+            continue
+        avg_probability = mean(probability for probability, _label in bucket)
+        positive_rate = mean(label for _probability, label in bucket)
+        error += (len(bucket) / len(rows)) * abs(avg_probability - positive_rate)
+    return float(error)
+
+
+def assess_probability_calibration(rows: List[ModelRow], model: TrainedModel) -> ProbabilityCalibrationReport:
+    """Measure current probability reliability without changing the model."""
+
+    if not rows:
+        return ProbabilityCalibrationReport(
+            status="fail",
+            warnings=["no rows available for probability calibration report"],
+            rows=0,
+            temperature=_coerce_temperature(getattr(model, "probability_temperature", 1.0)),
+            log_loss_before=0.0,
+            log_loss_after=0.0,
+            brier_before=0.0,
+            brier_after=0.0,
+            expected_calibration_error_before=0.0,
+            expected_calibration_error_after=0.0,
+            improved=False,
+        )
+    validate_model_rows(rows, label="probability calibration rows", expected_feature_dim=model.feature_dim)
+    temperature = _coerce_temperature(getattr(model, "probability_temperature", 1.0))
+    log_loss_before = _model_log_loss(rows, model, temperature=1.0)
+    log_loss_after = _model_log_loss(rows, model, temperature=temperature)
+    brier_before = _brier_score(rows, model, temperature=1.0)
+    brier_after = _brier_score(rows, model, temperature=temperature)
+    ece_before = _expected_calibration_error(rows, model, temperature=1.0)
+    ece_after = _expected_calibration_error(rows, model, temperature=temperature)
+    improved = (
+        abs(temperature - 1.0) > 1e-12
+        and (
+            log_loss_after < log_loss_before - 1e-6
+            or brier_after < brier_before - 1e-6
+        )
+    )
+    warnings: List[str] = []
+    if len(rows) < 20:
+        warnings.append("probability calibration sample has fewer than 20 rows")
+    if rows and _positive_rate(rows) in {0.0, 1.0}:
+        warnings.append("probability calibration labels contain only one class")
+    return ProbabilityCalibrationReport(
+        status="warn" if warnings else "ok",
+        warnings=warnings,
+        rows=len(rows),
+        temperature=temperature,
+        log_loss_before=float(log_loss_before),
+        log_loss_after=float(log_loss_after),
+        brier_before=float(brier_before),
+        brier_after=float(brier_after),
+        expected_calibration_error_before=float(ece_before),
+        expected_calibration_error_after=float(ece_after),
+        improved=bool(improved),
+    )
+
+
+def calibrate_probability_temperature(
+    rows: List[ModelRow],
+    model: TrainedModel,
+    *,
+    min_temperature: float = 0.5,
+    max_temperature: float = 5.0,
+    steps: int = 46,
+) -> ProbabilityCalibrationReport:
+    """Fit a one-parameter temperature calibrator on held-out rows."""
+
+    base = assess_probability_calibration(rows, model)
+    if base.status == "fail":
+        return base
+    warnings = list(base.warnings)
+    if _positive_rate(rows) in {0.0, 1.0}:
+        return ProbabilityCalibrationReport(
+            status="warn",
+            warnings=warnings,
+            rows=base.rows,
+            temperature=base.temperature,
+            log_loss_before=base.log_loss_before,
+            log_loss_after=base.log_loss_after,
+            brier_before=base.brier_before,
+            brier_after=base.brier_after,
+            expected_calibration_error_before=base.expected_calibration_error_before,
+            expected_calibration_error_after=base.expected_calibration_error_after,
+            improved=False,
+        )
+
+    low = max(0.05, float(min_temperature))
+    high = max(low, float(max_temperature))
+    steps = max(2, int(steps))
+    candidates = [low + (high - low) * i / (steps - 1) for i in range(steps)]
+    current = _coerce_temperature(getattr(model, "probability_temperature", 1.0))
+    if current not in candidates:
+        candidates.append(current)
+    best_temperature = current
+    best_log_loss = base.log_loss_before
+    best_brier = base.brier_before
+    best_ece = base.expected_calibration_error_before
+    for temperature in candidates:
+        log_loss = _model_log_loss(rows, model, temperature=temperature)
+        brier = _brier_score(rows, model, temperature=temperature)
+        if log_loss < best_log_loss - 1e-12 or (abs(log_loss - best_log_loss) <= 1e-12 and brier < best_brier):
+            best_temperature = float(temperature)
+            best_log_loss = float(log_loss)
+            best_brier = float(brier)
+            best_ece = _expected_calibration_error(rows, model, temperature=temperature)
+
+    improved = best_log_loss < base.log_loss_before - 1e-6 or best_brier < base.brier_before - 1e-6
+    if not improved:
+        warnings.append("temperature calibration did not improve held-out probability loss")
+        best_temperature = current
+        best_log_loss = base.log_loss_before
+        best_brier = base.brier_before
+        best_ece = base.expected_calibration_error_before
+    return ProbabilityCalibrationReport(
+        status="warn" if warnings else "ok",
+        warnings=warnings,
+        rows=base.rows,
+        temperature=float(best_temperature),
+        log_loss_before=base.log_loss_before,
+        log_loss_after=float(best_log_loss),
+        brier_before=base.brier_before,
+        brier_after=float(best_brier),
+        expected_calibration_error_before=base.expected_calibration_error_before,
+        expected_calibration_error_after=float(best_ece),
+        improved=bool(improved),
+    )
 
 
 def _positive_rate(rows: List[ModelRow]) -> float:
@@ -839,4 +1060,36 @@ def load_model(
             for value in payload.get("quality_warnings", [])
             if isinstance(value, str)
         ],
+        probability_temperature=float(payload.get("probability_temperature", 1.0)),
+        probability_calibration_size=int(payload.get("probability_calibration_size", 0)),
+        probability_log_loss_before=(
+            float(payload["probability_log_loss_before"])
+            if payload.get("probability_log_loss_before") is not None
+            else None
+        ),
+        probability_log_loss_after=(
+            float(payload["probability_log_loss_after"])
+            if payload.get("probability_log_loss_after") is not None
+            else None
+        ),
+        probability_brier_before=(
+            float(payload["probability_brier_before"])
+            if payload.get("probability_brier_before") is not None
+            else None
+        ),
+        probability_brier_after=(
+            float(payload["probability_brier_after"])
+            if payload.get("probability_brier_after") is not None
+            else None
+        ),
+        probability_ece_before=(
+            float(payload["probability_ece_before"])
+            if payload.get("probability_ece_before") is not None
+            else None
+        ),
+        probability_ece_after=(
+            float(payload["probability_ece_after"])
+            if payload.get("probability_ece_after") is not None
+            else None
+        ),
     )

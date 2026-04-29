@@ -9,6 +9,7 @@ from pathlib import Path
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
     ClassificationReport,
+    calibrate_probability_temperature,
     confidence_adjusted_probability,
     feature_dimension,
     ModelFeatureMismatchError,
@@ -225,6 +226,14 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
         calibration_size=12,
         validation_size=8,
         training_cutoff_timestamp=123,
+        probability_temperature=2.0,
+        probability_calibration_size=6,
+        probability_log_loss_before=0.8,
+        probability_log_loss_after=0.7,
+        probability_brier_before=0.25,
+        probability_brier_after=0.22,
+        probability_ece_before=0.20,
+        probability_ece_after=0.15,
     )
     from simple_ai_bitcoin_trading_binance.model import serialize_model
 
@@ -235,8 +244,36 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
     assert loaded.calibration_size == 12
     assert loaded.validation_size == 8
     assert loaded.training_cutoff_timestamp == 123
+    assert loaded.probability_temperature == 2.0
+    assert loaded.probability_calibration_size == 6
+    assert loaded.probability_brier_after == 0.22
     assert confidence_adjusted_probability(0.9, 0.5) == 0.7
     assert confidence_adjusted_probability(0.1, 0.5) == 0.3
     assert confidence_adjusted_probability("bad", 0.5) == 0.5
     assert confidence_adjusted_probability(0.8, None) == 0.8
     assert confidence_adjusted_probability(0.8, "bad") == 0.8
+
+
+def test_temperature_calibration_softens_overconfident_probabilities() -> None:
+    rows = [
+        ModelRow(timestamp=1, close=1.0, features=(1.0,), label=0),
+        ModelRow(timestamp=2, close=1.0, features=(1.0,), label=0),
+        ModelRow(timestamp=3, close=1.0, features=(1.0,), label=1),
+        ModelRow(timestamp=4, close=1.0, features=(1.0,), label=1),
+    ] * 10
+    model = TrainedModel(
+        weights=[8.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+    before = model.predict_proba((1.0,))
+    report = calibrate_probability_temperature(rows, model, min_temperature=1.0, max_temperature=6.0, steps=26)
+    model.probability_temperature = report.temperature
+    after = model.predict_proba((1.0,))
+    assert report.improved is True
+    assert report.temperature > 1.0
+    assert report.log_loss_after < report.log_loss_before
+    assert abs(after - 0.5) < abs(before - 0.5)

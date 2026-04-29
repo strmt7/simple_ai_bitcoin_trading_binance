@@ -18,8 +18,10 @@ from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_ena
 from .api import SymbolConstraints
 from .market_data import clean_candles
 from .model import (
+    assess_probability_calibration,
     build_model_quality_report,
     calibrate_threshold,
+    calibrate_probability_temperature,
     confidence_adjusted_probability,
     evaluate_classification,
     evaluate,
@@ -873,6 +875,21 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
                     float(quality_score) >= 0.45,
                     "model quality",
                     f"score={float(quality_score):.2f} warnings={warning_text}",
+                )
+            probability_brier = getattr(model, "probability_brier_after", None)
+            if probability_brier is not None:
+                probability_temperature = float(getattr(model, "probability_temperature", 1.0) or 1.0)
+                probability_ece = getattr(model, "probability_ece_after", None)
+                probability_detail = (
+                    f"temperature={probability_temperature:.2f} "
+                    f"brier={float(probability_brier):.3f}"
+                )
+                if probability_ece is not None:
+                    probability_detail += f" ece={float(probability_ece):.3f}"
+                add(
+                    float(probability_brier) <= 0.35,
+                    "probability calibration",
+                    probability_detail,
                 )
             if candles is not None:
                 rows = _build_model_rows(candles, strategy)
@@ -2700,6 +2717,20 @@ def command_train(args: argparse.Namespace) -> int:
         validation_rows=calibration_rows,
         early_stopping_rounds=max(5, min(25, int(args.epochs) // 5)) if calibration_rows else None,
     )
+    probability_calibration = (
+        calibrate_probability_temperature(calibration_rows, model)
+        if calibration_rows
+        else assess_probability_calibration([], model)
+    )
+    if probability_calibration.status != "fail":
+        model.probability_temperature = float(probability_calibration.temperature)
+        model.probability_calibration_size = int(probability_calibration.rows)
+        model.probability_log_loss_before = float(probability_calibration.log_loss_before)
+        model.probability_log_loss_after = float(probability_calibration.log_loss_after)
+        model.probability_brier_before = float(probability_calibration.brier_before)
+        model.probability_brier_after = float(probability_calibration.brier_after)
+        model.probability_ece_before = float(probability_calibration.expected_calibration_error_before)
+        model.probability_ece_after = float(probability_calibration.expected_calibration_error_after)
     threshold = cfg.signal_threshold
     if args.calibrate_threshold and calibration_rows:
         threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
@@ -2730,6 +2761,14 @@ def command_train(args: argparse.Namespace) -> int:
     print(f"model quality: {quality.status} score={quality.quality_score:.2f}")
     for warning in quality.warnings[:3]:
         print(f"model quality warning: {warning}")
+    print(
+        f"probability calibration: {probability_calibration.status} "
+        f"temperature={probability_calibration.temperature:.2f} "
+        f"brier={probability_calibration.brier_before:.3f}->{probability_calibration.brier_after:.3f} "
+        f"log_loss={probability_calibration.log_loss_before:.3f}->{probability_calibration.log_loss_after:.3f}"
+    )
+    for warning in probability_calibration.warnings[:3]:
+        print(f"probability calibration warning: {warning}")
     print(
         f"feature drift: {drift.status} max_z={drift.max_abs_z:.2f} "
         f"outliers={drift.outlier_fraction:.1%}"
@@ -2771,6 +2810,7 @@ def command_train(args: argparse.Namespace) -> int:
             "model_feature_signature": model.feature_signature,
         },
         "model_quality": quality.asdict(),
+        "probability_calibration": probability_calibration.asdict(),
         "feature_drift": drift.asdict(),
         "model": {
             "path": str(args.output),
@@ -2798,6 +2838,26 @@ def command_train(args: argparse.Namespace) -> int:
             if model.quality_score is not None
             else None,
             "quality_warnings": list(model.quality_warnings),
+            "probability_temperature": float(model.probability_temperature),
+            "probability_calibration_size": int(model.probability_calibration_size),
+            "probability_log_loss_before": float(model.probability_log_loss_before)
+            if model.probability_log_loss_before is not None
+            else None,
+            "probability_log_loss_after": float(model.probability_log_loss_after)
+            if model.probability_log_loss_after is not None
+            else None,
+            "probability_brier_before": float(model.probability_brier_before)
+            if model.probability_brier_before is not None
+            else None,
+            "probability_brier_after": float(model.probability_brier_after)
+            if model.probability_brier_after is not None
+            else None,
+            "probability_ece_before": float(model.probability_ece_before)
+            if model.probability_ece_before is not None
+            else None,
+            "probability_ece_after": float(model.probability_ece_after)
+            if model.probability_ece_after is not None
+            else None,
         },
         "market": runtime.market_type,
         "symbol": runtime.symbol,
@@ -3031,6 +3091,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
     report = evaluate_classification(test_rows if test_rows else rows, model, threshold=threshold)
     train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
     quality = build_model_quality_report(train_rows, test_rows if test_rows else rows, model, threshold)
+    probability_calibration = assess_probability_calibration(test_rows if test_rows else rows, model)
     drift = feature_drift_report(test_rows if test_rows else rows, model)
     artifact = {
         "command": "evaluate",
@@ -3071,16 +3132,21 @@ def command_evaluate(args: argparse.Namespace) -> int:
             },
         },
         "model_quality": quality.asdict(),
+        "probability_calibration": probability_calibration.asdict(),
         "feature_drift": drift.asdict(),
     }
     _persist_run_artifact("evaluate", Path(args.model).parent, artifact)
 
     print(f"evaluate model={model_path}")
     print(f"threshold: {report.threshold:.3f}")
+    train_accuracy = train_report.accuracy if train_report is not None else 0.0
+    train_precision = train_report.precision if train_report is not None else 0.0
+    train_recall = train_report.recall if train_report is not None else 0.0
+    train_f1 = train_report.f1 if train_report is not None else 0.0
     print(
         "train_accuracy: "
-        f"{train_report.accuracy:.3f} precision={train_report.precision:.3f} "
-        f"recall={train_report.recall:.3f} f1={train_report.f1:.3f}"
+        f"{train_accuracy:.3f} precision={train_precision:.3f} "
+        f"recall={train_recall:.3f} f1={train_f1:.3f}"
     )
     print(
         "test_accuracy: "
@@ -3095,6 +3161,14 @@ def command_evaluate(args: argparse.Namespace) -> int:
     print(f"model_quality: {quality.status} score={quality.quality_score:.2f}")
     for warning in quality.warnings[:3]:
         print(f"quality_warning: {warning}")
+    print(
+        f"probability_calibration: {probability_calibration.status} "
+        f"temperature={probability_calibration.temperature:.2f} "
+        f"brier={probability_calibration.brier_after:.3f} "
+        f"ece={probability_calibration.expected_calibration_error_after:.3f}"
+    )
+    for warning in probability_calibration.warnings[:3]:
+        print(f"probability_warning: {warning}")
     print(
         f"feature_drift: {drift.status} max_z={drift.max_abs_z:.2f} "
         f"outliers={drift.outlier_fraction:.1%}"

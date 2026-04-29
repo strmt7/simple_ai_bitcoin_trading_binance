@@ -9,17 +9,23 @@ from simple_ai_bitcoin_trading_binance.features import make_rows, make_rows_lega
 from simple_ai_bitcoin_trading_binance.features import _rsi as rsi_fn, _true_range
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
+    assess_probability_calibration,
     build_model_quality_report,
+    calibrate_probability_temperature,
     evaluate,
     evaluate_classification,
     feature_drift_report,
     _collect_feature_stats,
     _log_loss,
+    _brier_score,
+    _expected_calibration_error,
+    _model_log_loss,
     _majority_baseline,
     _normalize_rows,
     _positive_rate,
     _probability_stats,
     _sigmoid,
+    _temperature_scaled_score,
     _f1,
     _confusion,
     _class_weights,
@@ -95,9 +101,16 @@ def test_probability_and_quality_helpers_cover_edges() -> None:
         feature_stds=[1.0],
     )
     assert _log_loss([], [0.0], 0.0, [0.0], [1.0]) == 0.0
+    assert _model_log_loss([], model) == 0.0
+    assert _brier_score([], model) == 0.0
+    assert _expected_calibration_error([], model) == 0.0
+    assert _temperature_scaled_score(2.0, "bad") == 2.0
+    assert _temperature_scaled_score(2.0, 0.0) == 2.0
     assert _positive_rate([]) == 0.0
     assert _probability_stats([], model).asdict() == {"minimum": 0.0, "maximum": 0.0, "mean": 0.0, "std": 0.0}
     assert _majority_baseline([]) == 0.0
+    assert assess_probability_calibration([], model).status == "fail"
+    assert calibrate_probability_temperature([], model).status == "fail"
 
     validation = [SimpleNamespace(features=(1.0,), label=1)] * 5
     weak = build_model_quality_report([], validation, model, threshold=0.9)
@@ -107,6 +120,10 @@ def test_probability_and_quality_helpers_cover_edges() -> None:
 
     no_validation = build_model_quality_report(validation, [], model, threshold=0.5)
     assert no_validation.validation_rows == 0
+
+    one_class_calibration = calibrate_probability_temperature(validation, model)
+    assert one_class_calibration.status == "warn"
+    assert "only one class" in one_class_calibration.warnings[-1]
 
     strong_model = TrainedModel(
         weights=[8.0],
@@ -133,6 +150,49 @@ def test_probability_and_quality_helpers_cover_edges() -> None:
     assert overfit.status == "fail"
     assert any("overfitting" in warning for warning in overfit.warnings)
     assert any("F1 is zero" in warning for warning in overfit.warnings)
+
+    short_rows = [
+        SimpleNamespace(features=(0.0,), label=0),
+        SimpleNamespace(features=(1.0,), label=1),
+    ]
+    short_report = assess_probability_calibration(short_rows, strong_model)
+    assert short_report.status == "warn"
+    assert any("fewer than 20" in warning for warning in short_report.warnings)
+
+    strong_model.probability_temperature = 4.0
+    assessed = assess_probability_calibration(mixed, strong_model)
+    assert assessed.temperature == 4.0
+    assert assessed.improved is False
+
+    overconfident = TrainedModel(
+        weights=[8.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+        probability_temperature=4.0,
+    )
+    balanced = [
+        SimpleNamespace(features=(1.0,), label=0),
+        SimpleNamespace(features=(1.0,), label=1),
+    ] * 20
+    softened = assess_probability_calibration(balanced, overconfident)
+    assert softened.improved is True
+    assert softened.log_loss_after < softened.log_loss_before
+
+    overconfident.probability_temperature = "invalid"
+    assert assess_probability_calibration(balanced, overconfident).temperature == 1.0
+    overconfident.probability_temperature = float("nan")
+    assert assess_probability_calibration(balanced, overconfident).temperature == 1.0
+
+    strong_model.probability_temperature = 1.0
+    no_improvement = calibrate_probability_temperature(mixed, strong_model, min_temperature=1.0, max_temperature=1.0, steps=1)
+    assert no_improvement.status == "warn"
+    assert no_improvement.improved is False
+
+    appended_current = calibrate_probability_temperature(mixed, strong_model, min_temperature=2.0, max_temperature=3.0, steps=2)
+    assert appended_current.temperature >= 1.0
 
 
 def test_feature_drift_report_statuses_and_edges() -> None:

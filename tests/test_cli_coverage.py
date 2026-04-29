@@ -12,7 +12,7 @@ import pytest
 from simple_ai_bitcoin_trading_binance import cli
 from simple_ai_bitcoin_trading_binance.api import BinanceAPIError, Candle, SymbolConstraints
 from simple_ai_bitcoin_trading_binance.config import RuntimeConfig, load_strategy, save_runtime, save_strategy
-from simple_ai_bitcoin_trading_binance.model import ModelLoadError, TrainedModel
+from simple_ai_bitcoin_trading_binance.model import ModelLoadError, TemporalValidationSplit, TrainedModel
 from simple_ai_bitcoin_trading_binance.features import feature_signature
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
@@ -493,6 +493,17 @@ def test_readiness_report_includes_feature_drift(tmp_path, monkeypatch) -> None:
     assert any("[ok] model artifact" in line for line in lines)
     assert not any("feature drift" in line for line in lines)
 
+    model.probability_brier_after = 0.20
+    model.probability_ece_after = 0.12
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+    assert any("[ok] probability calibration" in line and "ece=0.120" in line for line in lines)
+
+    model.probability_brier_after = 0.42
+    model.probability_ece_after = None
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+    assert ok is False
+    assert any("[fix] probability calibration" in line and "brier=0.420" in line for line in lines)
+
 
 def test_build_order_notional_paths() -> None:
     cfg = StrategyConfig(risk_per_trade=0.1, max_position_pct=0.4, leverage=3.0)
@@ -883,6 +894,37 @@ def test_command_train_rejects_invalid_optimizer_parameters(tmp_path, monkeypatc
     assert "l2_penalty must be >= 0" in capsys.readouterr().err
 
 
+def test_command_train_handles_no_calibration_split(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    rows = [
+        SimpleNamespace(timestamp=1, close=100.0, features=(0.0,), label=0),
+        SimpleNamespace(timestamp=2, close=101.0, features=(1.0,), label=1),
+    ]
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: [object()])
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: rows)
+
+    assert cli.command_train(
+        argparse.Namespace(
+            input="history.json",
+            output=str(tmp_path / "model.json"),
+            preset="custom",
+            epochs=3,
+            learning_rate=0.05,
+            l2_penalty=0.0,
+            seed=7,
+            walk_forward=False,
+            walk_forward_train=10,
+            walk_forward_test=5,
+            walk_forward_step=1,
+            calibrate_threshold=False,
+        )
+    ) == 0
+    output = capsys.readouterr().out
+    assert "probability calibration: fail" in output
+
+
 def test_command_train_artifact_includes_signature(tmp_path, monkeypatch) -> None:
     strategy = StrategyConfig(feature_windows=(4, 20), label_threshold=0.002, training_epochs=7)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1089,6 +1131,38 @@ def test_command_evaluate_artifact_is_emitted(tmp_path, monkeypatch) -> None:
     assert payload["command"] == "evaluate"
     assert payload["runtime"]["api_key"] == "<redacted>"
     assert payload["runtime"]["api_secret"] == "<redacted>"
+
+
+def test_command_evaluate_prints_zero_train_metrics_when_split_has_no_train_rows(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+
+    row = SimpleNamespace(timestamp=1, features=(0.0,), label=1)
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "weights": [0.0],
+                "bias": 0.0,
+                "feature_dim": 1,
+                "epochs": 1,
+                "feature_version": "v1",
+                "feature_means": [0.0],
+                "feature_stds": [1.0],
+                "feature_signature": cli._strategy_feature_signature(StrategyConfig()),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: [object()])
+    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [row])
+    monkeypatch.setattr(cli, "temporal_validation_split", lambda _rows: TemporalValidationSplit([], [], [row]))
+
+    assert cli.command_evaluate(
+        argparse.Namespace(input="x", model=str(model_file), threshold=None, calibrate_threshold=False)
+    ) == 0
+    assert "train_accuracy: 0.000 precision=0.000 recall=0.000 f1=0.000" in capsys.readouterr().out
 
 
 def test_command_evaluate_rejects_bad_json_input(tmp_path, monkeypatch) -> None:
