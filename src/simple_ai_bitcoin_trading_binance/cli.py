@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence, TypeVar, cast
 
 from .api import BinanceAPIError, BinanceClient, Candle
-from .backtest import run_backtest
+from .backtest import calibrate_threshold_for_backtest, risk_adjusted_backtest_score, run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
 from . import data_workflows
@@ -2912,6 +2912,46 @@ def _load_training_candles(args: argparse.Namespace, runtime: RuntimeConfig) -> 
     )
 
 
+def _classification_payload(report: object) -> dict[str, float | int]:
+    return {
+        "accuracy": float(getattr(report, "accuracy", 0.0)),
+        "precision": float(getattr(report, "precision", 0.0)),
+        "recall": float(getattr(report, "recall", 0.0)),
+        "f1": float(getattr(report, "f1", 0.0)),
+        "threshold": float(getattr(report, "threshold", 0.5)),
+        "true_positive": int(getattr(report, "true_positive", 0)),
+        "false_positive": int(getattr(report, "false_positive", 0)),
+        "true_negative": int(getattr(report, "true_negative", 0)),
+        "false_negative": int(getattr(report, "false_negative", 0)),
+    }
+
+
+def _threshold_classification_guard(baseline: object, candidate: object) -> dict[str, float | str | bool]:
+    baseline_accuracy = float(getattr(baseline, "accuracy", 0.0))
+    baseline_f1 = float(getattr(baseline, "f1", 0.0))
+    baseline_precision = float(getattr(baseline, "precision", 0.0))
+    candidate_accuracy = float(getattr(candidate, "accuracy", 0.0))
+    candidate_f1 = float(getattr(candidate, "f1", 0.0))
+    candidate_precision = float(getattr(candidate, "precision", 0.0))
+    accuracy_floor = max(0.0, baseline_accuracy - 0.03)
+    f1_floor = max(0.0, baseline_f1 - 0.05)
+    precision_floor = max(0.0, baseline_precision - 0.02)
+    stable_f1 = candidate_accuracy >= accuracy_floor and candidate_f1 >= f1_floor
+    conservative_precision = (
+        candidate_accuracy >= baseline_accuracy + 0.02
+        and candidate_precision >= precision_floor
+    )
+    passed = stable_f1 or conservative_precision
+    mode = "f1_stable" if stable_f1 else ("accuracy_precision" if conservative_precision else "rejected")
+    return {
+        "passed": bool(passed),
+        "mode": mode,
+        "accuracy_floor": float(accuracy_floor),
+        "f1_floor": float(f1_floor),
+        "precision_floor": float(precision_floor),
+    }
+
+
 def command_train(args: argparse.Namespace) -> int:
     try:
         args = _apply_training_preset(args)
@@ -2997,12 +3037,50 @@ def command_train(args: argparse.Namespace) -> int:
         model.probability_ece_before = float(probability_calibration.expected_calibration_error_before)
         model.probability_ece_after = float(probability_calibration.expected_calibration_error_after)
     threshold = cfg.signal_threshold
+    threshold_source = "strategy"
+    threshold_calibration: dict[str, object] | None = None
     if args.calibrate_threshold and calibration_rows:
-        threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
+        classification_threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
+        threshold = classification_threshold
+        threshold_source = "classification_f1"
+        classification_report = evaluate_classification(calibration_rows, model, threshold=classification_threshold)
+        profit_calibration = calibrate_threshold_for_backtest(
+            calibration_rows,
+            model,
+            cfg,
+            starting_cash=1000.0,
+            market_type=runtime.market_type,
+            baseline_threshold=classification_threshold,
+            start=0.05,
+            end=0.95,
+            steps=181,
+        )
+        profit_report = evaluate_classification(calibration_rows, model, threshold=profit_calibration.best_threshold)
+        classification_guard = _threshold_classification_guard(classification_report, profit_report)
+        classification_guard_passed = bool(classification_guard["passed"])
+        if profit_calibration.accepted and classification_guard_passed:
+            threshold = profit_calibration.threshold
+            threshold_source = "profit_backtest"
+        threshold_calibration = {
+            "source": threshold_source,
+            "classification": _classification_payload(classification_report),
+            "profit_candidate": _classification_payload(profit_report),
+            "profit_backtest": profit_calibration.asdict(),
+            "classification_guard": classification_guard,
+        }
     model.decision_threshold = float(threshold)
     model.calibration_size = len(calibration_rows) if args.calibrate_threshold else 0
     model.validation_size = len(validation_rows)
     model.training_cutoff_timestamp = train_rows[-1].timestamp if train_rows else None
+    model.threshold_source = threshold_source
+    if threshold_calibration:
+        profit_backtest = cast(dict[str, object], threshold_calibration["profit_backtest"])
+        threshold_score = cast(float | int | str, profit_backtest["score"])
+        threshold_pnl = cast(float | int | str, profit_backtest["realized_pnl"])
+        threshold_trades = cast(float | int | str, profit_backtest["closed_trades"])
+        model.threshold_calibration_score = float(threshold_score)
+        model.threshold_calibration_pnl = float(threshold_pnl)
+        model.threshold_calibration_trades = int(threshold_trades)
     train_score = evaluate(train_rows, model, threshold=threshold)
     calibration_score = evaluate(calibration_rows, model, threshold=threshold) if calibration_rows else 0.0
     validation_score = evaluate(validation_rows, model, threshold=threshold) if validation_rows else 0.0
@@ -3021,8 +3099,20 @@ def command_train(args: argparse.Namespace) -> int:
     print(f"in-sample directional accuracy: {train_score:.3f}")
     print(f"out-of-sample directional accuracy: {validation_score:.3f}")
     if args.calibrate_threshold and calibration_rows:
-        print(f"validated threshold: {threshold:.3f}")
+        print(f"validated threshold: {threshold:.3f} source={threshold_source}")
         print(f"calibration directional accuracy: {calibration_score:.3f}")
+        threshold_calibration_payload = cast(dict[str, object], threshold_calibration)
+        profit_backtest = cast(dict[str, object], threshold_calibration_payload["profit_backtest"])
+        accepted = "accepted" if threshold_source == "profit_backtest" else "rejected"
+        best_threshold = float(cast(float | int | str, profit_backtest["best_threshold"]))
+        best_score = float(cast(float | int | str, profit_backtest["best_score"]))
+        baseline_score = float(cast(float | int | str, profit_backtest["baseline_score"]))
+        print(
+            "profit threshold candidate: "
+            f"{accepted} best={best_threshold:.3f} "
+            f"score={best_score:.3f} "
+            f"baseline={baseline_score:.3f}"
+        )
     print(f"model quality: {quality.status} score={quality.quality_score:.2f}")
     for warning in quality.warnings[:3]:
         print(f"model quality warning: {warning}")
@@ -3071,6 +3161,8 @@ def command_train(args: argparse.Namespace) -> int:
             "calibration_accuracy": float(calibration_score),
             "threshold": float(threshold),
             "tuned_threshold": float(threshold) if args.calibrate_threshold and calibration_rows else None,
+            "threshold_source": threshold_source,
+            "threshold_calibration": threshold_calibration,
             "calibrated_out_of_sample_accuracy": float(validation_score)
             if args.calibrate_threshold and validation_rows
             else None,
@@ -3126,6 +3218,14 @@ def command_train(args: argparse.Namespace) -> int:
             "probability_ece_after": float(model.probability_ece_after)
             if model.probability_ece_after is not None
             else None,
+            "threshold_source": model.threshold_source,
+            "threshold_calibration_score": float(model.threshold_calibration_score)
+            if model.threshold_calibration_score is not None
+            else None,
+            "threshold_calibration_pnl": float(model.threshold_calibration_pnl)
+            if model.threshold_calibration_pnl is not None
+            else None,
+            "threshold_calibration_trades": int(model.threshold_calibration_trades),
         },
         "market": runtime.market_type,
         "symbol": runtime.symbol,
@@ -3306,18 +3406,7 @@ def command_backtest(args: argparse.Namespace) -> int:
 
 
 def _tune_score(result: object, starting_cash: float = 1000.0) -> float:
-    realized = float(getattr(result, "realized_pnl", 0.0))
-    total_fees = float(getattr(result, "total_fees", 0.0))
-    max_drawdown = float(getattr(result, "max_drawdown", 0.0))
-    closed_trades = int(getattr(result, "closed_trades", 0))
-    stopped_by_drawdown = bool(getattr(result, "stopped_by_drawdown", False))
-    score = realized - total_fees
-    score -= max_drawdown * starting_cash
-    if stopped_by_drawdown:
-        score -= starting_cash * 0.5
-    if closed_trades <= 0:
-        score -= 50.0
-    return score
+    return risk_adjusted_backtest_score(result, starting_cash=starting_cash)
 
 
 def command_evaluate(args: argparse.Namespace) -> int:

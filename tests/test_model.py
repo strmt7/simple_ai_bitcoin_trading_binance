@@ -234,6 +234,10 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
         probability_brier_after=0.22,
         probability_ece_before=0.20,
         probability_ece_after=0.15,
+        threshold_source="profit_backtest",
+        threshold_calibration_score=12.3,
+        threshold_calibration_pnl=4.5,
+        threshold_calibration_trades=6,
     )
     from simple_ai_bitcoin_trading_binance.model import serialize_model
 
@@ -247,6 +251,10 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
     assert loaded.probability_temperature == 2.0
     assert loaded.probability_calibration_size == 6
     assert loaded.probability_brier_after == 0.22
+    assert loaded.threshold_source == "profit_backtest"
+    assert loaded.threshold_calibration_score == 12.3
+    assert loaded.threshold_calibration_pnl == 4.5
+    assert loaded.threshold_calibration_trades == 6
     assert confidence_adjusted_probability(0.9, 0.5) == 0.7
     assert confidence_adjusted_probability(0.1, 0.5) == 0.3
     assert confidence_adjusted_probability("bad", 0.5) == 0.5

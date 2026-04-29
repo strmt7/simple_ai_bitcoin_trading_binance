@@ -72,6 +72,20 @@ def _simple_candles(n: int = 320) -> list[Candle]:
     return out
 
 
+def test_threshold_classification_guard_modes() -> None:
+    baseline = SimpleNamespace(accuracy=0.50, precision=0.40, f1=0.40)
+    stable = SimpleNamespace(accuracy=0.49, precision=0.39, f1=0.36)
+    conservative = SimpleNamespace(accuracy=0.55, precision=0.39, f1=0.10)
+    rejected = SimpleNamespace(accuracy=0.45, precision=0.20, f1=0.10)
+
+    assert cli._threshold_classification_guard(baseline, stable)["mode"] == "f1_stable"
+    assert cli._threshold_classification_guard(baseline, conservative)["mode"] == "accuracy_precision"
+    guard = cli._threshold_classification_guard(baseline, rejected)
+    assert guard["mode"] == "rejected"
+    assert guard["passed"] is False
+    assert guard["precision_floor"] == 0.38
+
+
 def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     args = cli._parse_args(["status"])
     assert callable(args.func)
@@ -873,6 +887,89 @@ def test_command_train_workflow(tmp_path, monkeypatch) -> None:
             calibrate_threshold=False,
         )
     ) == 0
+
+
+def test_command_train_accepts_profit_threshold_candidate(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    candles = [
+        {
+            "open_time": i * 60_000,
+            "open": 100.0 + i,
+            "high": 101.0 + i,
+            "low": 99.0 + i,
+            "close": 100.0 + i,
+            "volume": 1.0,
+            "close_time": (i + 1) * 60_000,
+        }
+        for i in range(320)
+    ]
+    data_file = tmp_path / "history.json"
+    model_file = tmp_path / "model.json"
+    data_file.write_text(json.dumps(candles), encoding="utf-8")
+
+    class _ProfitCalibration:
+        accepted = True
+        threshold = 0.7
+        best_threshold = 0.7
+
+        def asdict(self) -> dict[str, object]:
+            return {
+                "score": 3.0,
+                "realized_pnl": 2.0,
+                "closed_trades": 4,
+                "best_threshold": 0.7,
+                "best_score": 3.0,
+                "baseline_score": 1.0,
+            }
+
+    reports = [
+        SimpleNamespace(
+            accuracy=0.50,
+            precision=0.40,
+            recall=0.60,
+            f1=0.48,
+            threshold=0.5,
+            true_positive=4,
+            false_positive=6,
+            true_negative=10,
+            false_negative=3,
+        ),
+        SimpleNamespace(
+            accuracy=0.56,
+            precision=0.41,
+            recall=0.20,
+            f1=0.25,
+            threshold=0.7,
+            true_positive=2,
+            false_positive=3,
+            true_negative=15,
+            false_negative=8,
+        ),
+    ]
+    monkeypatch.setattr(cli, "calibrate_threshold_for_backtest", lambda *_a, **_k: _ProfitCalibration())
+    monkeypatch.setattr(cli, "evaluate_classification", lambda *_a, **_k: reports.pop(0))
+
+    assert cli.command_train(
+        argparse.Namespace(
+            input=str(data_file),
+            output=str(model_file),
+            epochs=12,
+            walk_forward=False,
+            walk_forward_train=10,
+            walk_forward_test=5,
+            walk_forward_step=1,
+            calibrate_threshold=True,
+        )
+    ) == 0
+    output = capsys.readouterr().out
+    model_payload = json.loads(model_file.read_text(encoding="utf-8"))
+    assert "profit threshold candidate: accepted" in output
+    assert model_payload["decision_threshold"] == 0.7
+    assert model_payload["threshold_source"] == "profit_backtest"
+    assert model_payload["threshold_calibration_score"] == 3.0
+    assert model_payload["threshold_calibration_trades"] == 4
 
 
 def test_command_train_rejects_bad_json_input(tmp_path, monkeypatch) -> None:

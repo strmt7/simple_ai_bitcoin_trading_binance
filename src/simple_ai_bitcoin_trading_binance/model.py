@@ -63,6 +63,10 @@ class TrainedModel:
     probability_brier_after: float | None = None
     probability_ece_before: float | None = None
     probability_ece_after: float | None = None
+    threshold_source: str | None = None
+    threshold_calibration_score: float | None = None
+    threshold_calibration_pnl: float | None = None
+    threshold_calibration_trades: int = 0
 
     def _normalize(self, features: Tuple[float, ...]) -> Tuple[float, ...]:
         if len(features) != self.feature_dim:
@@ -1110,4 +1114,20 @@ def load_model(
             if payload.get("probability_ece_after") is not None
             else None
         ),
+        threshold_source=(
+            str(payload["threshold_source"])
+            if payload.get("threshold_source") is not None
+            else None
+        ),
+        threshold_calibration_score=(
+            float(payload["threshold_calibration_score"])
+            if payload.get("threshold_calibration_score") is not None
+            else None
+        ),
+        threshold_calibration_pnl=(
+            float(payload["threshold_calibration_pnl"])
+            if payload.get("threshold_calibration_pnl") is not None
+            else None
+        ),
+        threshold_calibration_trades=int(payload.get("threshold_calibration_trades", 0) or 0),
     )

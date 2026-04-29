@@ -1,7 +1,8 @@
 """Backtesting engine for BTCUSDC model-driven strategies."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+import math
+from dataclasses import asdict, dataclass, replace
 from typing import Dict, List
 
 from .features import ModelRow
@@ -25,6 +26,56 @@ class BacktestResult:
     trades_per_day_cap_hit: int
     buy_hold_pnl: float = 0.0
     edge_vs_buy_hold: float = 0.0
+
+
+@dataclass(frozen=True)
+class ThresholdBacktestCalibration:
+    threshold: float
+    accepted: bool
+    score: float
+    realized_pnl: float
+    total_fees: float
+    max_drawdown: float
+    win_rate: float
+    closed_trades: int
+    edge_vs_buy_hold: float
+    baseline_threshold: float
+    baseline_score: float
+    baseline_realized_pnl: float
+    baseline_closed_trades: int
+    best_threshold: float
+    best_score: float
+    evaluated_thresholds: int
+    rows: int
+
+    def asdict(self) -> dict[str, float | int | bool]:
+        return asdict(self)
+
+
+def _finite_float(value: object, default: float = 0.0) -> float:
+    if not isinstance(value, (int, float, str)):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def risk_adjusted_backtest_score(result: object, *, starting_cash: float = 1000.0) -> float:
+    realized = _finite_float(getattr(result, "realized_pnl", 0.0))
+    total_fees = max(0.0, _finite_float(getattr(result, "total_fees", 0.0)))
+    max_drawdown = max(0.0, _finite_float(getattr(result, "max_drawdown", 0.0)))
+    closed_trades = int(_finite_float(getattr(result, "closed_trades", 0), 0.0))
+    stopped_by_drawdown = bool(getattr(result, "stopped_by_drawdown", False))
+    cash = max(1.0, _finite_float(starting_cash, 1000.0))
+
+    score = realized - total_fees - (max_drawdown * cash)
+    if stopped_by_drawdown:
+        score -= cash * 0.5
+    if closed_trades <= 0:
+        score -= cash * 0.05
+    return float(score)
 
 
 def _bps_to_rate(bps: float) -> float:
@@ -87,6 +138,108 @@ def _buy_hold_pnl(rows: List[ModelRow], starting_cash: float, cfg: StrategyConfi
     exit_notional = qty * exit_price
     exit_fee = exit_notional * fee_rate
     return cash + exit_notional - exit_fee - starting_cash
+
+
+def _clamp_threshold(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.5
+    return max(0.0, min(1.0, value))
+
+
+def _threshold_grid(start: float, end: float, steps: int, baseline: float) -> list[float]:
+    if steps <= 1:
+        return [_clamp_threshold(baseline)]
+    start = _clamp_threshold(float(start))
+    end = _clamp_threshold(float(end))
+    if end <= start:
+        end = min(1.0, start + 0.01)
+    values = [start + (end - start) * i / (steps - 1) for i in range(steps)]
+    values.append(_clamp_threshold(baseline))
+    return sorted(set(round(_clamp_threshold(value), 12) for value in values))
+
+
+def _result_payload(result: BacktestResult) -> dict[str, float | int]:
+    return {
+        "realized_pnl": float(result.realized_pnl),
+        "total_fees": float(result.total_fees),
+        "max_drawdown": float(result.max_drawdown),
+        "win_rate": float(result.win_rate),
+        "closed_trades": int(result.closed_trades),
+        "edge_vs_buy_hold": float(result.edge_vs_buy_hold),
+    }
+
+
+def calibrate_threshold_for_backtest(
+    rows: List[ModelRow],
+    model: TrainedModel,
+    cfg: StrategyConfig,
+    *,
+    starting_cash: float = 1000.0,
+    market_type: str = "spot",
+    baseline_threshold: float | None = None,
+    start: float = 0.05,
+    end: float = 0.95,
+    steps: int = 31,
+    min_score_delta: float = 0.0,
+) -> ThresholdBacktestCalibration:
+    baseline_threshold = _clamp_threshold(
+        _finite_float(baseline_threshold, model_decision_threshold(model, cfg.signal_threshold))
+        if baseline_threshold is not None
+        else model_decision_threshold(model, cfg.signal_threshold)
+    )
+    baseline_model = replace(model, decision_threshold=baseline_threshold)
+    baseline_result = run_backtest(
+        rows,
+        baseline_model,
+        cfg,
+        starting_cash=starting_cash,
+        market_type=market_type,
+    )
+    baseline_score = risk_adjusted_backtest_score(baseline_result, starting_cash=starting_cash)
+    best_threshold = baseline_threshold
+    best_score = baseline_score
+    best_result = baseline_result
+    thresholds = _threshold_grid(start, end, steps, baseline_threshold)
+
+    for threshold in thresholds:
+        candidate_model = replace(model, decision_threshold=threshold)
+        result = run_backtest(rows, candidate_model, cfg, starting_cash=starting_cash, market_type=market_type)
+        score = risk_adjusted_backtest_score(result, starting_cash=starting_cash)
+        if (
+            score > best_score + 1e-12
+            or (
+                abs(score - best_score) <= 1e-12
+                and result.realized_pnl > best_result.realized_pnl
+            )
+        ):
+            best_threshold = threshold
+            best_score = score
+            best_result = result
+
+    accepted = best_score > baseline_score + max(0.0, _finite_float(min_score_delta, 0.0))
+    selected_threshold = best_threshold if accepted else baseline_threshold
+    selected_score = best_score if accepted else baseline_score
+    selected_result = best_result if accepted else baseline_result
+    payload = _result_payload(selected_result)
+    return ThresholdBacktestCalibration(
+        threshold=float(selected_threshold),
+        accepted=bool(accepted),
+        score=float(selected_score),
+        realized_pnl=float(payload["realized_pnl"]),
+        total_fees=float(payload["total_fees"]),
+        max_drawdown=float(payload["max_drawdown"]),
+        win_rate=float(payload["win_rate"]),
+        closed_trades=int(payload["closed_trades"]),
+        edge_vs_buy_hold=float(payload["edge_vs_buy_hold"]),
+        baseline_threshold=float(baseline_threshold),
+        baseline_score=float(baseline_score),
+        baseline_realized_pnl=float(baseline_result.realized_pnl),
+        baseline_closed_trades=int(baseline_result.closed_trades),
+        best_threshold=float(best_threshold),
+        best_score=float(best_score),
+        evaluated_thresholds=len(thresholds),
+        rows=len(rows),
+    )
 
 
 def run_backtest(
