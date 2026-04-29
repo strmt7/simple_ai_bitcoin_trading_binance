@@ -100,11 +100,25 @@ def test_command_train_suite_malformed_rows_and_limited_objectives(tmp_path, mon
         input=str(input_path),
         output_dir=str(tmp_path / "out"),
         starting_cash=1000.0,
-        objective=["default"],
+        objective=["balanced"],
     )
     assert cli.command_train_suite(args) == 0
     out = capsys.readouterr().out
     assert "training suite complete" in out
+
+
+def test_command_train_suite_unknown_objective_is_clean_error(tmp_path, capsys):
+    input_path = tmp_path / "candles.json"
+    _write_candles(input_path, count=4)
+    args = argparse.Namespace(
+        input=str(input_path),
+        output_dir=str(tmp_path / "out"),
+        starting_cash=1000.0,
+        objective=["not-real"],
+    )
+    assert cli.command_train_suite(args) == 2
+    err = capsys.readouterr().err
+    assert "Unknown objective" in err
 
 
 def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
@@ -251,11 +265,12 @@ def _autonomous_control_path(tmp_path, monkeypatch):
 
 def test_command_autonomous_start_stop_status(tmp_path, monkeypatch, capsys):
     path = _autonomous_control_path(tmp_path, monkeypatch)
-    args = argparse.Namespace(action="start", objective="default")
+    args = argparse.Namespace(action="start", objective="balanced")
     assert cli.command_autonomous(args) == 0
     assert path.exists()
     payload = json.loads(path.read_text())
     assert payload["state"] == "RUNNING"
+    assert payload["note"] == "CLI start objective=default"
 
     args_pause = argparse.Namespace(action="pause", objective="default")
     assert cli.command_autonomous(args_pause) == 0
@@ -276,7 +291,7 @@ def test_command_autonomous_unknown_objective(tmp_path, monkeypatch, capsys):
     args = argparse.Namespace(action="start", objective="bogus")
     assert cli.command_autonomous(args) == 2
     err = capsys.readouterr().err
-    assert "unknown objective" in err
+    assert "Unknown objective" in err
 
 
 # --------------------------------------------------------------------------- #

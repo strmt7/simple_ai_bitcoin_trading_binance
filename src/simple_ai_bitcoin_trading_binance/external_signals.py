@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 import requests
 
@@ -74,7 +74,7 @@ def _clamp(value: float, low: float, high: float) -> float:
     return value
 
 
-def _safe_float(value: object, default: float = 0.0) -> float:
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -268,6 +268,8 @@ def report_from_payload(payload: Mapping[str, object]) -> ExternalSignalReport |
         for component in [_component_from_payload(item)]
         if component is not None
     ]
+    warning_values = payload.get("warnings", [])
+    warnings = [str(value) for value in warning_values if isinstance(value, str)] if isinstance(warning_values, list) else []
     return ExternalSignalReport(
         status=str(payload.get("status") or "warn"),
         score_adjustment=_safe_float(payload.get("score_adjustment"), 0.0),
@@ -278,9 +280,7 @@ def report_from_payload(payload: Mapping[str, object]) -> ExternalSignalReport |
         stale_count=int(_safe_float(payload.get("stale_count"), 0.0)),
         known_at_ms=int(_safe_float(payload.get("known_at_ms"), 0.0)),
         cache_path=str(payload.get("cache_path") or ""),
-        warnings=[str(value) for value in payload.get("warnings", []) if isinstance(value, str)]
-        if isinstance(payload.get("warnings"), list)
-        else [],
+        warnings=warnings,
         components=components,
     )
 
@@ -380,7 +380,7 @@ def collect_external_signals(
         "mempool_fee_pressure",
     ]
     components: list[ExternalSignalComponent] = []
-    for provider, fetcher in zip(provider_names, fetchers):
+    for provider, fetcher in zip(provider_names, fetchers, strict=True):
         try:
             components.append(fetcher())
         except Exception as exc:

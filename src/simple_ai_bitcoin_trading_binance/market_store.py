@@ -6,8 +6,9 @@ import json
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, cast
 
 from .api import Candle
 
@@ -275,14 +276,16 @@ class MarketDataStore:
             """,
             (symbol.upper(), market_type, interval),
         ).fetchall()
-        open_times = [int(row["open_time"]) for row in rows]
+        open_times = [int(row["open_time"]) for row in rows if row["open_time"] is not None]
         missing = 0
-        for previous, current in zip(open_times, open_times[1:]):
+        for previous, current in pairwise(open_times):
             delta = current - previous
             if delta > interval_ms:
                 missing += max(0, (delta // interval_ms) - 1)
 
-        span = int(coverage.last_open_time) - int(coverage.first_open_time)
+        first_open_time = cast(int, coverage.first_open_time)
+        last_open_time = cast(int, coverage.last_open_time)
+        span = last_open_time - first_open_time
         expected_count = max(coverage.count, (span // interval_ms) + 1)
         ratio = coverage.count / expected_count if expected_count else 0.0
         return CandleCoverageQuality(
@@ -346,4 +349,4 @@ class MarketDataStore:
             (self._now_ms(), json.dumps(dict(payload), sort_keys=True)),
         )
         self.connect().commit()
-        return int(cursor.lastrowid)
+        return int(cast(int, cursor.lastrowid))

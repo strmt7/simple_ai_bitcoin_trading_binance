@@ -40,6 +40,7 @@ def test_available_and_describe():
 
 def test_get_objective_lookups():
     assert obj.get_objective("DEFAULT").name == "default"
+    assert obj.get_objective("balanced").name == "default"
     with pytest.raises(ValueError):
         obj.get_objective("")
     with pytest.raises(ValueError):

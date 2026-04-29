@@ -11,7 +11,7 @@ import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
@@ -1900,7 +1900,7 @@ def command_menu(_: argparse.Namespace) -> int:
     )
 
 
-def _load_json_candles(path: str) -> list[dict[str, object]]:
+def _load_json_candles(path: str) -> list[Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError(f"Expected candle list in JSON file: {path}")
@@ -4120,7 +4120,7 @@ def command_objectives(_: argparse.Namespace) -> int:
 
 def command_train_suite(args: argparse.Namespace) -> int:
     from .api import Candle
-    from .objective import available_objectives
+    from .objective import available_objectives, get_objective
     from .training_suite import run_training_suite
 
     runtime = load_runtime()
@@ -4144,15 +4144,23 @@ def command_train_suite(args: argparse.Namespace) -> int:
             ))
         except (KeyError, TypeError, ValueError):
             continue
-    objectives = tuple(args.objective) if args.objective else available_objectives()
-    report = run_training_suite(
-        candles,
-        strategy,
-        objectives=objectives,
-        market_type=runtime.market_type,
-        starting_cash=args.starting_cash,
-        output_dir=Path(args.output_dir),
-    )
+    try:
+        objectives = (
+            tuple(get_objective(name).name for name in args.objective)
+            if args.objective
+            else available_objectives()
+        )
+        report = run_training_suite(
+            candles,
+            strategy,
+            objectives=objectives,
+            market_type=runtime.market_type,
+            starting_cash=args.starting_cash,
+            output_dir=Path(args.output_dir),
+        )
+    except ValueError as err:
+        print(f"training suite failed: {err}", file=sys.stderr)
+        return 2
     print(f"training suite complete: {len(report.outcomes)} objective(s)")
     for outcome in report.outcomes:
         print(
@@ -4204,16 +4212,18 @@ def command_autonomous(args: argparse.Namespace) -> int:
         STATE_STOPPING,
         AutonomousControl,
     )
-    from .objective import available_objectives
+    from .objective import get_objective
 
     control = AutonomousControl()
     action = args.action
     if action == "start":
-        if args.objective not in available_objectives():
-            print(f"unknown objective {args.objective!r}", file=sys.stderr)
+        try:
+            objective = get_objective(args.objective)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
             return 2
-        control.write(STATE_RUNNING, note=f"CLI start objective={args.objective}")
-        print(f"autonomous: RUNNING (objective={args.objective})")
+        control.write(STATE_RUNNING, note=f"CLI start objective={objective.name}")
+        print(f"autonomous: RUNNING (objective={objective.name})")
         return 0
     if action == "pause":
         control.write(STATE_PAUSED, note="CLI pause")

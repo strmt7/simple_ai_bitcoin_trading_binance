@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Sequence
 
@@ -58,7 +59,7 @@ def _dominant_interval_ms(candles: Sequence[Candle]) -> int | None:
     ordered = sorted(candles, key=lambda candle: candle.open_time)
     diffs = [
         int(right.open_time - left.open_time)
-        for left, right in zip(ordered, ordered[1:])
+        for left, right in pairwise(ordered)
         if right.open_time > left.open_time
     ]
     if not diffs:
@@ -74,7 +75,7 @@ def _gap_count(candles: Sequence[Candle]) -> int:
     ordered = sorted(candles, key=lambda candle: candle.open_time)
     return sum(
         1
-        for left, right in zip(ordered, ordered[1:])
+        for left, right in pairwise(ordered)
         if right.open_time - left.open_time > interval * 1.5
     )
 
@@ -104,7 +105,7 @@ def _max_latest_feature_delta(candles: Sequence[Candle], strategy: StrategyConfi
         return None
     return max(
         abs(left - right)
-        for left, right in zip(rows_full[-1].features, rows_tail[-1].features)
+        for left, right in zip(rows_full[-1].features, rows_tail[-1].features, strict=True)
     )
 
 

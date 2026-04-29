@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -11,7 +12,8 @@ import hmac
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, List, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import requests
@@ -27,6 +29,8 @@ _MAX_FUTURES_LEVERAGE = 125
 _RETRY_HTTP_STATUSES = {418, 429, 500, 502, 503, 504}
 _RETRY_BAPI_CODES = {-1003, -1007}
 _SENSITIVE_QUERY_FIELDS = {"signature", "timestamp", "recvWindow"}
+
+JsonMap = dict[str, Any]
 
 
 def _extract_retry_after(value: str | None) -> float | None:
@@ -189,7 +193,7 @@ class BinanceClient:
         self._rate_limit_at = datetime.now(timezone.utc) + min_interval
 
     @staticmethod
-    def _is_retryable_code(raw_code: object) -> bool:
+    def _is_retryable_code(raw_code: Any) -> bool:
         try:
             value = int(raw_code)
         except (TypeError, ValueError):
@@ -202,11 +206,16 @@ class BinanceClient:
         base = 0.5
         return min(30.0, base * (2 ** max(0, attempt)))
 
-    def _request(self, method: str, path: str, params: Dict[str, object] | None = None,
-                 signed: bool = False) -> Dict[str, object] | List[Dict[str, object]]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Mapping[str, Any] | None = None,
+        signed: bool = False,
+    ) -> Any:
         if params is None:
             params = {}
-        if not isinstance(params, dict):
+        if not isinstance(params, Mapping):
             params = {}
 
         max_attempts = self.max_retries + 1
@@ -295,31 +304,82 @@ class BinanceClient:
         self._record_request(max_attempts, response_status, method, path, last_url or path, last_error)
         raise BinanceAPIError(last_error or "Binance request failed")
 
-    def ping(self) -> Dict[str, object] | None:
-        endpoint = "/api/v3/ping" if self.market_type == "spot" else "/fapi/v1/ping"
-        return self._request("GET", endpoint)
+    def _request_dict(
+        self,
+        method: str,
+        path: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        signed: bool = False,
+        label: str,
+    ) -> JsonMap:
+        payload = self._request(method, path, params, signed=True) if signed else self._request(method, path, params)
+        if not isinstance(payload, dict):
+            raise BinanceAPIError(f"Unexpected {label} payload")
+        return payload
 
-    def get_exchange_info(self) -> Dict[str, object]:
+    def _request_list(
+        self,
+        method: str,
+        path: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        signed: bool = False,
+        label: str,
+    ) -> list[Any]:
+        payload = self._request(method, path, params, signed=True) if signed else self._request(method, path, params)
+        if not isinstance(payload, list):
+            raise BinanceAPIError(f"Unexpected {label} payload")
+        return payload
+
+    def ping(self) -> JsonMap:
+        endpoint = "/api/v3/ping" if self.market_type == "spot" else "/fapi/v1/ping"
+        return self._request_dict("GET", endpoint, label="ping")
+
+    def get_exchange_info(self) -> JsonMap:
         endpoint = "/api/v3/exchangeInfo" if self.market_type == "spot" else "/fapi/v1/exchangeInfo"
-        return self._request("GET", endpoint)
+        return self._request_dict("GET", endpoint, label="exchangeInfo")
 
     @staticmethod
-    def _parse_float(value: object) -> float:
+    def _parse_float(value: Any) -> float:
         if value is None:
             return 0.0
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             return 0.0
+        return parsed if math.isfinite(parsed) else 0.0
 
     @staticmethod
-    def _parse_filter(filters: list[object], filter_type: str) -> Dict[str, str]:
+    def _parse_required_float(value: Any, label: str) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise BinanceAPIError(f"Unexpected numeric value for {label}") from exc
+        if not math.isfinite(parsed):
+            raise BinanceAPIError(f"Unexpected numeric value for {label}")
+        return parsed
+
+    @staticmethod
+    def _parse_required_int(value: Any, label: str) -> int:
+        parsed = BinanceClient._parse_required_float(value, label)
+        return int(parsed)
+
+    @staticmethod
+    def _parse_filter(filters: Sequence[object], filter_type: str) -> JsonMap:
         for item in filters:
             if not isinstance(item, dict):
                 continue
             if item.get("filterType") == filter_type:
-                return item
+                return dict(item)
         return {}
+
+    @staticmethod
+    def _symbols_from_exchange_info(info: Mapping[str, Any], *, label: str = "exchangeInfo symbols") -> list[JsonMap]:
+        symbols = info.get("symbols")
+        if not isinstance(symbols, list):
+            raise BinanceAPIError(f"Unexpected {label} payload")
+        return [dict(item) for item in symbols if isinstance(item, dict)]
 
     @staticmethod
     def _quantize_to_step(value: float, step_size: float) -> float:
@@ -350,7 +410,7 @@ class BinanceClient:
     def get_symbol_constraints(self, symbol: str) -> SymbolConstraints:
         symbol = symbol.upper()
         info = self.get_exchange_info()
-        symbols = [item for item in info.get("symbols", []) if isinstance(item, dict) and item.get("symbol") == symbol]
+        symbols = [item for item in self._symbols_from_exchange_info(info) if item.get("symbol") == symbol]
         if not symbols:
             raise BinanceAPIError(f"Unknown symbol in exchangeInfo: {symbol}")
 
@@ -419,10 +479,14 @@ class BinanceClient:
         if self.market_type != "futures":
             raise BinanceAPIError("Leverage brackets are available only in futures mode")
 
-        payload = self._request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol.upper()}, signed=True)
-        if not isinstance(payload, list):
-            raise BinanceAPIError("Unexpected leverage bracket payload")
-        return payload  # type: ignore[return-value]
+        payload = self._request_list(
+            "GET",
+            "/fapi/v1/leverageBracket",
+            {"symbol": symbol.upper()},
+            signed=True,
+            label="leverage bracket",
+        )
+        return [dict(item) for item in payload if isinstance(item, dict)]
 
     def get_max_leverage(self, symbol: str) -> int:
         if self.market_type != "futures":
@@ -455,13 +519,31 @@ class BinanceClient:
 
     def ensure_btcusdc(self) -> Dict[str, object]:
         info = self.get_exchange_info()
-        symbols = [s for s in info.get("symbols", []) if s.get("symbol") == "BTCUSDC"]
+        symbols = [item for item in self._symbols_from_exchange_info(info) if item.get("symbol") == "BTCUSDC"]
         if not symbols:
             raise BinanceAPIError("BTCUSDC is unavailable on this endpoint. Check Binance support for the current market")
         symbol_info = symbols[0]
         if symbol_info.get("status") != "TRADING":
             raise BinanceAPIError(f"BTCUSDC is not trading. Status: {symbol_info.get('status')}")
         return symbol_info
+
+    @classmethod
+    def _parse_kline_row(cls, row: object) -> Candle:
+        if not isinstance(row, (list, tuple)) or len(row) < 7:
+            raise BinanceAPIError("Unexpected kline row")
+        return Candle(
+            open_time=cls._parse_required_int(row[0], "kline open_time"),
+            open=cls._parse_required_float(row[1], "kline open"),
+            high=cls._parse_required_float(row[2], "kline high"),
+            low=cls._parse_required_float(row[3], "kline low"),
+            close=cls._parse_required_float(row[4], "kline close"),
+            volume=cls._parse_required_float(row[5], "kline volume"),
+            close_time=cls._parse_required_int(row[6], "kline close_time"),
+            quote_volume=cls._parse_float(row[7]) if len(row) > 7 else 0.0,
+            trade_count=cls._parse_required_int(row[8], "kline trade_count") if len(row) > 8 else 0,
+            taker_buy_base_volume=cls._parse_float(row[9]) if len(row) > 9 else 0.0,
+            taker_buy_quote_volume=cls._parse_float(row[10]) if len(row) > 10 else 0.0,
+        )
 
     def get_klines(self, symbol: str, interval: str, *, limit: int = 500,
                    start_time: int | None = None, end_time: int | None = None) -> List[Candle]:
@@ -478,60 +560,26 @@ class BinanceClient:
             params["endTime"] = end_time
 
         endpoint = "/api/v3/klines" if self.market_type == "spot" else "/fapi/v1/klines"
-        payload = self._request("GET", endpoint, params=params)
-        if not isinstance(payload, list):
-            raise BinanceAPIError("Unexpected kline payload")
-
-        candles = []
-        for row in payload:
-            if len(row) < 7:
-                raise BinanceAPIError("Unexpected kline row")
-            candles.append(
-                Candle(
-                    open_time=int(row[0]),
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=float(row[5]),
-                    close_time=int(row[6]),
-                    quote_volume=self._parse_float(row[7]) if len(row) > 7 else 0.0,
-                    trade_count=int(self._parse_float(row[8])) if len(row) > 8 else 0,
-                    taker_buy_base_volume=self._parse_float(row[9]) if len(row) > 9 else 0.0,
-                    taker_buy_quote_volume=self._parse_float(row[10]) if len(row) > 10 else 0.0,
-                )
-            )
-        return candles
+        payload = self._request_list("GET", endpoint, params=params, label="kline")
+        return [self._parse_kline_row(row) for row in payload]
 
     def get_ticker_24h(self, symbol: str) -> Dict[str, object]:
         endpoint = "/api/v3/ticker/24hr" if self.market_type == "spot" else "/fapi/v1/ticker/24hr"
-        payload = self._request("GET", endpoint, {"symbol": symbol.upper()})
-        if not isinstance(payload, dict):
-            raise BinanceAPIError("Unexpected 24h ticker payload")
-        return payload
+        return self._request_dict("GET", endpoint, {"symbol": symbol.upper()}, label="24h ticker")
 
     def get_book_ticker(self, symbol: str) -> Dict[str, object]:
         endpoint = "/api/v3/ticker/bookTicker" if self.market_type == "spot" else "/fapi/v1/ticker/bookTicker"
-        payload = self._request("GET", endpoint, {"symbol": symbol.upper()})
-        if not isinstance(payload, dict):
-            raise BinanceAPIError("Unexpected book ticker payload")
-        return payload
+        return self._request_dict("GET", endpoint, {"symbol": symbol.upper()}, label="book ticker")
 
     def get_futures_premium_index(self, symbol: str) -> Dict[str, object]:
         if self.market_type != "futures":
             raise BinanceAPIError("Premium index is available only in futures mode")
-        payload = self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
-        if not isinstance(payload, dict):
-            raise BinanceAPIError("Unexpected premium index payload")
-        return payload
+        return self._request_dict("GET", "/fapi/v1/premiumIndex", {"symbol": symbol.upper()}, label="premium index")
 
     def get_futures_open_interest(self, symbol: str) -> Dict[str, object]:
         if self.market_type != "futures":
             raise BinanceAPIError("Open interest is available only in futures mode")
-        payload = self._request("GET", "/fapi/v1/openInterest", {"symbol": symbol.upper()})
-        if not isinstance(payload, dict):
-            raise BinanceAPIError("Unexpected open interest payload")
-        return payload
+        return self._request_dict("GET", "/fapi/v1/openInterest", {"symbol": symbol.upper()}, label="open interest")
 
     def get_futures_funding_rate(
         self,
@@ -548,19 +596,17 @@ class BinanceClient:
             params["startTime"] = int(start_time)
         if end_time is not None:
             params["endTime"] = int(end_time)
-        payload = self._request("GET", "/fapi/v1/fundingRate", params)
-        if not isinstance(payload, list):
-            raise BinanceAPIError("Unexpected funding rate payload")
-        return payload  # type: ignore[return-value]
+        payload = self._request_list("GET", "/fapi/v1/fundingRate", params, label="funding rate")
+        return [dict(item) for item in payload if isinstance(item, dict)]
 
     def get_account(self) -> Dict[str, object]:
         endpoint = "/api/v3/account" if self.market_type == "spot" else "/fapi/v2/account"
-        return self._request("GET", endpoint, {}, signed=True)
+        return self._request_dict("GET", endpoint, {}, signed=True, label="account")
 
     def get_symbol_price(self, symbol: str) -> Tuple[float, int]:
         endpoint = "/api/v3/ticker/price" if self.market_type == "spot" else "/fapi/v1/ticker/price"
-        data = self._request("GET", endpoint, {"symbol": symbol})
-        return float(data["price"]), int(time.time() * 1000)
+        data = self._request_dict("GET", endpoint, {"symbol": symbol}, label="symbol price")
+        return self._parse_required_float(data.get("price"), "symbol price"), int(time.time() * 1000)
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, object]:
         if self.market_type != "futures":
@@ -572,7 +618,7 @@ class BinanceClient:
         if leverage > max_leverage:
             leverage = max_leverage
         payload = {"symbol": symbol, "leverage": leverage}
-        return self._request("POST", "/fapi/v1/leverage", payload, signed=True)
+        return self._request_dict("POST", "/fapi/v1/leverage", payload, signed=True, label="leverage")
 
     def place_order(self, symbol: str, side: str, quantity: float, *, dry_run: bool,
                    leverage: float = 1.0, reduce_only: bool = False) -> Dict[str, object]:
@@ -595,15 +641,15 @@ class BinanceClient:
             }
 
         if self.market_type == "spot":
-            return self._request("POST", "/api/v3/order", payload, signed=True)
+            return self._request_dict("POST", "/api/v3/order", payload, signed=True, label="order")
 
         payload["newOrderRespType"] = "RESULT"
         if reduce_only:
             payload["reduceOnly"] = "true"
         # futures: configure leverage before market order submission
         self.set_leverage(symbol, int(max(1, round(leverage))))
-        return self._request("POST", "/fapi/v1/order", payload, signed=True)
+        return self._request_dict("POST", "/fapi/v1/order", payload, signed=True, label="order")
 
-    def get_exchange_time(self) -> Dict[str, object] | None:
+    def get_exchange_time(self) -> Dict[str, object]:
         endpoint = "/api/v3/time" if self.market_type == "spot" else "/fapi/v1/time"
-        return self._request("GET", endpoint)
+        return self._request_dict("GET", endpoint, label="exchange time")

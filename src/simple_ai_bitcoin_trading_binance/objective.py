@@ -241,6 +241,9 @@ _REGISTRY: dict[str, ObjectiveSpec] = {
     DEFAULT.name: DEFAULT,
     RISKY.name: RISKY,
 }
+_ALIASES: dict[str, str] = {
+    "balanced": DEFAULT.name,
+}
 
 
 def available_objectives() -> tuple[str, ...]:
@@ -253,6 +256,7 @@ def get_objective(name: str) -> ObjectiveSpec:
     key = str(name).strip().lower()
     if not key:
         raise ValueError("Objective name cannot be empty")
+    key = _ALIASES.get(key, key)
     if key not in _REGISTRY:
         allowed = ", ".join(_REGISTRY)
         raise ValueError(f"Unknown objective {name!r}. Known: {allowed}")
@@ -306,5 +310,9 @@ def rank_candidates(
             "accepted": accepted,
             "reject_reason": reject_reason,
         })
-    ranked.sort(key=lambda entry: entry["score"], reverse=True)
+    def _rank_score(entry: dict[str, object]) -> float:
+        value = entry["score"]
+        return float(value) if isinstance(value, (int, float)) else float("-inf")
+
+    ranked.sort(key=_rank_score, reverse=True)
     return ranked

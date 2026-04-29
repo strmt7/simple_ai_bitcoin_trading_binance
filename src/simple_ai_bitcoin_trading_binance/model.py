@@ -7,10 +7,14 @@ import math
 import random
 from dataclasses import asdict, dataclass, field
 from statistics import mean, pstdev
-from typing import Any, Iterable, List, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
-from .features import FEATURE_VERSION, ModelRow, feature_dimension as feature_dimension
+from .features import FEATURE_VERSION, ModelRow, feature_dimension as _feature_dimension
 from .storage import write_json_atomic
+
+
+def feature_dimension(enabled_features: Sequence[str] | None = None) -> int:
+    return _feature_dimension(enabled_features)
 
 
 def _clamp(x: float, low: float, high: float) -> float:
@@ -67,13 +71,13 @@ class TrainedModel:
             return features
         return tuple(
             (x - mean_) / std_ if std_ != 0 else (x - mean_)
-            for x, mean_, std_ in zip(features, self.feature_means, self.feature_stds)
+            for x, mean_, std_ in zip(features, self.feature_means, self.feature_stds, strict=True)
         )
 
     def _linear_score(self, features: Tuple[float, ...]) -> float:
         score = self.bias
         normed = self._normalize(features)
-        for w, x in zip(self.weights, normed):
+        for w, x in zip(self.weights, normed, strict=True):
             score += w * x
         score = max(-50.0, min(50.0, score))
         return score
@@ -95,7 +99,7 @@ def _collect_feature_stats(rows: Iterable[ModelRow]) -> tuple[List[float], List[
     means = [0.0] * dim
     stds = [1.0] * dim
 
-    columns = list(zip(*[r.features for r in rows_list]))
+    columns = list(zip(*[r.features for r in rows_list], strict=True))
     for i, col in enumerate(columns):
         m = mean(col)
         s = pstdev(col)
@@ -248,7 +252,7 @@ def validate_model_rows(
 
 
 def _normalize_rows(rows: List[ModelRow], means: List[float], stds: List[float]) -> List[Tuple[float, ...]]:
-    return [tuple((x - m) / s for x, m, s in zip(r.features, means, stds)) for r in rows]
+    return [tuple((x - m) / s for x, m, s in zip(r.features, means, stds, strict=True)) for r in rows]
 
 
 def _sigmoid(x: float) -> float:
@@ -303,7 +307,7 @@ def _log_loss(
     total = 0.0
     for row in rows:
         score = bias
-        for weight, value, mean_, std_ in zip(weights, row.features, means, stds):
+        for weight, value, mean_, std_ in zip(weights, row.features, means, stds, strict=True):
             normalized = (value - mean_) / std_ if std_ != 0 else (value - mean_)
             score += weight * normalized
         probability = _clamp(_sigmoid(score), 1e-12, 1.0 - 1e-12)
@@ -644,7 +648,7 @@ def feature_drift_report(
 
     z_values: List[float] = []
     for row in rows:
-        for value, mean_, std_ in zip(row.features, means, stds):
+        for value, mean_, std_ in zip(row.features, means, stds, strict=True):
             denominator = float(std_) if abs(float(std_)) > 1e-12 else 1.0
             z_values.append(abs((float(value) - float(mean_)) / denominator))
     max_abs_z = max(z_values) if z_values else 0.0
@@ -817,7 +821,7 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
             row = rows[idx]
             x = normalized[idx]
             y = row.label
-            score = bias + sum(w * xi for w, xi in zip(weights, x))
+            score = bias + sum(w * xi for w, xi in zip(weights, x, strict=True))
             pred = _sigmoid(score)
             weight = class_weight_pos if y == 1 else class_weight_neg
             error = (pred - y) * weight

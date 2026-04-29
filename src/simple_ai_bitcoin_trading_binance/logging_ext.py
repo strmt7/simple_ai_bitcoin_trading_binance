@@ -23,7 +23,7 @@ import logging
 import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 LOGGER_NAME = "simple_ai_bitcoin_trading_binance"
 _MAX_BYTES = 2 * 1024 * 1024
@@ -44,7 +44,9 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"X-MBX-APIKEY:\s*\S+", re.IGNORECASE),
 )
 
-_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+_Replacement = str | Callable[[re.Match[str]], str]
+
+_REPLACEMENTS: tuple[tuple[re.Pattern[str], _Replacement], ...] = (
     (_SECRET_PATTERNS[0], "<redacted-pat>"),
     (_SECRET_PATTERNS[1], "<redacted-openai-key>"),
     (_SECRET_PATTERNS[2], "<redacted-private-key>"),

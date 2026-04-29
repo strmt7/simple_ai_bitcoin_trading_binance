@@ -397,18 +397,25 @@ def run_training_suite(
     specs = [get_objective(name) for name in names]
     outcomes: list[ObjectiveOutcome] = []
     total_rows = 0
-    # Pass ``max_workers`` only when the caller asked for it so legacy test
-    # doubles that monkey-patch ``train_for_objective`` keep working without
-    # having to extend their signature.
-    worker_kwargs = {"max_workers": max_workers} if max_workers is not None else {}
     for spec in specs:
-        outcome = train_for_objective(
-            candles, base_strategy, spec,
-            output_dir=output_dir,
-            market_type=market_type,
-            starting_cash=starting_cash,
-            **worker_kwargs,
-        )
+        # Pass ``max_workers`` only when the caller asked for it so legacy test
+        # doubles that monkey-patch ``train_for_objective`` keep working without
+        # having to extend their signature.
+        if max_workers is None:
+            outcome = train_for_objective(
+                candles, base_strategy, spec,
+                output_dir=output_dir,
+                market_type=market_type,
+                starting_cash=starting_cash,
+            )
+        else:
+            outcome = train_for_objective(
+                candles, base_strategy, spec,
+                output_dir=output_dir,
+                market_type=market_type,
+                starting_cash=starting_cash,
+                max_workers=max_workers,
+            )
         outcomes.append(outcome)
         total_rows = max(total_rows, outcome.row_count)
 

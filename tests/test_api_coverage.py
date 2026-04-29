@@ -321,6 +321,10 @@ def test_parse_and_quantize_helpers() -> None:
     assert BinanceClient._parse_float(None) == 0.0
     assert BinanceClient._parse_float("1.23") == 1.23
     assert BinanceClient._parse_float("bad") == 0.0
+    with pytest.raises(BinanceAPIError, match="Unexpected numeric value"):
+        BinanceClient._parse_required_float("bad", "price")
+    with pytest.raises(BinanceAPIError, match="Unexpected numeric value"):
+        BinanceClient._parse_required_float(float("nan"), "price")
 
     filters = [
         {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.005"},
@@ -379,6 +383,13 @@ def test_symbol_constraints_uses_market_filters_and_notional_fallback(monkeypatc
 
 def test_symbol_constraints_reject_unknown_symbol_or_bad_filters(monkeypatch) -> None:
     client = BinanceClient(api_key="k", api_secret="s")
+
+    def request_bad_symbols(_method: str, _path: str, _params=None, _signed: bool = False):
+        return {"symbols": "bad"}
+
+    monkeypatch.setattr(client, "_request", request_bad_symbols)
+    with pytest.raises(BinanceAPIError, match="Unexpected exchangeInfo symbols"):
+        client.get_symbol_constraints("BTCUSDC")
 
     def request_unknown(_method: str, _path: str, _params=None, _signed: bool = False):
         return {"symbols": []}
