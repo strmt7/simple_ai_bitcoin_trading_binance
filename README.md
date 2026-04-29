@@ -91,11 +91,42 @@ simple-ai-trading prepare --preset balanced --epochs 180 --learning-rate 0.05 --
 simple-ai-trading report
 simple-ai-trading doctor --online
 simple-ai-trading audit
+simple-ai-trading data-sync --rows 1000 --db data/market_data.sqlite
+simple-ai-trading data-sync --background --rows 1000 --sleep 300
+simple-ai-trading signals --refresh
 simple-ai-trading spot-roundtrip --mode auto --quantity 0.00008 --yes
-simple-ai-trading train --preset balanced
-simple-ai-trading strategy --profile conservative
-simple-ai-trading live --paper --model data/model.json --steps 20 --sleep 0
+simple-ai-trading train --source auto --preset balanced --download-missing
+simple-ai-trading strategy --profile conservative --external-signals
+simple-ai-trading live --paper --model data/model.json --steps 20 --sleep 0 --external-signals
 ```
+
+### Market data database and external signals
+
+`data-sync` is the durable downloader. It writes closed BTCUSDC candles and
+auxiliary Binance metrics to SQLite (`data/market_data.sqlite` by default):
+
+- kline OHLCV plus quote volume, trade count, and taker-buy volumes
+- Binance 24h ticker and L1 book ticker snapshots
+- Binance USD-M futures premium index, open interest, and funding-rate history
+  when a futures public client is available
+- per-run sync summaries and warnings for later inspection
+
+The downloader uses the same client throttle/backoff path as the rest of the
+app, so `max_rate_calls_per_minute`, retry handling, and `Retry-After` support
+remain centralized. Run it once for a bounded backfill or with `--background`
+to start a detached loop that writes a PID and log file.
+
+Training can now use `--source auto|file|db`. In `auto` mode the CLI trains
+from the JSON file when present, otherwise it checks the SQLite store for the
+chosen `--market` and `--interval`. If not enough rows exist, an interactive
+terminal prompts to download the missing data; non-interactive runs can pass
+`--download-missing`.
+
+`signals` fetches the live external confirmation layer used by `live
+--external-signals`. It currently blends Alternative.me Fear and Greed,
+CoinGecko BTC 24h change, Binance futures positioning, and mempool.space fee
+pressure behind a cached report. Positive boosts require the configured minimum
+number of fresh providers; negative signals can reduce score and risk sizing.
 
 ### Objectives (risk-adjusted scorers)
 
@@ -196,6 +227,8 @@ The console edits:
 - confidence beta
 - short and long feature windows
 - enabled model features
+- cached external signal toggle, max score adjustment, provider quorum, TTL,
+  and timeout
 
 ### Tuning windows
 
@@ -210,6 +243,12 @@ The console supports:
 - training uses the current feature selection from strategy settings
 - training supports `custom`, `quick`, `balanced`, and `thorough` presets
 - `fetch --batch-size N` pages kline downloads into request sizes up to Binance's spot 1000-candle limit or USD-M futures 1500-candle limit; live and signed order calls stay sequential to preserve exchange state and rate-limit safety
+- `data-sync` persists closed candles and auxiliary market metrics into SQLite
+  for repeatable training and future feature enrichment
+- `train --source auto` falls back to the SQLite store for the selected
+  market/interval and can prompt or `--download-missing` when history is absent
+- `signals` and `live --external-signals` add cached free-provider confirmation
+  without blocking the exchange loop on slow non-Binance APIs
 - `prepare` runs the normal offline sequence: fetch candles, train, evaluate, backtest, local audit, then readiness checks; it stops at the first failed step
 - `audit` runs no-network diagnostics for candle quality, feature stability,
   model metadata, and risk posture; `prepare` runs it before the final

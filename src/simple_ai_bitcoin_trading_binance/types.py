@@ -68,6 +68,11 @@ class StrategyConfig:
     time_in_force: str = "GTC"
     post_only: bool = False
     reduce_only_on_close: bool = True
+    external_signals_enabled: bool = False
+    external_signal_max_adjustment: float = 0.04
+    external_signal_min_providers: int = 2
+    external_signal_ttl_seconds: int = 300
+    external_signal_timeout_seconds: float = 3.0
 
     def __post_init__(self) -> None:
         self.feature_windows = tuple(int(value) for value in self.feature_windows)

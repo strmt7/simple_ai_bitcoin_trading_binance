@@ -453,6 +453,7 @@ def test_leverage_and_klines_errors(monkeypatch) -> None:
     candles = futures_client.get_klines("BTCUSDC", "15m")
     assert len(candles) == 1
     assert candles[0].open_time == 1
+    assert candles[0].quote_volume == 0.0
 
     with pytest.raises(BinanceAPIError, match="This CLI supports BTCUSDC only"):
         futures_client.get_klines("ETHUSDC", "15m")
@@ -477,11 +478,13 @@ def test_klines_uses_start_and_end_filters(monkeypatch) -> None:
         assert params["limit"] == 5
         assert params["startTime"] == 111
         assert params["endTime"] == 222
-        return [[1, "100", "101", "99", "100", "1", "2"]]
+        return [[1, "100", "101", "99", "100", "1", "2", "100", 7, "0.5", "50"]]
 
     monkeypatch.setattr(client, "_request", request)
     candles = client.get_klines("BTCUSDC", "1m", limit=5, start_time=111, end_time=222)
     assert len(candles) == 1
+    assert candles[0].trade_count == 7
+    assert candles[0].taker_buy_quote_volume == 50.0
     assert captured == [("BTCUSDC", "1m")]
 
 
@@ -495,6 +498,68 @@ def test_get_symbol_price_returns_numeric_tuple(monkeypatch) -> None:
     )
     price, _ts = client.get_symbol_price("BTCUSDC")
     assert price == 123.45
+
+
+def test_public_market_metric_endpoints_and_payload_validation(monkeypatch) -> None:
+    spot = BinanceClient(api_key="k", api_secret="s", market_type="spot")
+    futures = BinanceClient(api_key="k", api_secret="s", market_type="futures")
+    calls: list[tuple[str, str]] = []
+
+    def spot_request(method: str, path: str, params=None, signed: bool = False):
+        calls.append((method, path))
+        if path == "/api/v3/ticker/24hr":
+            return {"symbol": params["symbol"], "priceChangePercent": "1"}
+        if path == "/api/v3/ticker/bookTicker":
+            return {"symbol": params["symbol"], "bidPrice": "99", "askPrice": "100"}
+        raise AssertionError(path)
+
+    def futures_request(method: str, path: str, params=None, signed: bool = False):
+        calls.append((method, path))
+        if path == "/fapi/v1/ticker/24hr":
+            return {"symbol": params["symbol"]}
+        if path == "/fapi/v1/ticker/bookTicker":
+            return {"symbol": params["symbol"]}
+        if path == "/fapi/v1/premiumIndex":
+            return {"symbol": params["symbol"], "lastFundingRate": "0"}
+        if path == "/fapi/v1/openInterest":
+            return {"symbol": params["symbol"], "openInterest": "1"}
+        if path == "/fapi/v1/fundingRate":
+            assert params["limit"] == 1000
+            assert params["startTime"] == 1
+            assert params["endTime"] == 2
+            return [{"symbol": params["symbol"]}]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(spot, "_request", spot_request)
+    monkeypatch.setattr(futures, "_request", futures_request)
+    assert spot.get_ticker_24h("btcusdc")["symbol"] == "BTCUSDC"
+    assert spot.get_book_ticker("btcusdc")["askPrice"] == "100"
+    assert futures.get_ticker_24h("BTCUSDC")["symbol"] == "BTCUSDC"
+    assert futures.get_book_ticker("BTCUSDC")["symbol"] == "BTCUSDC"
+    assert futures.get_futures_premium_index("BTCUSDC")["lastFundingRate"] == "0"
+    assert futures.get_futures_open_interest("BTCUSDC")["openInterest"] == "1"
+    assert futures.get_futures_funding_rate("BTCUSDC", limit=5000, start_time=1, end_time=2) == [{"symbol": "BTCUSDC"}]
+
+    monkeypatch.setattr(spot, "_request", lambda *_args, **_kwargs: [])
+    with pytest.raises(BinanceAPIError, match="Unexpected 24h ticker"):
+        spot.get_ticker_24h("BTCUSDC")
+    with pytest.raises(BinanceAPIError, match="Unexpected book ticker"):
+        spot.get_book_ticker("BTCUSDC")
+    with pytest.raises(BinanceAPIError, match="Premium index"):
+        spot.get_futures_premium_index("BTCUSDC")
+    with pytest.raises(BinanceAPIError, match="Open interest"):
+        spot.get_futures_open_interest("BTCUSDC")
+    with pytest.raises(BinanceAPIError, match="Funding rate"):
+        spot.get_futures_funding_rate("BTCUSDC")
+
+    monkeypatch.setattr(futures, "_request", lambda *_args, **_kwargs: [])
+    with pytest.raises(BinanceAPIError, match="Unexpected premium index"):
+        futures.get_futures_premium_index("BTCUSDC")
+    with pytest.raises(BinanceAPIError, match="Unexpected open interest"):
+        futures.get_futures_open_interest("BTCUSDC")
+    monkeypatch.setattr(futures, "_request", lambda *_args, **_kwargs: {})
+    with pytest.raises(BinanceAPIError, match="Unexpected funding rate"):
+        futures.get_futures_funding_rate("BTCUSDC")
 
 
 def test_client_initialization_clamps_rate_limit_bounds() -> None:

@@ -95,6 +95,11 @@ def _strategy_form(**overrides: str) -> dict[str, str]:
         "confidence_beta": str(cfg.confidence_beta),
         "feature_window_short": str(cfg.feature_windows[0]),
         "feature_window_long": str(cfg.feature_windows[1]),
+        "external_signals": str(cfg.external_signals_enabled),
+        "external_signal_max_adjustment": str(cfg.external_signal_max_adjustment),
+        "external_signal_min_providers": str(cfg.external_signal_min_providers),
+        "external_signal_ttl": str(cfg.external_signal_ttl_seconds),
+        "external_signal_timeout": str(cfg.external_signal_timeout_seconds),
     }
     payload.update(overrides)
     return payload

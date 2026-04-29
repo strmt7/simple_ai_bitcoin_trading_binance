@@ -97,6 +97,10 @@ class Candle:
     close: float
     volume: float
     close_time: int
+    quote_volume: float = 0.0
+    trade_count: int = 0
+    taker_buy_base_volume: float = 0.0
+    taker_buy_quote_volume: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -491,9 +495,63 @@ class BinanceClient:
                     close=float(row[4]),
                     volume=float(row[5]),
                     close_time=int(row[6]),
+                    quote_volume=self._parse_float(row[7]) if len(row) > 7 else 0.0,
+                    trade_count=int(self._parse_float(row[8])) if len(row) > 8 else 0,
+                    taker_buy_base_volume=self._parse_float(row[9]) if len(row) > 9 else 0.0,
+                    taker_buy_quote_volume=self._parse_float(row[10]) if len(row) > 10 else 0.0,
                 )
             )
         return candles
+
+    def get_ticker_24h(self, symbol: str) -> Dict[str, object]:
+        endpoint = "/api/v3/ticker/24hr" if self.market_type == "spot" else "/fapi/v1/ticker/24hr"
+        payload = self._request("GET", endpoint, {"symbol": symbol.upper()})
+        if not isinstance(payload, dict):
+            raise BinanceAPIError("Unexpected 24h ticker payload")
+        return payload
+
+    def get_book_ticker(self, symbol: str) -> Dict[str, object]:
+        endpoint = "/api/v3/ticker/bookTicker" if self.market_type == "spot" else "/fapi/v1/ticker/bookTicker"
+        payload = self._request("GET", endpoint, {"symbol": symbol.upper()})
+        if not isinstance(payload, dict):
+            raise BinanceAPIError("Unexpected book ticker payload")
+        return payload
+
+    def get_futures_premium_index(self, symbol: str) -> Dict[str, object]:
+        if self.market_type != "futures":
+            raise BinanceAPIError("Premium index is available only in futures mode")
+        payload = self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
+        if not isinstance(payload, dict):
+            raise BinanceAPIError("Unexpected premium index payload")
+        return payload
+
+    def get_futures_open_interest(self, symbol: str) -> Dict[str, object]:
+        if self.market_type != "futures":
+            raise BinanceAPIError("Open interest is available only in futures mode")
+        payload = self._request("GET", "/fapi/v1/openInterest", {"symbol": symbol.upper()})
+        if not isinstance(payload, dict):
+            raise BinanceAPIError("Unexpected open interest payload")
+        return payload
+
+    def get_futures_funding_rate(
+        self,
+        symbol: str,
+        *,
+        limit: int = 100,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> List[Dict[str, object]]:
+        if self.market_type != "futures":
+            raise BinanceAPIError("Funding rate history is available only in futures mode")
+        params: Dict[str, object] = {"symbol": symbol.upper(), "limit": max(1, min(1000, int(limit)))}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        payload = self._request("GET", "/fapi/v1/fundingRate", params)
+        if not isinstance(payload, list):
+            raise BinanceAPIError("Unexpected funding rate payload")
+        return payload  # type: ignore[return-value]
 
     def get_account(self) -> Dict[str, object]:
         endpoint = "/api/v3/account" if self.market_type == "spot" else "/fapi/v2/account"

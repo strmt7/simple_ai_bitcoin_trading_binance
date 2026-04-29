@@ -1,6 +1,6 @@
 # Free Signal Source Inventory for BTCUSDC
 
-Last checked: 2026-04-28.
+Last checked: 2026-04-29.
 
 This inventory is for future enrichment of the testnet-first BTCUSDC trader. It
 intentionally separates exchange execution from external signal ingestion. A
@@ -152,19 +152,31 @@ they are high-signal, cheap, and fit the current repo shape.
 
 ## Implementation Backlog
 
+Implemented in this prototype:
+
+- `data-sync` stores Binance closed candles, 24h ticker, L1 book ticker, USD-M
+  premium index, open interest, and funding history in SQLite with the existing
+  rate-limited Binance client.
+- `signals` and `live --external-signals` cache and blend Alternative.me,
+  CoinGecko, Binance futures positioning, and mempool.space into a bounded
+  score/risk adjustment with provider quorum checks.
+- `train --source auto|db --download-missing` can train from the SQLite store
+  and prompt for a missing backfill when the selected interval lacks enough
+  rows.
+
+Remaining backlog:
+
 1. Add a source registry module with provider name, endpoint family, TTL,
    auth mode, and parser contract.
-2. Persist raw provider snapshots under `data/signals/<provider>/YYYYMMDD/`
+2. Persist non-Binance raw provider snapshots under `data/signals/<provider>/YYYYMMDD/`
    with atomic writes and redacted config metadata.
 3. Build a timestamp-safe joiner that only uses values whose `known_at_ms` is
    at or before the candle close time.
 4. Add offline feature columns behind explicit feature names. Keep them disabled
    by default until backtest coverage exists.
-5. Add a `signals fetch` command that can run without exchange credentials and
-   exits cleanly when optional provider keys are absent.
-6. Add a `signals report` command that prints freshness, cache paths, and any
-   rate-limit/backoff events.
-7. Only after offline tests pass, allow `live` and `backtest` to read cached
+5. Add richer `signals` subcommands for per-provider freshness, cache paths,
+   and any rate-limit/backoff events.
+6. Only after offline tests pass, allow `backtest` to read cached
    external features. Runtime should never block on a slow news/social API.
 
 ## Sources Checked

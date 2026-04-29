@@ -5,8 +5,15 @@ import json
 import pytest
 
 from simple_ai_bitcoin_trading_binance.api import Candle
+from simple_ai_bitcoin_trading_binance.data_downloader import (
+    MarketDataSyncConfig,
+    _snapshot_time,
+    render_sync_result,
+    sync_market_data,
+)
 import simple_ai_bitcoin_trading_binance.storage as storage
 from simple_ai_bitcoin_trading_binance.market_data import clean_candles
+from simple_ai_bitcoin_trading_binance.market_store import MarketDataStore
 from simple_ai_bitcoin_trading_binance.storage import write_json_atomic
 
 
@@ -82,3 +89,159 @@ def test_write_json_atomic_preserves_original_error_when_cleanup_fails(tmp_path,
 
     for leftover in tmp_path.glob(".payload.json.*.tmp"):
         leftover.unlink()
+
+
+def test_market_data_store_roundtrip_snapshots_and_sync_runs(tmp_path) -> None:
+    db = tmp_path / "market.sqlite"
+    store = MarketDataStore(db)
+    assert store.connect() is store.connect()
+    assert store.upsert_candles("BTCUSDC", "spot", "15m", []) == 0
+    candles = [
+        Candle(0, 100, 101, 99, 100, 1, 59_000, quote_volume=100, trade_count=3),
+        Candle(60_000, 101, 102, 100, 101, 2, 119_000, quote_volume=202, trade_count=4),
+    ]
+    assert store.upsert_candles("BTCUSDC", "spot", "15m", candles, ingested_at_ms=123) == 2
+    assert [c.open_time for c in store.fetch_candles("btcusdc", "spot", "15m")] == [0, 60_000]
+    latest = store.fetch_candles("BTCUSDC", "spot", "15m", limit=1)
+    assert latest[0].quote_volume == 202
+    coverage = store.coverage("BTCUSDC", "spot", "15m")
+    assert coverage.asdict()["count"] == 2
+    assert store.latest_open_time("BTCUSDC", "spot", "15m") == 60_000
+    assert store.insert_snapshot("binance", "btcusdc", "spot", "ticker_24h", {"closeTime": 5}, ts_ms=5) == 1
+    assert store.latest_snapshot("BTCUSDC", "spot", "ticker_24h") == {"closeTime": 5}
+    assert store.latest_snapshot("BTCUSDC", "spot", "missing") is None
+    store.connect().execute(
+        "INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+        ("binance", "BTCUSDC", "spot", "scalar", 1, "3"),
+    )
+    store.connect().commit()
+    assert store.latest_snapshot("BTCUSDC", "spot", "scalar") is None
+    assert store.insert_sync_run({"ok": True}) >= 1
+    store.close()
+    store.close()
+    with MarketDataStore(db) as reopened:
+        assert reopened.coverage("BTCUSDC", "spot", "15m").count == 2
+
+
+class _SyncClient:
+    def __init__(self, *, market_type: str = "spot", fail_snapshot: bool = False, bad_book: bool = False) -> None:
+        self.market_type = market_type
+        self.fail_snapshot = fail_snapshot
+        self.bad_book = bad_book
+        self.calls = 0
+        self.last_request_info = {"path": "fake"}
+
+    def get_klines(self, _symbol, _interval, *, limit, end_time=None):
+        self.calls += 1
+        if self.calls == 1:
+            return [_candle(60_000), _candle(120_000)][:limit]
+        return [_candle(0)][:limit]
+
+    def get_ticker_24h(self, _symbol):
+        if self.fail_snapshot:
+            from simple_ai_bitcoin_trading_binance.api import BinanceAPIError
+
+            raise BinanceAPIError("ticker down")
+        return {"closeTime": 120_000, "priceChangePercent": "1.5"}
+
+    def get_book_ticker(self, _symbol):
+        return "bad" if self.bad_book else {"time": 120_001, "bidPrice": "99", "askPrice": "101"}
+
+    def get_futures_premium_index(self, _symbol):
+        return {"time": 120_002, "lastFundingRate": "0.0001"}
+
+    def get_futures_open_interest(self, _symbol):
+        return {"time": 120_003, "openInterest": "100"}
+
+    def get_futures_funding_rate(self, _symbol, *, limit):
+        assert limit == 100
+        return [{"fundingTime": 120_004, "fundingRate": "0.0001"}]
+
+
+def test_sync_market_data_paginates_and_stores_metrics(tmp_path) -> None:
+    spot = _SyncClient()
+    futures = _SyncClient(market_type="futures")
+    result = sync_market_data(
+        spot,  # type: ignore[arg-type]
+        MarketDataSyncConfig(db_path=tmp_path / "m.sqlite", rows=3, batch_size=2, now_ms=999_999),
+        futures_client=futures,  # type: ignore[arg-type]
+    )
+    assert result.status == "ok"
+    assert result.candles_inserted == 3
+    assert result.snapshots_inserted == 5
+    assert "candles_available=3" in render_sync_result(result)
+
+
+def test_sync_market_data_reports_snapshot_warnings_and_failures(tmp_path) -> None:
+    warn = sync_market_data(
+        _SyncClient(fail_snapshot=True, bad_book=True),  # type: ignore[arg-type]
+        MarketDataSyncConfig(db_path=tmp_path / "warn.sqlite", rows=1, include_futures_metrics=False),
+    )
+    assert warn.status == "warn"
+    assert any("ticker_24h" in error for error in warn.errors)
+    assert any("book_ticker" in error for error in warn.errors)
+
+    fail = sync_market_data(
+        _SyncClient(),  # type: ignore[arg-type]
+        MarketDataSyncConfig(db_path=tmp_path / "fail.sqlite", rows=0, include_futures_metrics=True),
+    )
+    assert fail.status == "fail"
+    assert any("futures client unavailable" in error for error in fail.errors)
+    rendered = render_sync_result(fail)
+    assert "latest_open_time" not in rendered
+    assert "warning:" in rendered
+
+
+def test_sync_market_data_validates_symbol_interval_and_snapshot_time(tmp_path) -> None:
+    from simple_ai_bitcoin_trading_binance.api import BinanceAPIError
+
+    assert _snapshot_time([{"x": 1}], 7) == 7
+    assert _snapshot_time({"time": "bad"}, 8) == 8
+    assert _snapshot_time({"fundingTime": "9"}, None) == 9
+    assert _snapshot_time({"nothing": "9"}, 10) == 10
+    with pytest.raises(BinanceAPIError, match="BTCUSDC only"):
+        sync_market_data(
+            _SyncClient(),  # type: ignore[arg-type]
+            MarketDataSyncConfig(symbol="ETHUSDC", db_path=tmp_path / "x.sqlite"),
+        )
+    with pytest.raises(ValueError, match="not supported"):
+        sync_market_data(
+            _SyncClient(),  # type: ignore[arg-type]
+            MarketDataSyncConfig(interval="1s", market_type="futures", db_path=tmp_path / "x.sqlite"),
+        )
+
+
+def test_sync_market_data_handles_kline_error_empty_and_short_page(tmp_path) -> None:
+    from simple_ai_bitcoin_trading_binance.api import BinanceAPIError
+
+    class ErrorClient(_SyncClient):
+        def get_klines(self, *_args, **_kwargs):
+            raise BinanceAPIError("rate limited")
+
+    errored = sync_market_data(
+        ErrorClient(),  # type: ignore[arg-type]
+        MarketDataSyncConfig(db_path=tmp_path / "error.sqlite", rows=2, include_futures_metrics=False),
+    )
+    assert errored.status == "fail"
+    assert any("klines" in error for error in errored.errors)
+
+    class EmptyClient(_SyncClient):
+        def get_klines(self, *_args, **_kwargs):
+            return []
+
+    empty = sync_market_data(
+        EmptyClient(),  # type: ignore[arg-type]
+        MarketDataSyncConfig(db_path=tmp_path / "empty.sqlite", rows=2, include_futures_metrics=False),
+    )
+    assert empty.candles_inserted == 0
+
+    class ShortClient(_SyncClient):
+        def get_klines(self, _symbol, _interval, *, limit, end_time=None):
+            assert limit == 3
+            return [_candle(0)]
+
+    short = sync_market_data(
+        ShortClient(),  # type: ignore[arg-type]
+        MarketDataSyncConfig(db_path=tmp_path / "short.sqlite", rows=3, batch_size=3, include_futures_metrics=False),
+    )
+    assert short.candles_inserted == 1

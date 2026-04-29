@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,9 +15,12 @@ from .api import BinanceAPIError, BinanceClient
 from .backtest import run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
+from .data_downloader import MarketDataSyncConfig, render_sync_result, sync_market_data
 from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_enabled_features
 from .api import SymbolConstraints
+from .external_signals import ExternalSignalReport, collect_external_signals, render_external_signal_report
 from .market_data import clean_candles
+from .market_store import MarketDataStore
 from .model import (
     assess_probability_calibration,
     build_model_quality_report,
@@ -80,6 +84,9 @@ _STRATEGY_PROFILES: dict[str, dict[str, object]] = {
         "max_drawdown_limit": 0.12,
         "training_epochs": 180,
         "confidence_beta": 0.90,
+        "external_signals_enabled": True,
+        "external_signal_max_adjustment": 0.03,
+        "external_signal_min_providers": 2,
     },
     "balanced": {
         "leverage": 2.0,
@@ -94,6 +101,9 @@ _STRATEGY_PROFILES: dict[str, dict[str, object]] = {
         "max_drawdown_limit": 0.20,
         "training_epochs": 250,
         "confidence_beta": 0.85,
+        "external_signals_enabled": True,
+        "external_signal_max_adjustment": 0.04,
+        "external_signal_min_providers": 2,
     },
     "active": {
         "leverage": 3.0,
@@ -108,6 +118,9 @@ _STRATEGY_PROFILES: dict[str, dict[str, object]] = {
         "max_drawdown_limit": 0.25,
         "training_epochs": 300,
         "confidence_beta": 0.80,
+        "external_signals_enabled": True,
+        "external_signal_max_adjustment": 0.05,
+        "external_signal_min_providers": 2,
     },
 }
 
@@ -174,9 +187,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_fetch.add_argument("--output", default="data/historical_btcusdc.json")
     parser_fetch.set_defaults(func=command_fetch)
 
+    parser_data_sync = subparsers.add_parser(
+        "data-sync",
+        help="rate-limited Binance downloader for candles and auxiliary metrics into SQLite",
+    )
+    parser_data_sync.add_argument("--db", default="data/market_data.sqlite")
+    parser_data_sync.add_argument("--symbol", default=None)
+    parser_data_sync.add_argument("--interval", default=None)
+    parser_data_sync.add_argument("--market", choices=["spot", "futures"], default=None)
+    parser_data_sync.add_argument("--rows", type=int, default=500)
+    parser_data_sync.add_argument("--batch-size", type=int, default=1000)
+    parser_data_sync.add_argument("--include-futures-metrics", action="store_true", default=True)
+    parser_data_sync.add_argument("--no-include-futures-metrics", action="store_false", dest="include_futures_metrics")
+    parser_data_sync.add_argument("--loop", action="store_true", help="keep syncing in the foreground")
+    parser_data_sync.add_argument("--iterations", type=int, default=1, help="foreground loop iterations; 0 means unlimited")
+    parser_data_sync.add_argument("--sleep", type=int, default=300, help="seconds between loop iterations")
+    parser_data_sync.add_argument("--background", action="store_true", help="start a detached downloader process")
+    parser_data_sync.add_argument("--pid-file", default="data/market_data_sync.pid")
+    parser_data_sync.add_argument("--log-file", default="data/market_data_sync.log")
+    parser_data_sync.add_argument("--json", action="store_true")
+    parser_data_sync.set_defaults(func=command_data_sync)
+
     parser_train = subparsers.add_parser("train", help="train model from cached candles")
     parser_train.add_argument("--input", default="data/historical_btcusdc.json")
     parser_train.add_argument("--output", default="data/model.json")
+    parser_train.add_argument("--source", choices=["auto", "file", "db"], default="auto")
+    parser_train.add_argument("--db", default="data/market_data.sqlite")
+    parser_train.add_argument("--interval", default=None)
+    parser_train.add_argument("--market", choices=["spot", "futures"], default=None)
+    parser_train.add_argument("--min-rows", type=int, default=120)
+    parser_train.add_argument("--download-missing", action="store_true")
     parser_train.add_argument("--preset", choices=sorted(_TRAINING_PRESETS), default="custom")
     parser_train.add_argument("--epochs", type=int, default=250)
     parser_train.add_argument("--learning-rate", type=float, default=0.05)
@@ -243,6 +283,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_evaluate.add_argument("--calibrate-threshold", action="store_true")
     parser_evaluate.set_defaults(func=command_evaluate)
 
+    parser_signals = subparsers.add_parser(
+        "signals",
+        help="fetch and cache free external BTC signal checks used by live mode",
+    )
+    parser_signals.add_argument("--model", default="data/model.json", help="model path used to derive default cache location")
+    parser_signals.add_argument("--cache", default=None, help="signal cache path (default: model-adjacent data/signals)")
+    parser_signals.add_argument("--ttl", type=int, default=300, help="cache TTL seconds")
+    parser_signals.add_argument("--timeout", type=float, default=3.0, help="per-provider timeout seconds")
+    parser_signals.add_argument("--max-adjustment", type=float, default=0.04, help="maximum model score adjustment")
+    parser_signals.add_argument("--min-providers", type=int, default=2, help="minimum usable providers for positive boosts")
+    parser_signals.add_argument("--refresh", action="store_true", help="ignore cache and fetch every provider")
+    parser_signals.add_argument("--json", action="store_true", help="print machine-readable report")
+    parser_signals.set_defaults(func=command_signals)
+
     parser_live = subparsers.add_parser("live", help="run a conservative live loop on testnet/demo or paper mode")
     parser_live.add_argument("--model", default="data/model.json")
     parser_live.add_argument("--steps", type=int, default=20)
@@ -276,6 +330,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="force authenticated testnet execution even when runtime.dry_run is true",
     )
+    parser_live.add_argument(
+        "--external-signals",
+        action="store_true",
+        default=None,
+        help="enable cached free external signal adjustment for this run",
+    )
+    parser_live.add_argument(
+        "--no-external-signals",
+        action="store_false",
+        dest="external_signals",
+        help="disable cached free external signal adjustment for this run",
+    )
     parser_live.set_defaults(func=command_live)
 
     parser_status = subparsers.add_parser("status", help="show persisted runtime and strategy config")
@@ -304,6 +370,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--set-features", default=None, help="comma-separated ordered feature list for retraining")
     parser_strategy.add_argument("--enable-feature", action="append", default=None, help="enable a feature by name")
     parser_strategy.add_argument("--disable-feature", action="append", default=None, help="disable a feature by name")
+    parser_strategy.add_argument("--external-signals", action="store_true", default=None, help="enable live free external signals")
+    parser_strategy.add_argument("--no-external-signals", action="store_false", dest="external_signals", help="disable live free external signals")
+    parser_strategy.add_argument("--external-signal-max-adjustment", type=float, default=None)
+    parser_strategy.add_argument("--external-signal-min-providers", type=int, default=None)
+    parser_strategy.add_argument("--external-signal-ttl", type=int, default=None)
+    parser_strategy.add_argument("--external-signal-timeout", type=float, default=None)
     parser_strategy.set_defaults(func=command_strategy)
 
     parser_shell = subparsers.add_parser("shell", help="launch the Claude-Code-inspired interactive shell")
@@ -576,6 +648,11 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             set_features=None,
             enable_feature=None,
             disable_feature=None,
+            external_signals=None,
+            external_signal_max_adjustment=None,
+            external_signal_min_providers=None,
+            external_signal_ttl=None,
+            external_signal_timeout=None,
         )
     enabled_features = normalize_enabled_features(selected_features)
     payload = await ui.form(
@@ -600,6 +677,11 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             FormField("confidence_beta", "Confidence beta", str(cfg.confidence_beta)),
             FormField("feature_window_short", "Feature window short", str(cfg.feature_windows[0])),
             FormField("feature_window_long", "Feature window long", str(cfg.feature_windows[1])),
+            FormField("external_signals", "External signals [yes/no]", str(cfg.external_signals_enabled)),
+            FormField("external_signal_max_adjustment", "External max score adjustment", str(cfg.external_signal_max_adjustment)),
+            FormField("external_signal_min_providers", "External min providers", str(cfg.external_signal_min_providers)),
+            FormField("external_signal_ttl", "External cache TTL seconds", str(cfg.external_signal_ttl_seconds)),
+            FormField("external_signal_timeout", "External timeout seconds", str(cfg.external_signal_timeout_seconds)),
         ],
     )
     if payload is None:
@@ -626,6 +708,11 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             set_features=None,
             enable_feature=None,
             disable_feature=None,
+            external_signals=None,
+            external_signal_max_adjustment=None,
+            external_signal_min_providers=None,
+            external_signal_ttl=None,
+            external_signal_timeout=None,
         )
     profile = _parse_strategy_profile(payload["profile"])
 
@@ -645,6 +732,15 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             key,
             current,
             lambda raw: _parse_form_int(raw, label=label, default=current, minimum=minimum, maximum=maximum),
+        )
+
+    def field_bool(key: str, current: bool):
+        return _profile_field_value(
+            profile,
+            payload,
+            key,
+            current,
+            lambda raw: _parse_form_bool(raw, current),
         )
 
     feature_window_short = field_int("feature_window_short", cfg.feature_windows[0], "Feature window short", minimum=1)
@@ -684,6 +780,34 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
         set_features=",".join(enabled_features),
         enable_feature=None,
         disable_feature=None,
+        external_signals=field_bool("external_signals", cfg.external_signals_enabled),
+        external_signal_max_adjustment=field_float(
+            "external_signal_max_adjustment",
+            cfg.external_signal_max_adjustment,
+            "External max score adjustment",
+            minimum=0.0,
+            maximum=0.20,
+        ),
+        external_signal_min_providers=field_int(
+            "external_signal_min_providers",
+            cfg.external_signal_min_providers,
+            "External min providers",
+            minimum=0,
+            maximum=4,
+        ),
+        external_signal_ttl=field_int(
+            "external_signal_ttl",
+            cfg.external_signal_ttl_seconds,
+            "External cache TTL seconds",
+            minimum=0,
+        ),
+        external_signal_timeout=field_float(
+            "external_signal_timeout",
+            cfg.external_signal_timeout_seconds,
+            "External timeout seconds",
+            minimum=0.1,
+            maximum=30.0,
+        ),
     )
 
 
@@ -2563,6 +2687,16 @@ def command_strategy(args: argparse.Namespace) -> int:
         updates["training_epochs"] = max(1, int(args.training_epochs))
     if getattr(args, "confidence_beta", None) is not None:
         updates["confidence_beta"] = _clamp(float(args.confidence_beta), 0.0, 1.0)
+    if getattr(args, "external_signals", None) is not None:
+        updates["external_signals_enabled"] = bool(args.external_signals)
+    if getattr(args, "external_signal_max_adjustment", None) is not None:
+        updates["external_signal_max_adjustment"] = _clamp(float(args.external_signal_max_adjustment), 0.0, 0.20)
+    if getattr(args, "external_signal_min_providers", None) is not None:
+        updates["external_signal_min_providers"] = max(0, min(4, int(args.external_signal_min_providers)))
+    if getattr(args, "external_signal_ttl", None) is not None:
+        updates["external_signal_ttl_seconds"] = max(0, int(args.external_signal_ttl))
+    if getattr(args, "external_signal_timeout", None) is not None:
+        updates["external_signal_timeout_seconds"] = _clamp(float(args.external_signal_timeout), 0.1, 30.0)
     feature_window_short = getattr(args, "feature_window_short", None)
     feature_window_long = getattr(args, "feature_window_long", None)
     if feature_window_short is not None or feature_window_long is not None:
@@ -2592,6 +2726,96 @@ def command_strategy(args: argparse.Namespace) -> int:
     print("Saved strategy settings.")
     print(json.dumps(cfg.asdict(), indent=2))
     return 0
+
+
+def _runtime_with_market(runtime: RuntimeConfig, market_type: str) -> RuntimeConfig:
+    return RuntimeConfig(**{**runtime.asdict(), "market_type": market_type})
+
+
+def _data_sync_config_from_args(args: argparse.Namespace, runtime: RuntimeConfig) -> MarketDataSyncConfig:
+    market_type = getattr(args, "market", None) or runtime.market_type
+    return MarketDataSyncConfig(
+        symbol=(getattr(args, "symbol", None) or runtime.symbol).upper(),
+        interval=getattr(args, "interval", None) or runtime.interval,
+        market_type=market_type,
+        db_path=getattr(args, "db", "data/market_data.sqlite"),
+        rows=max(0, int(getattr(args, "rows", 500))),
+        batch_size=max(1, int(getattr(args, "batch_size", 1000))),
+        include_futures_metrics=bool(getattr(args, "include_futures_metrics", True)),
+    )
+
+
+def _start_background_data_sync(args: argparse.Namespace) -> int:
+    pid_file = Path(getattr(args, "pid_file", "data/market_data_sync.pid"))
+    log_file = Path(getattr(args, "log_file", "data/market_data_sync.log"))
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "simple_ai_bitcoin_trading_binance",
+        "data-sync",
+        "--db",
+        str(getattr(args, "db", "data/market_data.sqlite")),
+        "--rows",
+        str(max(0, int(getattr(args, "rows", 500)))),
+        "--batch-size",
+        str(max(1, int(getattr(args, "batch_size", 1000)))),
+        "--loop",
+        "--iterations",
+        str(max(0, int(getattr(args, "iterations", 0)))),
+        "--sleep",
+        str(max(1, int(getattr(args, "sleep", 300)))),
+    ]
+    for option, value in (
+        ("--symbol", getattr(args, "symbol", None)),
+        ("--interval", getattr(args, "interval", None)),
+        ("--market", getattr(args, "market", None)),
+    ):
+        if value:
+            command.extend([option, str(value)])
+    if not bool(getattr(args, "include_futures_metrics", True)):
+        command.append("--no-include-futures-metrics")
+    with log_file.open("ab") as log_handle:
+        process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
+    pid_file.write_text(f"{process.pid}\n", encoding="utf-8")
+    print(f"started market data downloader pid={process.pid}")
+    print(f"pid_file={pid_file}")
+    print(f"log_file={log_file}")
+    return 0
+
+
+def command_data_sync(args: argparse.Namespace) -> int:
+    if getattr(args, "background", False):
+        return _start_background_data_sync(args)
+    runtime = load_runtime()
+    config = _data_sync_config_from_args(args, runtime)
+    client = _build_client(_runtime_with_market(runtime, config.market_type))
+    futures_client = None
+    if config.include_futures_metrics and config.market_type != "futures":
+        futures_client = _build_client(_runtime_with_market(runtime, "futures"))
+
+    loop = bool(getattr(args, "loop", False))
+    iterations = max(0, int(getattr(args, "iterations", 1)))
+    completed = 0
+    exit_code = 0
+    while True:  # pragma: no branch - loop exits through the iteration guard below
+        try:
+            result = sync_market_data(client, config, futures_client=futures_client)
+        except (BinanceAPIError, ValueError, OSError) as exc:
+            print(f"Market data sync failed: {exc}", file=sys.stderr)
+            return 2
+        if getattr(args, "json", False):
+            print(json.dumps(result.asdict(), indent=2, sort_keys=True))
+        else:
+            print(render_sync_result(result))
+        if result.status == "fail":
+            exit_code = 2
+        completed += 1
+        if not loop or (iterations > 0 and completed >= iterations):
+            break
+        time.sleep(max(0, int(getattr(args, "sleep", 300))))
+    return exit_code
 
 
 def command_fetch(args: argparse.Namespace) -> int:
@@ -2647,6 +2871,106 @@ def command_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_training_candles_from_db(
+    db_path: str | Path,
+    runtime: RuntimeConfig,
+    *,
+    interval: str,
+    market_type: str,
+    min_rows: int,
+) -> list | None:
+    with MarketDataStore(db_path) as store:
+        candles = store.fetch_candles(runtime.symbol, market_type, interval)
+    return candles if len(candles) >= min_rows else None
+
+
+def _confirm_download_missing_training_data(
+    *,
+    symbol: str,
+    market_type: str,
+    interval: str,
+    available: int,
+    required: int,
+) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    answer = input(
+        f"Only {available}/{required} {symbol} {market_type} {interval} rows are available. "
+        "Download missing data now? [y/N] "
+    )
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def _download_training_candles(args: argparse.Namespace, runtime: RuntimeConfig, *, interval: str, market_type: str) -> bool:
+    sync_args = argparse.Namespace(
+        db=getattr(args, "db", "data/market_data.sqlite"),
+        symbol=runtime.symbol,
+        interval=interval,
+        market=market_type,
+        rows=max(int(getattr(args, "min_rows", 120)), int(getattr(args, "min_rows", 120)) + 50),
+        batch_size=1000,
+        include_futures_metrics=True,
+        loop=False,
+        iterations=1,
+        sleep=0,
+        background=False,
+        json=False,
+    )
+    return command_data_sync(sync_args) == 0
+
+
+def _load_training_candles(args: argparse.Namespace, runtime: RuntimeConfig) -> tuple[list | None, str]:
+    source = str(getattr(args, "source", "file") or "file")
+    input_path = Path(getattr(args, "input", "data/historical_btcusdc.json"))
+    interval = getattr(args, "interval", None) or runtime.interval
+    market_type = getattr(args, "market", None) or runtime.market_type
+    min_rows = max(1, int(getattr(args, "min_rows", 120)))
+    if source in {"auto", "file"} and input_path.exists():
+        candles = _load_rows_for_command(str(input_path), label="Training data load failed")
+        return candles, "file" if candles is not None else "missing"
+    if source == "file":
+        candles = _load_rows_for_command(str(input_path), label="Training data load failed")
+        return candles, "file" if candles is not None else "missing"
+
+    candles = _load_training_candles_from_db(
+        getattr(args, "db", "data/market_data.sqlite"),
+        runtime,
+        interval=interval,
+        market_type=market_type,
+        min_rows=min_rows,
+    )
+    if candles is not None:
+        print(f"loaded {len(candles)} candles from market database for {runtime.symbol} {market_type} {interval}")
+        return candles, "db"
+
+    with MarketDataStore(getattr(args, "db", "data/market_data.sqlite")) as store:
+        available = store.coverage(runtime.symbol, market_type, interval).count
+    should_download = bool(getattr(args, "download_missing", False)) or _confirm_download_missing_training_data(
+        symbol=runtime.symbol,
+        market_type=market_type,
+        interval=interval,
+        available=available,
+        required=min_rows,
+    )
+    if should_download and _download_training_candles(args, runtime, interval=interval, market_type=market_type):
+        candles = _load_training_candles_from_db(
+            getattr(args, "db", "data/market_data.sqlite"),
+            runtime,
+            interval=interval,
+            market_type=market_type,
+            min_rows=min_rows,
+        )
+        if candles is not None:
+            return candles, "db_downloaded"
+    print(
+        f"Training data unavailable for {runtime.symbol} {market_type} {interval}: "
+        f"{available}/{min_rows} rows in {getattr(args, 'db', 'data/market_data.sqlite')}. "
+        "Run data-sync or use --download-missing.",
+        file=sys.stderr,
+    )
+    return None, "missing"
+
+
 def command_train(args: argparse.Namespace) -> int:
     try:
         args = _apply_training_preset(args)
@@ -2655,7 +2979,7 @@ def command_train(args: argparse.Namespace) -> int:
         return 2
     cfg = load_strategy()
     runtime = load_runtime()
-    candles = _load_rows_for_command(args.input, label="Training data load failed")
+    candles, training_source = _load_training_candles(args, runtime)
     if candles is None:
         return 2
     rows = _build_model_rows(candles, cfg)
@@ -2783,6 +3107,9 @@ def command_train(args: argparse.Namespace) -> int:
         "strategy": cfg.asdict(),
         "train": {
             "input": str(args.input),
+            "data_source": training_source,
+            "db": str(getattr(args, "db", "data/market_data.sqlite")),
+            "interval": str(getattr(args, "interval", None) or runtime.interval),
             "output": str(args.output),
             "rows_total": len(rows),
             "rows_train": len(train_rows),
@@ -3178,6 +3505,62 @@ def command_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _external_signal_cache_path(model_path: Path) -> Path:
+    return model_path.parent / "signals" / "external_signals.json"
+
+
+def _strategy_with_external_risk(cfg: StrategyConfig, risk_multiplier: float) -> StrategyConfig:
+    multiplier = _clamp(float(risk_multiplier), 0.0, 1.0)
+    if multiplier >= 0.999:
+        return cfg
+    return StrategyConfig(
+        **{
+            **cfg.asdict(),
+            "risk_per_trade": max(0.0001, cfg.risk_per_trade * multiplier),
+            "max_position_pct": max(0.0, cfg.max_position_pct * multiplier),
+        }
+    )
+
+
+def _apply_external_signal_to_score(
+    score: float,
+    cfg: StrategyConfig,
+    report: ExternalSignalReport,
+) -> tuple[float, StrategyConfig, float]:
+    applied_adjustment = float(report.score_adjustment)
+    if report.fresh_count < max(0, int(cfg.external_signal_min_providers)):
+        applied_adjustment = min(0.0, applied_adjustment)
+    max_adjustment = _clamp(float(cfg.external_signal_max_adjustment), 0.0, 0.20)
+    applied_adjustment = _clamp(applied_adjustment, -max_adjustment, max_adjustment)
+    adjusted_score = _clamp(float(score) + applied_adjustment, 0.0, 1.0)
+    effective_cfg = _strategy_with_external_risk(cfg, report.risk_multiplier)
+    return adjusted_score, effective_cfg, applied_adjustment
+
+
+def command_signals(args: argparse.Namespace) -> int:
+    runtime = load_runtime()
+    model_path = Path(getattr(args, "model", "data/model.json"))
+    cache_path = Path(getattr(args, "cache", None) or _external_signal_cache_path(model_path))
+    try:
+        report = collect_external_signals(
+            symbol=runtime.symbol,
+            cache_path=cache_path,
+            ttl_seconds=max(0, int(getattr(args, "ttl", 300))),
+            timeout_seconds=_clamp(float(getattr(args, "timeout", 3.0)), 0.1, 30.0),
+            max_adjustment=_clamp(float(getattr(args, "max_adjustment", 0.04)), 0.0, 0.20),
+            min_providers=max(0, min(4, int(getattr(args, "min_providers", 2)))),
+            force_refresh=bool(getattr(args, "refresh", False)),
+        )
+    except Exception as exc:
+        print(f"External signal collection failed: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(report.asdict(), indent=2, sort_keys=True))
+    else:
+        print(render_external_signal_report(report))
+    return 0 if report.status != "fail" else 2
+
+
 def command_live(args: argparse.Namespace) -> int:
     runtime = load_runtime()
     cfg = load_strategy()
@@ -3191,13 +3574,16 @@ def command_live(args: argparse.Namespace) -> int:
             cfg = StrategyConfig(**{**cfg.asdict(), "leverage": requested})
         else:
             print("Leverage override is spot-inactive; spot runs at 1x.")
+    external_override = getattr(args, "external_signals", None)
+    if external_override is not None:
+        cfg = StrategyConfig(**{**cfg.asdict(), "external_signals_enabled": bool(external_override)})
     client = _build_client(runtime)
     model_path = Path(getattr(args, "model", "data/model.json"))
 
     if getattr(args, "live", False):
         effective_dry_run = False
     else:
-        effective_dry_run = runtime.dry_run or args.paper
+        effective_dry_run = runtime.dry_run or getattr(args, "paper", False)
     if not _allows_signed_execution(runtime):
         print("Real-money execution is disabled in this phase. Set testnet=true or demo=true to run.")
         return 2
@@ -3258,6 +3644,12 @@ def command_live(args: argparse.Namespace) -> int:
     print(f"Starting {mode_label} loop for {args.steps} steps on {runtime.symbol} {runtime.interval} [{runtime.market_type}]")
     if runtime.market_type == "futures":
         print(f"effective leverage: {leverage:.1f}x")
+    if cfg.external_signals_enabled:
+        print(
+            "external signals: enabled "
+            f"max_adjust={cfg.external_signal_max_adjustment:.3f} "
+            f"min_providers={cfg.external_signal_min_providers}"
+        )
 
     fee_rate = max(0.0, cfg.taker_fee_bps) / 10_000.0
     slippage = max(0.0, cfg.slippage_bps) / 10_000.0
@@ -3279,6 +3671,7 @@ def command_live(args: argparse.Namespace) -> int:
         "events": [],
         "model_signature": str(getattr(model, "feature_signature", "")) or None,
         "starting_cash": float(cash),
+        "external_signal_cache": str(_external_signal_cache_path(model_path)),
     }
     if not effective_dry_run:
         try:
@@ -3442,7 +3835,51 @@ def command_live(args: argparse.Namespace) -> int:
             raw_score = model.predict_proba(latest.features)
             threshold = model_decision_threshold(model, cfg.signal_threshold)
             score = confidence_adjusted_probability(raw_score, cfg.confidence_beta)
-        direction = _score_to_direction(score, cfg, runtime.market_type, threshold)
+        decision_cfg = cfg
+        if cfg.external_signals_enabled:
+            score_before_external = score
+            try:
+                external_report = collect_external_signals(
+                    symbol=runtime.symbol,
+                    cache_path=_external_signal_cache_path(model_path),
+                    ttl_seconds=cfg.external_signal_ttl_seconds,
+                    timeout_seconds=cfg.external_signal_timeout_seconds,
+                    max_adjustment=cfg.external_signal_max_adjustment,
+                    min_providers=cfg.external_signal_min_providers,
+                )
+                score, decision_cfg, applied_adjustment = _apply_external_signal_to_score(
+                    score,
+                    cfg,
+                    external_report,
+                )
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "external_signals",
+                        "score_before": float(score_before_external),
+                        "score_after": float(score),
+                        "applied_adjustment": float(applied_adjustment),
+                        "risk_multiplier": float(external_report.risk_multiplier),
+                        "fresh_count": int(external_report.fresh_count),
+                        "provider_count": int(external_report.provider_count),
+                        "report": external_report.asdict(),
+                    }
+                )
+                print(
+                    f"step {i + 1:>2}: external signals "
+                    f"providers={external_report.fresh_count}/{external_report.provider_count} "
+                    f"adj={applied_adjustment:+.4f} risk={external_report.risk_multiplier:.3f}"
+                )
+            except Exception as exc:
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "external_signals_error",
+                        "error": str(exc),
+                    }
+                )
+                print(f"step {i + 1:>2}: external signals unavailable: {exc}", file=sys.stderr)
+        direction = _score_to_direction(score, decision_cfg, runtime.market_type, threshold)
 
         # cooldown reduces immediate flip-flopping in choppy conditions
         if cooldown_left > 0:
@@ -3483,7 +3920,7 @@ def command_live(args: argparse.Namespace) -> int:
             notional, qty = _build_order_notional(
                 cash,
                 price,
-                cfg,
+                decision_cfg,
                 runtime.market_type,
                 leverage,
                 client,
@@ -3551,7 +3988,7 @@ def command_live(args: argparse.Namespace) -> int:
                 _paper_or_live_order(
                     client,
                     runtime,
-                    cfg,
+                    decision_cfg,
                     side=side,
                     size=qty,
                     dry_run=effective_dry_run,

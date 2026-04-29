@@ -389,6 +389,11 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
                 "confidence_beta": "0.9",
                 "feature_window_short": "12",
                 "feature_window_long": "48",
+                "external_signals": "yes",
+                "external_signal_max_adjustment": "0.05",
+                "external_signal_min_providers": "3",
+                "external_signal_ttl": "120",
+                "external_signal_timeout": "2.5",
             }
         ],
     )
@@ -401,6 +406,8 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
     assert captured["args"].feature_window_long == 48
     assert captured["args"].training_epochs == 500
     assert captured["args"].confidence_beta == 0.9
+    assert captured["args"].external_signals is True
+    assert captured["args"].external_signal_min_providers == 3
     assert captured["args"].set_features == "momentum_1,rsi"
 
 

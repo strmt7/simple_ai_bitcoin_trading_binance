@@ -2462,6 +2462,11 @@ def test_tui_strategy_profile_uses_unchanged_fields_as_profile_defaults(tmp_path
         "confidence_beta": "0.85",
         "feature_window_short": "10",
         "feature_window_long": "40",
+        "external_signals": "False",
+        "external_signal_max_adjustment": "0.04",
+        "external_signal_min_providers": "2",
+        "external_signal_ttl": "300",
+        "external_signal_timeout": "3.0",
     }
 
     class _UI:
@@ -2484,6 +2489,7 @@ def test_tui_strategy_profile_uses_unchanged_fields_as_profile_defaults(tmp_path
     assert updated.leverage == 3.0
     assert updated.risk_per_trade == 0.015
     assert updated.signal_threshold == 0.55
+    assert updated.external_signals_enabled is True
 
 
 def test_existing_position_detection_helpers() -> None:
