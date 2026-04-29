@@ -12,6 +12,7 @@ from simple_ai_bitcoin_trading_binance.model import (
     build_model_quality_report,
     evaluate,
     evaluate_classification,
+    feature_drift_report,
     _collect_feature_stats,
     _log_loss,
     _majority_baseline,
@@ -132,6 +133,74 @@ def test_probability_and_quality_helpers_cover_edges() -> None:
     assert overfit.status == "fail"
     assert any("overfitting" in warning for warning in overfit.warnings)
     assert any("F1 is zero" in warning for warning in overfit.warnings)
+
+
+def test_feature_drift_report_statuses_and_edges() -> None:
+    model = TrainedModel(
+        weights=[0.0, 0.0],
+        bias=0.0,
+        feature_dim=2,
+        epochs=1,
+        feature_means=[0.0, 0.0],
+        feature_stds=[1.0, 1.0],
+    )
+    assert feature_drift_report([], model).status == "fail"
+
+    ok = feature_drift_report([SimpleNamespace(features=(1.0, 2.0), label=1)], model)
+    assert ok.status == "ok"
+    assert ok.rows == 1
+
+    warn = feature_drift_report(
+        [SimpleNamespace(features=(5.0, 0.0), label=1)],
+        model,
+        outlier_fail_fraction=1.0,
+    )
+    assert warn.status == "warn"
+    assert "warning threshold" in warn.warnings[0]
+
+    fail = feature_drift_report([SimpleNamespace(features=(9.0, 0.0), label=1)], model)
+    assert fail.status == "fail"
+    assert "hard threshold" in fail.warnings[0]
+
+    sparse_hard_model = TrainedModel(
+        weights=[0.0] * 10,
+        bias=0.0,
+        feature_dim=10,
+        epochs=1,
+        feature_means=[0.0] * 10,
+        feature_stds=[1.0] * 10,
+    )
+    sparse_hard = feature_drift_report(
+        [SimpleNamespace(features=(9.0,) + (0.0,) * 9, label=1)],
+        sparse_hard_model,
+        outlier_warn_fraction=0.01,
+        outlier_fail_fraction=1.0,
+    )
+    assert sparse_hard.status == "fail"
+    assert any("elevated" in warning for warning in sparse_hard.warnings)
+
+    outlier_fail = feature_drift_report(
+        [SimpleNamespace(features=(2.0, 2.0), label=1)],
+        model,
+        warn_z=1.0,
+        fail_z=100.0,
+        outlier_fail_fraction=0.5,
+    )
+    assert outlier_fail.status == "fail"
+    assert any("too many" in warning for warning in outlier_fail.warnings)
+
+    incomplete = TrainedModel(
+        weights=[0.0, 0.0],
+        bias=0.0,
+        feature_dim=2,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+    assert feature_drift_report([SimpleNamespace(features=(1.0, 1.0), label=1)], incomplete).status == "fail"
+
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        feature_drift_report([SimpleNamespace(features=(1.0,), label=1)], model)
 
 
 def test_normalization_and_training_edge_cases() -> None:

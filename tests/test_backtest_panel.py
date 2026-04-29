@@ -370,6 +370,34 @@ def test_run_panel_end_to_end_with_objective(tmp_path: Path) -> None:
     assert isinstance(data["objective"]["accepted"], bool)
 
 
+def test_run_panel_rejects_mismatched_model_dimension(tmp_path: Path) -> None:
+    req = BacktestRequest(
+        interval="5m",
+        market_type="spot",
+        model_path="standard-model.json",
+        data_path="ignored",
+        objective="default",
+        tag="mismatch",
+    )
+    mismatched_model = TrainedModel(
+        weights=[0.0] * 13,
+        bias=0.0,
+        feature_dim=13,
+        epochs=1,
+        feature_means=[0.0] * 13,
+        feature_stds=[1.0] * 13,
+    )
+
+    with pytest.raises(ValueError, match="train-suite model_<objective>"):
+        run_panel(
+            req,
+            StrategyConfig(),
+            candles_loader=lambda _path: _synthetic_candles(n=300),
+            model_loader=lambda _path: mismatched_model,
+            report_dir=tmp_path / "reports",
+        )
+
+
 # ----- list_reports --------------------------------------------------------
 
 

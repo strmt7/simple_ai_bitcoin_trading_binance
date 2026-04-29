@@ -135,6 +135,22 @@ class ModelQualityReport:
 
 
 @dataclass(frozen=True)
+class FeatureDriftReport:
+    status: str
+    warnings: List[str]
+    rows: int
+    feature_dim: int
+    max_abs_z: float
+    mean_abs_z: float
+    outlier_fraction: float
+    warn_threshold: float
+    fail_threshold: float
+
+    def asdict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TemporalValidationSplit:
     train_rows: List[ModelRow]
     calibration_rows: List[ModelRow]
@@ -354,6 +370,90 @@ def build_model_quality_report(
         validation_rows=len(validation_rows),
         validation_positive_rate=float(validation_positive_rate),
         probability_stats=probability_stats,
+    )
+
+
+def feature_drift_report(
+    rows: List[ModelRow],
+    model: TrainedModel,
+    *,
+    warn_z: float = 4.0,
+    fail_z: float = 8.0,
+    outlier_warn_fraction: float = 0.10,
+    outlier_fail_fraction: float = 0.25,
+) -> FeatureDriftReport:
+    """Compare feature rows against the model's fitted normalization stats."""
+
+    warn_z = max(0.1, float(warn_z))
+    fail_z = max(warn_z, float(fail_z))
+    outlier_warn_fraction = _clamp(float(outlier_warn_fraction), 0.0, 1.0)
+    outlier_fail_fraction = _clamp(float(outlier_fail_fraction), outlier_warn_fraction, 1.0)
+    feature_dim = int(getattr(model, "feature_dim", 0) or 0)
+    warnings: List[str] = []
+    if not rows:
+        return FeatureDriftReport(
+            status="fail",
+            warnings=["no feature rows available for drift check"],
+            rows=0,
+            feature_dim=feature_dim,
+            max_abs_z=0.0,
+            mean_abs_z=0.0,
+            outlier_fraction=0.0,
+            warn_threshold=warn_z,
+            fail_threshold=fail_z,
+        )
+
+    validate_model_rows(rows, label="drift rows", expected_feature_dim=feature_dim)
+    means = list(getattr(model, "feature_means", []) or [])
+    stds = list(getattr(model, "feature_stds", []) or [])
+    if len(means) != feature_dim or len(stds) != feature_dim:
+        return FeatureDriftReport(
+            status="fail",
+            warnings=["model feature statistics are incomplete"],
+            rows=len(rows),
+            feature_dim=feature_dim,
+            max_abs_z=0.0,
+            mean_abs_z=0.0,
+            outlier_fraction=1.0,
+            warn_threshold=warn_z,
+            fail_threshold=fail_z,
+        )
+
+    z_values: List[float] = []
+    for row in rows:
+        for value, mean_, std_ in zip(row.features, means, stds):
+            denominator = float(std_) if abs(float(std_)) > 1e-12 else 1.0
+            z_values.append(abs((float(value) - float(mean_)) / denominator))
+    max_abs_z = max(z_values) if z_values else 0.0
+    mean_abs_z = mean(z_values) if z_values else 0.0
+    outliers = sum(1 for value in z_values if value >= warn_z)
+    outlier_fraction = outliers / len(z_values) if z_values else 0.0
+
+    status = "ok"
+    if max_abs_z >= fail_z:
+        warnings.append("feature drift exceeds hard threshold")
+        status = "fail"
+    elif max_abs_z >= warn_z:
+        warnings.append("feature drift exceeds warning threshold")
+        status = "warn"
+    if outliers > 0 and outlier_fraction >= outlier_fail_fraction:
+        warnings.append("too many feature values are out-of-distribution")
+        status = "fail"
+    elif outliers > 0 and outlier_fraction >= outlier_warn_fraction:
+        warnings.append("elevated out-of-distribution feature fraction")
+        if status != "fail":
+            status = "warn"
+
+    return FeatureDriftReport(
+        status=status,
+        warnings=warnings,
+        rows=len(rows),
+        feature_dim=feature_dim,
+        max_abs_z=float(max_abs_z),
+        mean_abs_z=float(mean_abs_z),
+        outlier_fraction=float(outlier_fraction),
+        warn_threshold=warn_z,
+        fail_threshold=fail_z,
     )
 
 

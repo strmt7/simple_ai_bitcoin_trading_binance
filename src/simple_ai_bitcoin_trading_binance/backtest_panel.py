@@ -247,6 +247,14 @@ def run_panel(
             enabled_features=strategy.enabled_features,
         )
     model, loaded, resolved = _load_model_or_baseline(request.model_path, rows, model_loader)
+    if rows and int(getattr(model, "feature_dim", 0)) != len(rows[0].features):
+        raise ValueError(
+            "model feature dimension "
+            f"{getattr(model, 'feature_dim', 'unknown')} does not match panel rows "
+            f"({len(rows[0].features)}). Use a model whose feature signature matches "
+            "this panel request; objective runs need train-suite model_<objective>.json, "
+            "while standard runs need train model artifacts with the same strategy features."
+        )
     result = run_backtest(
         rows,
         model,

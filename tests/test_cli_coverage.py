@@ -460,6 +460,40 @@ def test_readiness_report_and_command_doctor(tmp_path, monkeypatch, capsys) -> N
     assert any("bad model" in line for line in lines)
 
 
+def test_readiness_report_includes_feature_drift(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True))
+    save_strategy(StrategyConfig())
+    data_file = tmp_path / "history.json"
+    model_file = tmp_path / "model.json"
+    data_file.write_text("[]", encoding="utf-8")
+    model_file.write_text("{}", encoding="utf-8")
+    drift_row = SimpleNamespace(features=(9.0,), label=1)
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: [object()] * 80)
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [drift_row])
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: model)
+
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+
+    assert ok is False
+    assert any("[fix] feature drift" in line and "hard threshold" in line for line in lines)
+
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: None)
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+    assert ok is False
+    assert any("[ok] model artifact" in line for line in lines)
+    assert not any("feature drift" in line for line in lines)
+
+
 def test_build_order_notional_paths() -> None:
     cfg = StrategyConfig(risk_per_trade=0.1, max_position_pct=0.4, leverage=3.0)
     client = SimpleNamespace(
@@ -1730,6 +1764,221 @@ def test_command_live_loaded_model_signature_and_authenticated_sleep_floor(tmp_p
     )
     assert "minimum sleep=1s" in capsys.readouterr().out
     assert captured[0]["model_signature"] == "runtime-signature"
+
+
+def test_command_live_records_feature_drift_warning(tmp_path, monkeypatch, capsys) -> None:
+    captured: list[dict[str, object]] = []
+    feature_count = 13
+    row = SimpleNamespace(
+        timestamp=60_000,
+        close=100.0,
+        features=(5.0,) + (0.0,) * (feature_count - 1),
+        label=1,
+    )
+    model = TrainedModel(
+        weights=[0.0] * feature_count,
+        bias=0.0,
+        feature_dim=feature_count,
+        epochs=1,
+        feature_means=[0.0] * feature_count,
+        feature_stds=[1.0] * feature_count,
+    )
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        assert kind == "live"
+        captured.append(payload)
+        return output_dir / "live.json"
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig())
+    model_file = tmp_path / "model.json"
+    model_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    assert (
+        cli.command_live(
+            argparse.Namespace(
+                steps=1,
+                sleep=0,
+                paper=True,
+                live=False,
+                model=str(model_file),
+                leverage=None,
+                retrain_interval=0,
+                retrain_window=300,
+                retrain_min_rows=240,
+            )
+        )
+        == 0
+    )
+    assert "feature drift warning" in capsys.readouterr().out
+    drift_events = [event for event in captured[0]["events"] if event["status"] == "feature_drift"]
+    assert drift_events[0]["drift_status"] == "warn"
+
+
+def test_command_live_blocks_failed_feature_drift(tmp_path, monkeypatch, capsys) -> None:
+    captured: list[dict[str, object]] = []
+    feature_count = 13
+    row = SimpleNamespace(
+        timestamp=60_000,
+        close=100.0,
+        features=(9.0,) + (0.0,) * (feature_count - 1),
+        label=1,
+    )
+    model = TrainedModel(
+        weights=[0.0] * feature_count,
+        bias=0.0,
+        feature_dim=feature_count,
+        epochs=1,
+        feature_means=[0.0] * feature_count,
+        feature_stds=[1.0] * feature_count,
+    )
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        assert kind == "live"
+        captured.append(payload)
+        return output_dir / "live.json"
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig())
+    model_file = tmp_path / "model.json"
+    model_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    assert (
+        cli.command_live(
+            argparse.Namespace(
+                steps=1,
+                sleep=0,
+                paper=True,
+                live=False,
+                model=str(model_file),
+                leverage=None,
+                retrain_interval=0,
+                retrain_window=300,
+                retrain_min_rows=240,
+            )
+        )
+        == 0
+    )
+    assert "feature drift block" in capsys.readouterr().out
+    drift_events = [event for event in captured[0]["events"] if event["status"] == "feature_drift"]
+    assert drift_events[0]["drift_status"] == "fail"
+    assert captured[0]["result"]["entries"] == 0
+
+
+def test_command_live_halts_on_authenticated_feature_drift_check_failure(tmp_path, monkeypatch, capsys) -> None:
+    captured: list[dict[str, object]] = []
+    row = SimpleNamespace(timestamp=60_000, close=100.0, features=(1.0, 2.0), label=1)
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+
+    def fake_persist(kind: str, output_dir: Path, payload: dict[str, object]) -> Path:
+        assert kind == "live"
+        captured.append(payload)
+        return output_dir / "live.json"
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=False, market_type="spot", api_key="k", api_secret="s"))
+    save_strategy(StrategyConfig())
+    model_file = tmp_path / "model.json"
+    model_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr(cli, "_persist_run_artifact", fake_persist)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    assert (
+        cli.command_live(
+            argparse.Namespace(
+                steps=1,
+                sleep=0,
+                paper=False,
+                live=True,
+                model=str(model_file),
+                leverage=None,
+                retrain_interval=0,
+                retrain_window=300,
+                retrain_min_rows=240,
+            )
+        )
+        == 2
+    )
+    assert "Live feature drift check failed" in capsys.readouterr().err
+    assert captured[0]["result"]["status"] == "feature_drift_check_failed"
+    assert captured[0]["events"][-1]["status"] == "feature_drift_check_failed"
+
+
+def test_command_live_paper_recovers_after_feature_drift_check_failure(tmp_path, monkeypatch, capsys) -> None:
+    row = SimpleNamespace(timestamp=60_000, close=100.0, features=(1.0, 2.0), label=1)
+    incompatible = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+    recovered = TrainedModel(
+        weights=[0.0, 0.0],
+        bias=0.0,
+        feature_dim=2,
+        epochs=1,
+        feature_means=[0.0, 0.0],
+        feature_stds=[1.0, 1.0],
+    )
+    train_calls: list[int] = []
+
+    def fake_train(*_args, **_kwargs):
+        train_calls.append(1)
+        return recovered
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig())
+    model_file = tmp_path / "model.json"
+    model_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: incompatible)
+    monkeypatch.setattr(cli, "train", fake_train)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
+
+    assert (
+        cli.command_live(
+            argparse.Namespace(
+                steps=1,
+                sleep=0,
+                paper=True,
+                live=False,
+                model=str(model_file),
+                leverage=None,
+                retrain_interval=0,
+                retrain_window=300,
+                retrain_min_rows=240,
+            )
+        )
+        == 0
+    )
+    assert "paper model incompatible; retraining" in capsys.readouterr().err
+    assert train_calls == [1]
 
 
 def test_paper_or_live_order_passes_reduce_only_for_authenticated_futures(capsys) -> None:

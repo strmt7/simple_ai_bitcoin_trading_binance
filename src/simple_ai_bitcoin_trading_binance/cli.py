@@ -23,6 +23,7 @@ from .model import (
     confidence_adjusted_probability,
     evaluate_classification,
     evaluate,
+    feature_drift_report,
     ModelFeatureMismatchError,
     ModelLoadError,
     load_model,
@@ -848,6 +849,7 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
     add(bool(strategy.enabled_features), "feature set", ",".join(strategy.enabled_features))
 
     data_file = Path(input_path)
+    candles = None
     if data_file.exists():
         candles = _load_rows_for_command(str(data_file), label="Readiness data load failed")
         candle_count = len(candles) if candles is not None else 0
@@ -872,6 +874,19 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
                     "model quality",
                     f"score={float(quality_score):.2f} warnings={warning_text}",
                 )
+            if candles is not None:
+                rows = _build_model_rows(candles, strategy)
+                if rows:
+                    drift = feature_drift_report(rows[-min(50, len(rows)):], model)
+                    drift_warning = "; ".join(drift.warnings[:2]) or "none"
+                    add(
+                        drift.status != "fail",
+                        "feature drift",
+                        (
+                            f"status={drift.status} max_z={drift.max_abs_z:.2f} "
+                            f"outliers={drift.outlier_fraction:.1%} warnings={drift_warning}"
+                        ),
+                    )
     else:
         add(False, "model artifact", f"missing {model_file}")
 
@@ -2696,6 +2711,7 @@ def command_train(args: argparse.Namespace) -> int:
     calibration_score = evaluate(calibration_rows, model, threshold=threshold) if calibration_rows else 0.0
     validation_score = evaluate(validation_rows, model, threshold=threshold) if validation_rows else 0.0
     quality = build_model_quality_report(train_rows, validation_rows, model, threshold)
+    drift = feature_drift_report(validation_rows if validation_rows else rows[-min(50, len(rows)):], model)
     model.quality_score = float(quality.quality_score)
     model.quality_warnings = list(quality.warnings)
     output = Path(args.output)
@@ -2714,6 +2730,12 @@ def command_train(args: argparse.Namespace) -> int:
     print(f"model quality: {quality.status} score={quality.quality_score:.2f}")
     for warning in quality.warnings[:3]:
         print(f"model quality warning: {warning}")
+    print(
+        f"feature drift: {drift.status} max_z={drift.max_abs_z:.2f} "
+        f"outliers={drift.outlier_fraction:.1%}"
+    )
+    for warning in drift.warnings[:3]:
+        print(f"feature drift warning: {warning}")
     artifact = {
         "command": "train",
         "timestamp": int(time.time()),
@@ -2749,6 +2771,7 @@ def command_train(args: argparse.Namespace) -> int:
             "model_feature_signature": model.feature_signature,
         },
         "model_quality": quality.asdict(),
+        "feature_drift": drift.asdict(),
         "model": {
             "path": str(args.output),
             "feature_dim": int(model.feature_dim),
@@ -3008,6 +3031,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
     report = evaluate_classification(test_rows if test_rows else rows, model, threshold=threshold)
     train_report = evaluate_classification(train_rows, model, threshold=threshold) if train_rows else None
     quality = build_model_quality_report(train_rows, test_rows if test_rows else rows, model, threshold)
+    drift = feature_drift_report(test_rows if test_rows else rows, model)
     artifact = {
         "command": "evaluate",
         "timestamp": int(time.time()),
@@ -3047,6 +3071,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
             },
         },
         "model_quality": quality.asdict(),
+        "feature_drift": drift.asdict(),
     }
     _persist_run_artifact("evaluate", Path(args.model).parent, artifact)
 
@@ -3070,6 +3095,12 @@ def command_evaluate(args: argparse.Namespace) -> int:
     print(f"model_quality: {quality.status} score={quality.quality_score:.2f}")
     for warning in quality.warnings[:3]:
         print(f"quality_warning: {warning}")
+    print(
+        f"feature_drift: {drift.status} max_z={drift.max_abs_z:.2f} "
+        f"outliers={drift.outlier_fraction:.1%}"
+    )
+    for warning in drift.warnings[:3]:
+        print(f"drift_warning: {warning}")
     return 0
 
 
@@ -3286,6 +3317,40 @@ def command_live(args: argparse.Namespace) -> int:
             model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
             model_loads += 1
         latest = rows[-1]
+        if hasattr(model, "feature_means") and hasattr(model, "feature_stds"):
+            try:
+                drift = feature_drift_report([latest], model)
+            except ValueError as exc:
+                if not effective_dry_run:
+                    print(f"Live feature drift check failed: {exc}", file=sys.stderr)
+                    halt_reason = "feature_drift_check_failed"
+                    exit_code = 2
+                    live_run["events"].append({"step": i + 1, "status": halt_reason, "error": str(exc)})
+                    break
+                drift = None
+            if drift is not None:
+                live_run["events"].append(
+                    {
+                        "step": i + 1,
+                        "status": "feature_drift",
+                        "drift_status": drift.status,
+                        "max_abs_z": float(drift.max_abs_z),
+                        "outlier_fraction": float(drift.outlier_fraction),
+                        "warnings": list(drift.warnings),
+                    }
+                )
+                if drift.status == "fail":
+                    print(
+                        f"step {i + 1:>2}: feature drift block "
+                        f"max_z={drift.max_abs_z:.2f} outliers={drift.outlier_fraction:.1%}"
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+                if drift.status == "warn":
+                    print(
+                        f"step {i + 1:>2}: feature drift warning "
+                        f"max_z={drift.max_abs_z:.2f} outliers={drift.outlier_fraction:.1%}"
+                    )
         try:
             raw_score = model.predict_proba(latest.features)
             threshold = model_decision_threshold(model, cfg.signal_threshold)
