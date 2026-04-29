@@ -3,47 +3,54 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from getpass import getpass
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Any, Callable
 
 from .features import normalize_enabled_features
 from .storage import write_json_atomic
 from .types import RuntimeConfig, StrategyConfig, config_paths
 
 SUPPORTED_SYMBOL = "BTCUSDC"
+_RUNTIME_FIELD_NAMES = frozenset(field.name for field in fields(RuntimeConfig))
+_STRATEGY_FIELD_NAMES = frozenset(field.name for field in fields(StrategyConfig))
 
 
-def _read_config_json(path: Path) -> Dict[str, object]:
+def _read_config_json(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     if not isinstance(payload, dict):
         return {}
-    return payload
+    return dict(payload)
 
 
-def _write_json(path: Path, payload: Dict[str, object]) -> None:
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
     write_json_atomic(path, payload, indent=2, sort_keys=True, mode=0o600)
 
 
-def _normalize_runtime_payload(payload: Dict[str, object]) -> Dict[str, object]:
+def _known_payload(payload: dict[str, Any], allowed_fields: frozenset[str]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key in allowed_fields}
+
+
+def _normalize_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
     symbol = str(normalized.get("symbol") or SUPPORTED_SYMBOL).upper()
     normalized["symbol"] = SUPPORTED_SYMBOL if symbol != SUPPORTED_SYMBOL else symbol
     return normalized
 
 
-def load_runtime(overrides: Dict[str, object] | None = None) -> RuntimeConfig:
+def load_runtime(overrides: dict[str, Any] | None = None) -> RuntimeConfig:
     paths = config_paths()
-    payload = {}
+    payload: dict[str, Any] = {}
     if paths["runtime"].exists():
         payload.update(_read_config_json(paths["runtime"]))
     if overrides:
         payload.update(overrides)
     payload = _normalize_runtime_payload(payload)
-    return RuntimeConfig(**{k: v for k, v in payload.items() if hasattr(RuntimeConfig, k)})
+    return RuntimeConfig(**_known_payload(payload, _RUNTIME_FIELD_NAMES))
 
 
 def save_runtime(cfg: RuntimeConfig) -> RuntimeConfig:
@@ -53,7 +60,7 @@ def save_runtime(cfg: RuntimeConfig) -> RuntimeConfig:
 
 def load_strategy() -> StrategyConfig:
     paths = config_paths()
-    payload = {}
+    payload: dict[str, Any] = {}
     if paths["strategy"].exists():
         raw = _read_config_json(paths["strategy"])
         payload.update(raw)
@@ -73,7 +80,7 @@ def load_strategy() -> StrategyConfig:
             payload["enabled_features"] = normalize_enabled_features()
     else:
         payload["enabled_features"] = normalize_enabled_features()
-    return StrategyConfig(**{k: v for k, v in payload.items() if hasattr(StrategyConfig, k)})
+    return StrategyConfig(**_known_payload(payload, _STRATEGY_FIELD_NAMES))
 
 
 def save_strategy(cfg: StrategyConfig) -> StrategyConfig:

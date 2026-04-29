@@ -18,7 +18,7 @@ surface that to the operator.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 BackendKind = Literal["cpu", "cuda", "rocm", "mps"]
 
@@ -42,7 +42,7 @@ class BackendInfo:
     reason: str
 
 
-def _probe_torch() -> tuple[object | None, str]:
+def _probe_torch() -> tuple[Any | None, str]:
     try:
         import torch  # type: ignore
     except Exception as exc:  # pragma: no cover - environmental

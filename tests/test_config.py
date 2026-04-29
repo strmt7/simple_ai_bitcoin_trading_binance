@@ -126,6 +126,18 @@ def test_load_runtime_forces_supported_symbol(tmp_path: Path, monkeypatch) -> No
     assert loaded.symbol == "BTCUSDC"
 
 
+def test_load_runtime_ignores_method_name_payload_keys(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["runtime"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(
+        json.dumps({"api_key": "persisted", "asdict": "not-a-field", "public_dict": "not-a-field"}),
+        encoding="utf-8",
+    )
+    loaded = load_runtime()
+    assert loaded.api_key == "persisted"
+
+
 def test_load_strategy_coerces_feature_windows(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     cfg_file = config_paths()["strategy"]
@@ -163,6 +175,18 @@ def test_load_strategy_invalid_enabled_features_falls_back_to_default(tmp_path: 
     cfg_file.write_text('{"enabled_features": ["not-real"]}', encoding="utf-8")
     loaded = load_strategy()
     assert "momentum_1" in loaded.enabled_features
+
+
+def test_load_strategy_ignores_method_name_payload_keys(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["strategy"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(
+        json.dumps({"risk_per_trade": 0.003, "asdict": "not-a-field"}),
+        encoding="utf-8",
+    )
+    loaded = load_strategy()
+    assert loaded.risk_per_trade == 0.003
 
 
 def test_read_config_json_rejects_non_dict_payload(tmp_path: Path) -> None:

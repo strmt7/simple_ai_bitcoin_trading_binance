@@ -9,14 +9,19 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
-from .api import BinanceAPIError
-from .data_downloader import MarketDataSyncConfig, render_sync_result, sync_market_data
+from .api import BinanceAPIError, BinanceClient
+from .data_downloader import MarketDataSyncConfig, MarketDataSyncResult, render_sync_result, sync_market_data
 from .intervals import interval_milliseconds
 from .market_data import clean_candles
 from .market_store import MarketDataStore
 from .storage import write_json_atomic
 from .types import RuntimeConfig
+
+
+class BackgroundProcess(Protocol):
+    pid: int
 
 
 def runtime_with_market(runtime: RuntimeConfig, market_type: str) -> RuntimeConfig:
@@ -40,7 +45,7 @@ def start_background_data_sync(
     args: argparse.Namespace,
     *,
     python_executable: str = sys.executable,
-    popen: Callable[..., object] = subprocess.Popen,
+    popen: Callable[..., BackgroundProcess] = subprocess.Popen,
 ) -> int:
     pid_file = Path(getattr(args, "pid_file", "data/market_data_sync.pid"))
     log_file = Path(getattr(args, "log_file", "data/market_data_sync.log"))
@@ -85,12 +90,12 @@ def command_data_sync(
     args: argparse.Namespace,
     *,
     load_runtime_fn: Callable[[], RuntimeConfig],
-    build_client_fn: Callable[[RuntimeConfig], object],
-    sync_market_data_fn: Callable[..., object] = sync_market_data,
-    render_sync_result_fn: Callable[[object], str] = render_sync_result,
+    build_client_fn: Callable[[RuntimeConfig], BinanceClient],
+    sync_market_data_fn: Callable[..., MarketDataSyncResult] = sync_market_data,
+    render_sync_result_fn: Callable[[MarketDataSyncResult], str] = render_sync_result,
     sleep_fn: Callable[[float], None] = time.sleep,
     python_executable: str = sys.executable,
-    popen: Callable[..., object] = subprocess.Popen,
+    popen: Callable[..., BackgroundProcess] = subprocess.Popen,
 ) -> int:
     if getattr(args, "background", False):
         return start_background_data_sync(args, python_executable=python_executable, popen=popen)
@@ -128,7 +133,7 @@ def command_fetch(
     args: argparse.Namespace,
     *,
     load_runtime_fn: Callable[[], RuntimeConfig],
-    build_client_fn: Callable[[RuntimeConfig], object],
+    build_client_fn: Callable[[RuntimeConfig], BinanceClient],
 ) -> int:
     runtime = load_runtime_fn()
     symbol = (args.symbol or runtime.symbol).upper()

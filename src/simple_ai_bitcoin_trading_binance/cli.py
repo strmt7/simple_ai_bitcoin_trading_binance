@@ -11,15 +11,15 @@ import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence, TypeVar, cast
 
-from .api import BinanceAPIError, BinanceClient
+from .api import BinanceAPIError, BinanceClient, Candle
 from .backtest import run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
 from . import data_workflows
 from .data_downloader import MarketDataSyncConfig, render_sync_result, sync_market_data
-from .features import FEATURE_NAMES, feature_signature, make_rows, normalize_enabled_features
+from .features import FEATURE_NAMES, ModelRow, feature_signature, make_rows, normalize_enabled_features
 from .api import SymbolConstraints
 from .external_signals import ExternalSignalReport, collect_external_signals, render_external_signal_report
 from .live_artifacts import build_live_run_payload
@@ -40,6 +40,7 @@ from .model import (
     serialize_model,
     temporal_validation_split,
     train,
+    TrainedModel,
     walk_forward_report,
 )
 from .risk_controls import EntryRiskDecision, assess_entry_risk, build_risk_policy_report, render_risk_policy_report
@@ -72,6 +73,7 @@ _TRAINING_PRESETS: dict[str, dict[str, object]] = {
         "calibrate_threshold": True,
     },
 }
+_T = TypeVar("_T")
 
 
 _STRATEGY_PROFILES: dict[str, dict[str, object]] = {
@@ -559,13 +561,19 @@ def _unchanged_form_value(payload: dict[str, str], key: str, current: object) ->
     return payload.get(key, "").strip() == str(current)
 
 
-def _profile_field_value(profile: str, payload: dict[str, str], key: str, current: object, parser) -> object | None:
+def _profile_field_value(
+    profile: str,
+    payload: dict[str, str],
+    key: str,
+    current: _T,
+    parser: Callable[[str], _T],
+) -> _T | None:
     if profile != "custom" and _unchanged_form_value(payload, key, current):
         return None
     return parser(payload[key])
 
 
-async def _ui_edit_runtime(ui, current) -> object:
+async def _ui_edit_runtime(ui, current: RuntimeConfig) -> RuntimeConfig:
     from .tui import FormField
 
     payload = await ui.form(
@@ -874,9 +882,12 @@ def _account_overview_lines(runtime) -> list[str]:
         account = client.get_account()
     except BinanceAPIError as exc:
         return [f"Account overview failed: {exc}"]
-    balances = account.get("balances", []) if isinstance(account, dict) else []
-    assets = account.get("assets", []) if isinstance(account, dict) else []
-    positions = account.get("positions", []) if isinstance(account, dict) else []
+    balances_payload = account.get("balances", []) if isinstance(account, dict) else []
+    assets_payload = account.get("assets", []) if isinstance(account, dict) else []
+    positions_payload = account.get("positions", []) if isinstance(account, dict) else []
+    balances = balances_payload if isinstance(balances_payload, list) else []
+    assets = assets_payload if isinstance(assets_payload, list) else []
+    positions = positions_payload if isinstance(positions_payload, list) else []
     interesting = []
     for item in balances:
         if not isinstance(item, dict):
@@ -1958,12 +1969,12 @@ def _parse_date_boundary(raw: str, *, end_of_day: bool) -> int:
 
 
 def _filter_candles_for_time_window(
-    candles: Sequence[object],
+    candles: Sequence[Candle],
     *,
     lookback_days: int | None = None,
     from_date: str | None = None,
     to_date: str | None = None,
-) -> list[object]:
+) -> list[Candle]:
     if lookback_days is not None and lookback_days <= 0:
         raise ValueError("lookback_days must be > 0")
     if lookback_days is not None and (from_date or to_date):
@@ -2005,8 +2016,8 @@ def _public_runtime_payload(runtime) -> dict[str, object]:
     return runtime.public_dict()
 
 
-def _build_model_rows(candles: Sequence[object], strategy: StrategyConfig):
-    candles = clean_candles(c for c in candles if hasattr(c, "open_time"))
+def _build_model_rows(candles: Sequence[Candle], strategy: StrategyConfig) -> list[ModelRow]:
+    candles = clean_candles(candles)
     return make_rows(
         candles,
         strategy.feature_windows[0],
@@ -2060,7 +2071,7 @@ def _strategy_feature_signature(strategy: StrategyConfig) -> str:
     )
 
 
-def _load_runtime_model(model_path: Path, strategy: StrategyConfig):
+def _load_runtime_model(model_path: Path, strategy: StrategyConfig) -> TrainedModel:
     strategy_signature = _strategy_feature_signature(strategy)
     return load_model(
         model_path,
@@ -2075,7 +2086,7 @@ def _load_live_start_model(
     strategy: StrategyConfig,
     *,
     effective_dry_run: bool,
-) -> tuple[object | None, str | None, str | None]:
+) -> tuple[TrainedModel | None, str | None, str | None]:
     if model_path.exists():
         try:
             return _load_runtime_model(model_path, strategy), None, None
@@ -2166,11 +2177,11 @@ def _safe_day_ms(timestamp_ms: int) -> int:
 
 
 def _resolve_live_retrain_rows(
-    rows: list,
+    rows: list[ModelRow],
     *,
     retrain_window: int,
     retrain_min_rows: int,
-) -> list:
+) -> list[ModelRow]:
     if len(rows) < retrain_min_rows:
         return []
     if len(rows) <= retrain_window:
@@ -2179,15 +2190,15 @@ def _resolve_live_retrain_rows(
 
 
 def _build_live_model(
-    rows: list,
+    rows: list[ModelRow],
     *,
-    model: object | None = None,
+    model: TrainedModel | None = None,
     retrain_every: int,
     step: int,
     cfg: StrategyConfig,
     retrain_window: int,
     retrain_min_rows: int,
-) -> object | None:
+) -> TrainedModel | None:
     if model is not None:
         if retrain_every <= 0:
             return model
@@ -2238,7 +2249,7 @@ def _live_entry_risk_skip(
     return message, event
 
 
-def _safe_float(value: object) -> float:
+def _safe_float(value: Any) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -2944,11 +2955,11 @@ def command_train(args: argparse.Namespace) -> int:
                 f"walk-forward: folds={wf['folds']} avg_score={wf['average_score']:.4f} "
                 f"(train={wf['train_window']} test={wf['test_window']} step={wf['step']})"
             )
-            folds = wf["scores"]
-            if folds:
+            fold_values = wf["scores"]
+            if isinstance(fold_values, list) and fold_values:
                 print(
                     "walk-forward fold scores: "
-                    + ", ".join(f"{float(v):.3f}" for v in folds)
+                    + ", ".join(f"{float(v):.3f}" for v in fold_values)
             )
         except ValueError as exc:
             print(f"walk-forward unavailable: {exc}")
@@ -3529,8 +3540,9 @@ def command_live(args: argparse.Namespace) -> int:
     if runtime.market_type == "futures" and not effective_dry_run:
         try:
             set_response = client.set_leverage(runtime.symbol, int(leverage))
-            if isinstance(set_response, dict) and set_response.get("leverage"):
-                leverage = float(set_response.get("leverage"))
+            leverage_value = set_response.get("leverage") if isinstance(set_response, dict) else None
+            if leverage_value is not None:
+                leverage = _safe_float(leverage_value) or leverage
         except BinanceAPIError as exc:
             print(f"Failed to set leverage: {exc}", file=sys.stderr)
             return 2
@@ -3597,6 +3609,7 @@ def command_live(args: argparse.Namespace) -> int:
         external_signal_cache=_external_signal_cache_path(model_path),
         risk_policy=risk_policy,
     )
+    live_events = cast(list[dict[str, object]], live_run["events"])
     if risk_policy.warning_count:
         print(f"risk policy warnings: {risk_policy.warning_count}")
     if not effective_dry_run:
@@ -3616,7 +3629,7 @@ def command_live(args: argparse.Namespace) -> int:
                 "Detected existing exchange position: "
                 f"{'long' if position_side > 0 else 'short'} qty={qty:.8f} entry={entry_price:.2f}"
             )
-            live_run["events"].append(
+            live_events.append(
                 {
                     "step": 0,
                     "status": "resume_exchange_position",
@@ -3643,7 +3656,7 @@ def command_live(args: argparse.Namespace) -> int:
         print(f"order error: {exc}", file=sys.stderr)
         halt_reason = "order_error"
         exit_code = 2
-        live_run["events"].append(
+        live_events.append(
             {
                 "step": step,
                 "status": "order_error",
@@ -3660,7 +3673,7 @@ def command_live(args: argparse.Namespace) -> int:
             print(f"market error: {exc}", file=sys.stderr)
             halt_reason = "market_error"
             exit_code = 2
-            live_run["events"].append({"step": i + 1, "status": "market_error", "error": str(exc)})
+            live_events.append({"step": i + 1, "status": "market_error", "error": str(exc)})
             break
 
         steps_executed += 1
@@ -3668,11 +3681,11 @@ def command_live(args: argparse.Namespace) -> int:
         rows = _build_model_rows(candles, cfg)
         if not rows:
             print("not enough historical data for live signal")
-            live_run["events"].append({"step": i + 1, "status": "no_rows"})
+            live_events.append({"step": i + 1, "status": "no_rows"})
             time.sleep(sleep_seconds)
             continue
 
-        live_run["events"].append({"step": i + 1, "status": "rows", "count": len(rows)})
+        live_events.append({"step": i + 1, "status": "rows", "count": len(rows)})
 
         retrain_interval = getattr(args, "retrain_interval", 0)
         retrain_window = getattr(args, "retrain_window", 300)
@@ -3718,11 +3731,11 @@ def command_live(args: argparse.Namespace) -> int:
                     print(f"Live feature drift check failed: {exc}", file=sys.stderr)
                     halt_reason = "feature_drift_check_failed"
                     exit_code = 2
-                    live_run["events"].append({"step": i + 1, "status": halt_reason, "error": str(exc)})
+                    live_events.append({"step": i + 1, "status": halt_reason, "error": str(exc)})
                     break
                 drift = None
             if drift is not None:
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "feature_drift",
@@ -3753,7 +3766,7 @@ def command_live(args: argparse.Namespace) -> int:
                 print(f"Live model incompatible with current rows: {exc}", file=sys.stderr)
                 halt_reason = "model_incompatible"
                 exit_code = 2
-                live_run["events"].append({"step": i + 1, "status": "model_incompatible", "error": str(exc)})
+                live_events.append({"step": i + 1, "status": "model_incompatible", "error": str(exc)})
                 break
             print(f"paper model incompatible; retraining: {exc}", file=sys.stderr)
             model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
@@ -3778,7 +3791,7 @@ def command_live(args: argparse.Namespace) -> int:
                     cfg,
                     external_report,
                 )
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "external_signals",
@@ -3797,7 +3810,7 @@ def command_live(args: argparse.Namespace) -> int:
                     f"adj={applied_adjustment:+.4f} risk={external_report.risk_multiplier:.3f}"
                 )
             except Exception as exc:
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "external_signals_error",
@@ -3839,7 +3852,7 @@ def command_live(args: argparse.Namespace) -> int:
                 )
                 print(message)
                 skipped_entries += 1
-                live_run["events"].append(event)
+                live_events.append(event)
                 time.sleep(sleep_seconds)
                 continue
 
@@ -3855,7 +3868,7 @@ def command_live(args: argparse.Namespace) -> int:
             if notional <= 0:
                 print(f"step {i + 1:>2}: skipped entry due to order constraints")
                 skipped_entries += 1
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "skip_constraints",
@@ -3876,7 +3889,7 @@ def command_live(args: argparse.Namespace) -> int:
             if total > cash:
                 print(f"step {i + 1:>2}: insufficient cash for leverage-adjusted entry")
                 skipped_entries += 1
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "skip_insufficient_cash_pre_fill",
@@ -3898,7 +3911,7 @@ def command_live(args: argparse.Namespace) -> int:
             if total > cash:
                 print(f"step {i + 1:>2}: insufficient cash after fill adjustment")
                 skipped_entries += 1
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "skip_insufficient_cash_after_fill",
@@ -3934,7 +3947,7 @@ def command_live(args: argparse.Namespace) -> int:
 
             print(f"step {i + 1:>2}: enter {'long' if position_side > 0 else 'short'} at {fill:.2f} qty={qty:.6f}")
             entries += 1
-            live_run["events"].append(
+            live_events.append(
                 {
                     "step": i + 1,
                     "status": "enter",
@@ -3981,7 +3994,7 @@ def command_live(args: argparse.Namespace) -> int:
                     f"pnl={pnl:.2f} cash={cash:.2f}"
                 )
                 closes += 1
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "close",
@@ -4004,7 +4017,7 @@ def command_live(args: argparse.Namespace) -> int:
                 unrealized = margin_used + pnl
                 print(f"step {i + 1:>2}: hold {'long' if position_side > 0 else 'short'} pnl={pnl_pct:.2%} cash={cash:.2f}")
                 print(f"         unrealized equity={cash + unrealized:.2f}")
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "hold",
@@ -4059,7 +4072,7 @@ def command_live(args: argparse.Namespace) -> int:
                     qty = 0.0
                     margin_used = 0.0
                     entry_price = 0.0
-                live_run["events"].append(
+                live_events.append(
                     {
                         "step": i + 1,
                         "status": "emergency_close",
@@ -4073,7 +4086,7 @@ def command_live(args: argparse.Namespace) -> int:
                 break
 
         if position_side == 0 and direction != 0:
-            live_run["events"].append(
+            live_events.append(
                 {
                     "step": i + 1,
                     "status": "signal_no_entry",

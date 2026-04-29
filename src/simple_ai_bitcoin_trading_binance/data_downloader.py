@@ -207,8 +207,12 @@ def sync_market_data(
     with MarketDataStore(config.db_path) as store:
         coverage_before = store.coverage(symbol, config.market_type, interval)
         latest_open_time = coverage_before.last_open_time
-        should_increment = rows_requested > 0 and coverage_before.count >= rows_requested and latest_open_time is not None
-        if should_increment:
+        incremental_start_time = (
+            int(latest_open_time) + step_ms
+            if rows_requested > 0 and coverage_before.count >= rows_requested and latest_open_time is not None
+            else None
+        )
+        if incremental_start_time is not None:
             sync_mode = "incremental"
             candle_stats = _sync_incremental_candles(
                 store,
@@ -217,7 +221,7 @@ def sync_market_data(
                 config.market_type,
                 interval,
                 batch_size=batch_size,
-                start_time=int(latest_open_time) + step_ms,
+                start_time=incremental_start_time,
                 now_ms=config.now_ms,
                 errors=errors,
             )
