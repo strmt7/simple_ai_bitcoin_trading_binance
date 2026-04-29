@@ -6,7 +6,7 @@ import argparse
 import builtins
 from datetime import datetime, timedelta, timezone
 import json
-import subprocess
+import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path

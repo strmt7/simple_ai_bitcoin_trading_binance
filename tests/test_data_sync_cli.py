@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import builtins
 import json
-import sys
 from pathlib import Path
 
 from simple_ai_bitcoin_trading_binance import cli

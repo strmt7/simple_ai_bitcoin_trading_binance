@@ -31,7 +31,6 @@ from .autonomous import (
     AutonomousControl,
 )
 from .backtest_panel import describe_supported_intervals, list_reports
-from .intervals import supported_intervals
 from .objective import available_objectives, describe_objectives
 from .positions import (
     PositionsStore,

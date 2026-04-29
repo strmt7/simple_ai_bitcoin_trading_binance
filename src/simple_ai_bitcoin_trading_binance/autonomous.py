@@ -28,7 +28,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from .api import BinanceAPIError, BinanceClient
 from .logging_ext import configure as configure_logging

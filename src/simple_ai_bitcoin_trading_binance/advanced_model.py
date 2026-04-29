@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Sequence
 
 from .api import Candle
 from .features import (
@@ -101,19 +101,91 @@ def _safe(x: float) -> float:
     return 0.0 if not math.isfinite(x) else float(x)
 
 
-def _extra_window_features(closes: Sequence[float], windows: Sequence[int]) -> list[float]:
+def _prefix_sum(values: Sequence[float]) -> list[float]:
+    total = 0.0
+    prefix = [0.0]
+    for value in values:
+        total += value
+        prefix.append(total)
+    return prefix
+
+
+def _window_sum(prefix: Sequence[float], start: int, end: int) -> float:
+    return prefix[end + 1] - prefix[start]
+
+
+@dataclass(frozen=True)
+class _AdvancedWindowCache:
+    closes: list[float]
+    close_prefix: list[float]
+    close_square_prefix: list[float]
+    gain_prefix: list[float]
+    loss_prefix: list[float]
+
+
+def _build_window_cache(closes: Sequence[float]) -> _AdvancedWindowCache:
+    close_values = [float(value) for value in closes]
+    gains = [0.0]
+    losses = [0.0]
+    for index in range(1, len(close_values)):
+        delta = close_values[index] - close_values[index - 1]
+        gains.append(max(0.0, delta))
+        losses.append(max(0.0, -delta))
+    return _AdvancedWindowCache(
+        closes=close_values,
+        close_prefix=_prefix_sum(close_values),
+        close_square_prefix=_prefix_sum([value * value for value in close_values]),
+        gain_prefix=_prefix_sum(gains),
+        loss_prefix=_prefix_sum(losses),
+    )
+
+
+def _window_mean(prefix: Sequence[float], start: int, end: int) -> float:
+    if end < start:
+        return float("nan")
+    return _window_sum(prefix, start, end) / float(end - start + 1)
+
+
+def _rsi_at(cache: _AdvancedWindowCache, end: int, window: int) -> float:
+    if window <= 0 or end < window:
+        return float("nan")
+    start = end + 1 - window
+    avg_gain = _window_mean(cache.gain_prefix, start, end)
+    avg_loss = _window_mean(cache.loss_prefix, start, end)
+    if avg_loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def _volatility_at(cache: _AdvancedWindowCache, end: int, window: int) -> float:
+    if window <= 1 or end < window - 1:
+        return float("nan")
+    start = end + 1 - window
+    total = _window_sum(cache.close_prefix, start, end)
+    total_sq = _window_sum(cache.close_square_prefix, start, end)
+    variance = (total_sq - (total * total / window)) / max(1, window - 1)
+    return math.sqrt(max(0.0, variance))
+
+
+def _extra_window_features_at(cache: _AdvancedWindowCache, end: int, windows: Sequence[int]) -> list[float]:
     features: list[float] = []
+    anchor = cache.closes[end] if cache.closes else 0.0
     for window in windows:
-        sma = _sma(closes, window)
-        rsi = _rsi(closes, window)
-        vol = _volatility(closes, window)
-        anchor = closes[-1] if closes else 0.0
+        sma = _window_mean(cache.close_prefix, end + 1 - window, end) if end >= window - 1 else float("nan")
+        rsi = _rsi_at(cache, end, window)
+        vol = _volatility_at(cache, end, window)
         features.extend([
             _safe((anchor - sma) / sma) if math.isfinite(sma) and sma != 0 else 0.0,
             _safe((rsi / 100.0) if math.isfinite(rsi) else 0.0),
             _safe(vol / anchor) if anchor != 0 else 0.0,
         ])
     return features
+
+
+def _extra_window_features(closes: Sequence[float], windows: Sequence[int]) -> list[float]:
+    if not closes:
+        return [0.0 for _ in range(3 * len(windows))]
+    return _extra_window_features_at(_build_window_cache(closes), len(closes) - 1, windows)
 
 
 def _nonlinear_expand(values: Sequence[float], transforms: Sequence[str]) -> list[float]:
@@ -191,7 +263,7 @@ def make_advanced_rows(
     cfg: AdvancedFeatureConfig,
     *,
     lookahead: int = 1,
-) -> List[ModelRow]:
+) -> list[ModelRow]:
     """Build expanded ``ModelRow`` objects for ``candles`` using ``cfg``."""
 
     enabled = normalize_enabled_features(cfg.base_features)
@@ -208,12 +280,24 @@ def make_advanced_rows(
     # reconstruct the index alignment used by make_rows
     valid_candles = _filter_valid(candles)
     index_by_time = {candle.close_time: idx for idx, candle in enumerate(valid_candles)}
+    window_cache = _build_window_cache([candle.close for candle in valid_candles])
     expanded: list[ModelRow] = []
     for row in base_rows:
         idx = index_by_time.get(row.timestamp)
         if idx is None:
             continue
-        expanded.append(expand_row(row, valid_candles, cfg, idx))
+        base = list(row.features)
+        extras = _extra_window_features_at(window_cache, idx, cfg.extra_lookback_windows)
+        transforms = _nonlinear_expand(base, cfg.nonlinear_transforms)
+        pairs = _polynomial_pairs(base, cfg.polynomial_top_features, cfg.polynomial_degree)
+        expanded.append(
+            ModelRow(
+                timestamp=row.timestamp,
+                close=row.close,
+                features=tuple(_safe(value) for value in base + extras + transforms + pairs),
+                label=row.label,
+            )
+        )
     return expanded
 
 
@@ -263,7 +347,7 @@ def train_advanced(
     learning_rate: float,
     l2_penalty: float,
     seed: int = 7,
-) -> Tuple[TrainedModel, AdvancedTrainingReport]:
+) -> tuple[TrainedModel, AdvancedTrainingReport]:
     """Train a logistic regression on an expanded feature set.
 
     Returns the ``TrainedModel`` along with a small report describing the run

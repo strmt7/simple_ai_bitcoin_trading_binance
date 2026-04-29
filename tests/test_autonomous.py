@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from simple_ai_bitcoin_trading_binance import autonomous
 from simple_ai_bitcoin_trading_binance.api import BinanceAPIError
 from simple_ai_bitcoin_trading_binance.autonomous import (
     AutonomousConfig,

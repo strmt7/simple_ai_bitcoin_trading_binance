@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,7 +124,7 @@ def _git_executable() -> str:
 
 
 def _run_git(repo_root: Path, *args: str) -> str:
-    completed = subprocess.run(
+    completed = subprocess.run(  # nosec B603
         [_git_executable(), "-c", f"safe.directory={repo_root.resolve()}", *args],
         cwd=repo_root,
         check=True,

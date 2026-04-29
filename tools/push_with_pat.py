@@ -25,7 +25,7 @@ import os
 import shutil
 import socket
 import stat
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tempfile
 import threading

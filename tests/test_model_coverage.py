@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from simple_ai_bitcoin_trading_binance.features import make_rows, make_rows_legacy, _safe_div, _sma, _ema, _rsi
+from simple_ai_bitcoin_trading_binance.features import _safe_div, _sma
 from simple_ai_bitcoin_trading_binance.features import _rsi as rsi_fn, _true_range
 from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
@@ -354,7 +354,6 @@ def test_model_class_weights_handles_all_one_or_zero_labels() -> None:
 
 
 def test_model_train_and_calibrate_edges() -> None:
-    empty = []
     with pytest.raises(ValueError, match="No training rows"):
         train([], epochs=1)  # type: ignore[arg-type]
 

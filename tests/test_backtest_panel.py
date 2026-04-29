@@ -9,7 +9,6 @@ from typing import Sequence
 
 import pytest
 
-from simple_ai_bitcoin_trading_binance import backtest_panel
 from simple_ai_bitcoin_trading_binance.api import Candle
 from simple_ai_bitcoin_trading_binance.backtest_panel import (
     BacktestRequest,

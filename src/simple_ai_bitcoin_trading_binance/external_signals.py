@@ -85,9 +85,10 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 
 
 def _get_json(url: str, timeout: float) -> object:
+    request_timeout = max(0.1, float(timeout))
     response = requests.get(
         url,
-        timeout=max(0.1, float(timeout)),
+        timeout=request_timeout,
         headers={"User-Agent": "simple-ai-btcusdc-cli/0.1"},
     )
     response.raise_for_status()
@@ -421,4 +422,3 @@ def render_external_signal_report(report: ExternalSignalReport) -> str:
     for warning in report.warnings:
         lines.append(f"warning: {warning}")
     return "\n".join(lines)
-

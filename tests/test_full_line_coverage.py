@@ -6,7 +6,6 @@ import json
 import runpy
 import sys
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest

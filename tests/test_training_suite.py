@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
 
 import pytest
 
 from simple_ai_bitcoin_trading_binance import training_suite
-from simple_ai_bitcoin_trading_binance.advanced_model import AdvancedFeatureConfig
 from simple_ai_bitcoin_trading_binance.api import Candle
 from simple_ai_bitcoin_trading_binance.backtest import BacktestResult
 from simple_ai_bitcoin_trading_binance.features import ModelRow

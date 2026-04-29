@@ -6,7 +6,6 @@ import argparse
 import json
 from pathlib import Path
 
-import pytest
 
 from simple_ai_bitcoin_trading_binance import cli
 from simple_ai_bitcoin_trading_binance.positions import OpenPosition, PositionsStore

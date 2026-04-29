@@ -550,7 +550,6 @@ def test_paper_order_is_logged(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("HOME", str(tmp_path))
     save_runtime(RuntimeConfig())
-    args = SimpleNamespace()
 
     cli._paper_or_live_order(client, RuntimeConfig(), cfg, side="BUY", size=0.1, dry_run=True, leverage=3.0)
     cli._paper_or_live_order(client, RuntimeConfig(), cfg, side="SELL", size=0.2, dry_run=False, leverage=2.0)

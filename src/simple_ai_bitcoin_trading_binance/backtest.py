@@ -197,7 +197,6 @@ def run_backtest(
             max_exposure = max(max_exposure, abs(notional))
 
         elif position_side != 0:
-            current_pnl = position_side * (price - entry_price) * qty
             current_pnl_pct = (price - entry_price) / entry_price if position_side > 0 else (entry_price - price) / entry_price
             should_close = (
                 current_pnl_pct >= cfg.take_profit_pct

@@ -11,6 +11,9 @@ from simple_ai_bitcoin_trading_binance.features import (
     normalize_enabled_features,
     _safe_div,
     _sma,
+    _prefix_sum,
+    _rolling_mean,
+    _window_mean,
     _ema,
     _rsi,
     _true_range,
@@ -68,6 +71,11 @@ def test_feature_utilities() -> None:
     assert _safe_div(10.0, 0.0) == 0.0
     assert math.isnan(_sma([1.0, 2.0], 3))
     assert _sma([1.0, 2.0], 2) == 1.5
+    prefix = _prefix_sum([1.0, 2.0, 3.0])
+    assert _window_mean(prefix, 1, 2) == 2.5
+    assert math.isnan(_window_mean(prefix, 2, 1))
+    assert _rolling_mean(prefix, 2, 2) == 2.5
+    assert math.isnan(_rolling_mean(prefix, 0, 2))
     assert _ema([1.0, 2.0, 3.0], 3) == 2.25
     assert _rsi([1.0, 1.0], 1) == 100.0
     assert _rsi([1.0], 5) != _rsi([1.0, 2.0, 3.0], 1)

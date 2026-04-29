@@ -11,7 +11,7 @@ import hmac
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import requests
@@ -57,7 +57,7 @@ def _redact_sensitive_text(text: str, request_url: str | None = None) -> str:
     for field in _SENSITIVE_QUERY_FIELDS:
         redacted = re.sub(
             rf"([?&]{re.escape(field)}=)[^&\s'\"<>)]*",
-            rf"\1<redacted>",
+            r"\1<redacted>",
             redacted,
         )
     return redacted

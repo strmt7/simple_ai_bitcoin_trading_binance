@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import io
 
-import pytest
 
 from simple_ai_bitcoin_trading_binance import style
 

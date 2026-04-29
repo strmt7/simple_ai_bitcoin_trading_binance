@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Sequence, Tuple
 
 from .api import Candle
 from .market_data import clean_candles
@@ -28,6 +28,7 @@ FEATURE_NAMES = (
     "gap_to_vwap",
     "volume_trend",
 )
+_FEATURE_INDEX = {name: index for index, name in enumerate(FEATURE_NAMES)}
 
 
 def normalize_enabled_features(enabled_features: Sequence[str] | None = None) -> tuple[str, ...]:
@@ -47,7 +48,7 @@ def normalize_enabled_features(enabled_features: Sequence[str] | None = None) ->
 
 def _feature_indices(enabled_features: Sequence[str] | None = None) -> tuple[int, ...]:
     normalized = normalize_enabled_features(enabled_features)
-    return tuple(FEATURE_NAMES.index(name) for name in normalized)
+    return tuple(_FEATURE_INDEX[name] for name in normalized)
 
 
 def feature_signature(
@@ -76,7 +77,7 @@ def feature_signature(
 
 
 def _valid_ohlcv(candle: Candle) -> bool:
-    if not math.isfinite(candle.open) or not math.isfinite(candle.high) or not math.isfinite(candle.low) or not math.isfinite(candle.close):
+    if not all(math.isfinite(value) for value in (candle.open, candle.high, candle.low, candle.close)):
         return False
     if candle.open <= 0.0 or candle.high <= 0.0 or candle.low <= 0.0 or candle.close <= 0.0:
         return False
@@ -121,6 +122,27 @@ def _sma(values: Sequence[float], window: int) -> float:
     return sum(values[-window:]) / float(window)
 
 
+def _prefix_sum(values: Sequence[float]) -> list[float]:
+    total = 0.0
+    prefix = [0.0]
+    for value in values:
+        total += value
+        prefix.append(total)
+    return prefix
+
+
+def _window_mean(prefix: Sequence[float], start: int, end: int) -> float:
+    if end < start:
+        return float("nan")
+    return (prefix[end + 1] - prefix[start]) / float(end - start + 1)
+
+
+def _rolling_mean(prefix: Sequence[float], end: int, window: int) -> float:
+    if window <= 0 or end < window - 1:
+        return float("nan")
+    return _window_mean(prefix, end - window + 1, end)
+
+
 def _ema(values: Sequence[float], window: int) -> float:
     if len(values) < window:
         return float("nan")
@@ -134,8 +156,8 @@ def _ema(values: Sequence[float], window: int) -> float:
 def _rsi(values: Sequence[float], window: int) -> float:
     if len(values) < window + 1:
         return float("nan")
-    gains: List[float] = []
-    losses: List[float] = []
+    gains: list[float] = []
+    losses: list[float] = []
     for i in range(len(values) - window, len(values)):
         delta = values[i] - values[i - 1]
         gains.append(max(0.0, delta))
@@ -157,8 +179,120 @@ def _true_range(candles: Sequence[Candle], i: int) -> float:
     return max(high - low, abs(high - prev_close), abs(low - prev_close))
 
 
-def _safe_features(values: Sequence[float]) -> List[float]:
+def _safe_features(values: Sequence[float]) -> list[float]:
     return [0.0 if not math.isfinite(v) else float(v) for v in values]
+
+
+@dataclass(frozen=True)
+class _FeatureCache:
+    candles: list[Candle]
+    closes: list[float]
+    volumes: list[float]
+    close_prefix: list[float]
+    volume_prefix: list[float]
+    abs_change_prefix: list[float]
+    true_range_prefix: list[float]
+    gain_prefix: list[float]
+    loss_prefix: list[float]
+
+
+def _build_feature_cache(candles: Sequence[Candle]) -> _FeatureCache:
+    cleaned = [candle for candle in clean_candles(candles) if _valid_ohlcv(candle)]
+    closes = [candle.close for candle in cleaned]
+    volumes = [candle.volume for candle in cleaned]
+    abs_changes = [0.0]
+    true_ranges = [0.0]
+    gains = [0.0]
+    losses = [0.0]
+    for index in range(1, len(cleaned)):
+        previous = closes[index - 1]
+        current = closes[index]
+        delta = current - previous
+        gains.append(max(0.0, delta))
+        losses.append(max(0.0, -delta))
+        abs_changes.append(abs(_pct(current, previous)))
+        true_ranges.append(_true_range(cleaned, index))
+    return _FeatureCache(
+        candles=cleaned,
+        closes=closes,
+        volumes=volumes,
+        close_prefix=_prefix_sum(closes),
+        volume_prefix=_prefix_sum(volumes),
+        abs_change_prefix=_prefix_sum(abs_changes),
+        true_range_prefix=_prefix_sum(true_ranges),
+        gain_prefix=_prefix_sum(gains),
+        loss_prefix=_prefix_sum(losses),
+    )
+
+
+def _rsi_at(cache: _FeatureCache, end: int, window: int) -> float:
+    if window <= 0 or end < window:
+        return float("nan")
+    start = end + 1 - window
+    avg_gain = _window_mean(cache.gain_prefix, start, end)
+    avg_loss = _window_mean(cache.loss_prefix, start, end)
+    if avg_loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def _build_full_features(
+    cache: _FeatureCache,
+    index: int,
+    short_window: int,
+    long_window: int,
+) -> tuple[float, ...] | None:
+    closes = cache.closes
+    volumes = cache.volumes
+    close = closes[index]
+    short = _rolling_mean(cache.close_prefix, index, short_window)
+    long = _rolling_mean(cache.close_prefix, index, long_window)
+    ema = _ema(closes[max(0, index + 1 - (2 * long_window)): index + 1], long_window)
+    rsi = _rsi_at(cache, index, 14)
+    if not all(math.isfinite(value) for value in (short, long, ema, rsi)):
+        return None
+
+    momentum = _pct(close, closes[index - 1]) if index >= 1 else 0.0
+    momentum_3 = _pct(close, closes[index - 3]) if index >= 3 else 0.0
+    momentum_10 = _pct(close, closes[index - 10]) if index >= 10 else 0.0
+    momentum_20 = _pct(close, closes[index - 20]) if index >= 20 else 0.0
+    spread = _safe_div(short - long, long)
+
+    vol_moment = (
+        _window_mean(cache.abs_change_prefix, index - 19, index)
+        if index >= 20
+        else float("nan")
+    )
+    atr_count = min(14, index)
+    atr = _window_mean(cache.true_range_prefix, index - atr_count + 1, index)
+    rel_atr = _safe_div(atr, close)
+    ema_spread = _safe_div(ema - close, close)
+
+    prev_vol = _rolling_mean(cache.volume_prefix, index - 1, min(20, max(1, index)))
+    vol_ratio = _safe_div(volumes[index] - prev_vol, prev_vol)
+    prev_short = _rolling_mean(cache.close_prefix, index - 2, short_window)
+    trend_accel = _safe_div(short - prev_short, prev_short) if prev_short else 0.0
+    gap_average = _rolling_mean(cache.close_prefix, index, min(5, index + 1))
+    gap_to_vwap = _safe_div(close - gap_average, close)
+    vol_short = _rolling_mean(cache.volume_prefix, index, min(short_window, index + 1))
+    vol_long = _rolling_mean(cache.volume_prefix, index, min(long_window, index + 1))
+    volume_trend = _safe_div(vol_short - vol_long, vol_long)
+
+    return tuple(_safe_features([
+        momentum,
+        momentum_3,
+        momentum_10,
+        momentum_20,
+        spread,
+        rsi / 100.0,
+        ema_spread,
+        rel_atr,
+        vol_moment,
+        vol_ratio,
+        trend_accel,
+        gap_to_vwap,
+        volume_trend,
+    ]))
 
 
 def make_rows(
@@ -169,89 +303,34 @@ def make_rows(
     lookahead: int = 1,
     label_threshold: float = 0.001,
     enabled_features: Sequence[str] | None = None,
-) -> List[ModelRow]:
+) -> list[ModelRow]:
     if short_window <= 0 or long_window <= 0 or lookahead <= 0:
         raise ValueError("short_window, long_window, and lookahead must be positive")
     if long_window < short_window:
         raise ValueError("long_window must be greater than or equal to short_window")
 
     selected_indices = _feature_indices(enabled_features)
-    candles = [c for c in clean_candles(candles) if _valid_ohlcv(c)]
-    closes = [c.close for c in candles]
-    rows: List[ModelRow] = []
+    cache = _build_feature_cache(candles)
+    rows: list[ModelRow] = []
     min_window = max(long_window, short_window, lookahead + 2, 2 * long_window)
-    if len(candles) < min_window:
+    if len(cache.candles) < min_window:
         return rows
 
-    for i in range(long_window + lookahead, len(candles) - lookahead):
-        window = closes[: i + 1]
-        short = _sma(window, short_window)
-        long = _sma(window, long_window)
-        # Bound EMA history so training, backtests, and live runs agree when
-        # they use different candle-cache depths.
-        ema = _ema(window[-(2 * long_window):], long_window)
-        rsi = _rsi(window, 14)
-
-        if not all(math.isfinite(v) for v in (short, long, ema, rsi)):
+    for i in range(long_window + lookahead, len(cache.candles) - lookahead):
+        full_features = _build_full_features(cache, i, short_window, long_window)
+        if full_features is None:
             continue
-
-        momentum = _pct(window[-1], window[-2]) if i >= 1 else 0.0
-        momentum_3 = _pct(window[-1], window[-4]) if i >= 3 else 0.0
-        momentum_10 = _pct(window[-1], window[-11]) if i >= 10 else 0.0
-        momentum_20 = _pct(window[-1], window[-21]) if i >= 20 else 0.0
-
-        spread = _safe_div(short - long, long)
-
-        close_changes = [_pct(window[j], window[j - 1]) for j in range(1, i + 1)]
-        vol_moment = _sma([abs(v) for v in close_changes[max(0, len(close_changes) - 20):]], 20)
-        atr_window = [_true_range(candles[: i + 1], j) for j in range(1, i + 1)]
-        atr = _sma(atr_window, min(14, len(atr_window)))
-        rel_atr = _safe_div(atr, window[-1])
-
-        ema_spread = _safe_div(ema - window[-1], window[-1])
-
-        volume_window = [c.volume for c in candles[: i + 1]]
-        prev_vol = _sma(volume_window[:-1], min(20, max(1, i)))
-        vol_ratio = _safe_div(volume_window[-1] - prev_vol, prev_vol)
-
-        prev_short = _sma(window[:-2], short_window)
-        trend_accel = _safe_div(short - prev_short, prev_short) if prev_short else 0.0
-
-        gap_to_vwap = _safe_div(
-            window[-1] - _sma(window[max(0, len(window) - 5):], min(5, len(window))),
-            window[-1],
-        )
-
-        vol_short = _sma(volume_window[-short_window:], min(short_window, len(volume_window)))
-        vol_long = _sma(volume_window[-long_window:], min(long_window, len(volume_window)))
-        volume_trend = _safe_div(vol_short - vol_long, vol_long)
-
-        full_features = tuple(_safe_features([
-            momentum,
-            momentum_3,
-            momentum_10,
-            momentum_20,
-            spread,
-            rsi / 100.0,
-            ema_spread,
-            rel_atr,
-            vol_moment,
-            vol_ratio,
-            trend_accel,
-            gap_to_vwap,
-            volume_trend,
-        ]))
         features = tuple(full_features[index] for index in selected_indices)
 
-        future = closes[i + lookahead]
-        present = closes[i]
+        future = cache.closes[i + lookahead]
+        present = cache.closes[i]
         label = int(_pct(future, present) >= label_threshold)
-        rows.append(ModelRow(timestamp=candles[i].close_time, close=present, features=features, label=label))
+        rows.append(ModelRow(timestamp=cache.candles[i].close_time, close=present, features=features, label=label))
 
     return rows
 
 
 def make_rows_legacy(candles: Sequence[Candle], short_window: int, long_window: int,
-                     lookahead: int = 1) -> List[ModelRow]:
+                     lookahead: int = 1) -> list[ModelRow]:
     """Compatibility helper for existing integrations expecting 5-feature rows."""
     return make_rows(candles, short_window, long_window, lookahead=lookahead, label_threshold=0.001)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from simple_ai_bitcoin_trading_binance import external_signals as signals
 

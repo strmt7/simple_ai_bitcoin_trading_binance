@@ -202,21 +202,17 @@ class MarketDataStore:
         limit: int | None = None,
     ) -> list[Candle]:
         params: list[object] = [symbol.upper(), market_type, interval]
-        limit_sql = ""
-        if limit is not None:
-            limit_sql = " LIMIT ?"
-            params.append(max(0, int(limit)))
-        rows = self.connect().execute(
-            f"""
+        query = """
             SELECT open_time, open, high, low, close, volume, close_time,
                    quote_volume, trade_count, taker_buy_base_volume, taker_buy_quote_volume
             FROM candles
             WHERE symbol = ? AND market_type = ? AND interval = ?
             ORDER BY open_time DESC
-            {limit_sql}
-            """,
-            params,
-        ).fetchall()
+            """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self.connect().execute(query, params).fetchall()
         return [
             Candle(
                 open_time=int(row["open_time"]),

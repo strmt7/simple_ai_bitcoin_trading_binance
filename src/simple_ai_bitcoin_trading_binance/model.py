@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from statistics import mean, pstdev
 from typing import Iterable, List, Tuple
 
-from .features import FEATURE_VERSION, feature_dimension, ModelRow
+from .features import FEATURE_VERSION, ModelRow, feature_dimension as feature_dimension
 from .storage import write_json_atomic
 
 
@@ -781,7 +781,7 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
     means, stds = _collect_feature_stats(rows)
     normalized = _normalize_rows(rows, means, stds)
 
-    rng = random.Random(seed)
+    rng = random.Random(seed)  # nosec B311
     weights = [rng.uniform(-0.05, 0.05) for _ in range(feature_dim)]
     bias = 0.0
     class_weight_pos, class_weight_neg = _class_weights(rows)

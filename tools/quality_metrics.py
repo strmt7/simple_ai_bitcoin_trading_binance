@@ -7,7 +7,7 @@ import argparse
 import ast
 import json
 import re
-import subprocess
+import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -46,7 +46,7 @@ def _is_test_path(path: str) -> bool:
 
 
 def _run_git(args: list[str]) -> str:
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607
         ["git", *args],
         cwd=REPO_ROOT,
         check=True,

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 
-import pytest
 
 from simple_ai_bitcoin_trading_binance import training_suite
 from simple_ai_bitcoin_trading_binance.api import Candle

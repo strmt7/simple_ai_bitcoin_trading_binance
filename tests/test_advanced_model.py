@@ -76,6 +76,9 @@ def test_safe_helper_and_extras():
     closes = [100.0 + i for i in range(40)]
     features = am._extra_window_features(closes, (5, 10))
     assert len(features) == 6
+    assert am._extra_window_features([], (5, 10)) == [0.0] * 6
+    cache = am._build_window_cache(closes)
+    assert math.isnan(am._window_mean(cache.close_prefix, 2, 1))
 
 
 def test_nonlinear_expand_unknown_raises():
