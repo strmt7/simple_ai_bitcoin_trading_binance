@@ -66,6 +66,7 @@ def test_command_train_suite_missing_file(tmp_path, capsys):
         output_dir=str(tmp_path / "out"),
         starting_cash=1000.0,
         objective=None,
+        max_workers=None,
     )
     assert cli.command_train_suite(args) == 2
     err = capsys.readouterr().err
@@ -84,10 +85,11 @@ def test_command_train_suite_malformed_rows_and_limited_objectives(tmp_path, mon
             self.outcomes = []
             self.summary_path = tmp_path / "summary.json"
 
-    def fake_run(candles, strategy, *, objectives, market_type, starting_cash, output_dir):
+    def fake_run(candles, strategy, *, objectives, market_type, starting_cash, output_dir, max_workers):
         # assert malformed entries were skipped
         assert len(candles) == 1
         assert objectives == ("default",)
+        assert max_workers == 3
         return _Fake()
 
     monkeypatch.setattr(cli, "run_training_suite", fake_run, raising=False)
@@ -101,6 +103,7 @@ def test_command_train_suite_malformed_rows_and_limited_objectives(tmp_path, mon
         output_dir=str(tmp_path / "out"),
         starting_cash=1000.0,
         objective=["balanced"],
+        max_workers=3,
     )
     assert cli.command_train_suite(args) == 0
     out = capsys.readouterr().out
@@ -115,6 +118,7 @@ def test_command_train_suite_unknown_objective_is_clean_error(tmp_path, capsys):
         output_dir=str(tmp_path / "out"),
         starting_cash=1000.0,
         objective=["not-real"],
+        max_workers=None,
     )
     assert cli.command_train_suite(args) == 2
     err = capsys.readouterr().err
@@ -130,6 +134,9 @@ def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
             self.objective = name
             self.best_score = 0.12
             self.model_path = Path(f"/tmp/{name}.json")
+            self.decision_threshold = 0.58
+            self.threshold_source = "strategy"
+            self.explored_candidates = 432
 
     class _Report:
         def __init__(self):
@@ -149,6 +156,7 @@ def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
         output_dir=str(tmp_path / "out"),
         starting_cash=1000.0,
         objective=None,
+        max_workers=None,
     )
     assert cli.command_train_suite(args) == 0
     out = capsys.readouterr().out

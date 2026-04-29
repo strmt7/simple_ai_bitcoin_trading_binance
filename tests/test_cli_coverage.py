@@ -10,9 +10,20 @@ from types import SimpleNamespace
 import pytest
 
 from simple_ai_bitcoin_trading_binance import cli
+from simple_ai_bitcoin_trading_binance.advanced_model import (
+    advanced_feature_signature,
+    default_config_for,
+    make_advanced_rows,
+)
 from simple_ai_bitcoin_trading_binance.api import BinanceAPIError, Candle, SymbolConstraints
 from simple_ai_bitcoin_trading_binance.config import RuntimeConfig, load_strategy, save_runtime, save_strategy
-from simple_ai_bitcoin_trading_binance.model import ModelLoadError, TemporalValidationSplit, TrainedModel
+from simple_ai_bitcoin_trading_binance.model import (
+    ModelFeatureMismatchError,
+    ModelLoadError,
+    TemporalValidationSplit,
+    TrainedModel,
+    serialize_model,
+)
 from simple_ai_bitcoin_trading_binance.features import feature_signature
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
@@ -102,6 +113,8 @@ def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     assert roundtrip_args.yes is True
     train_args = cli._parse_args(["train", "--preset", "quick"])
     assert train_args.preset == "quick"
+    suite_args = cli._parse_args(["train-suite", "--max-workers", "2"])
+    assert suite_args.max_workers == 2
     report_default = cli._parse_args(["report"])
     assert report_default.doctor is True
     report_no_doctor = cli._parse_args(["report", "--no-doctor"])
@@ -517,6 +530,74 @@ def test_readiness_report_includes_feature_drift(tmp_path, monkeypatch) -> None:
     ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
     assert ok is False
     assert any("[fix] probability calibration" in line and "brier=0.420" in line for line in lines)
+
+
+def test_readiness_report_accepts_train_suite_advanced_model(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True))
+    strategy = StrategyConfig()
+    save_strategy(strategy)
+
+    candles = _simple_candles(320)
+    feature_cfg = default_config_for("default", strategy.enabled_features)
+    rows = make_advanced_rows(candles, feature_cfg)
+    assert rows
+    columns = list(zip(*(row.features for row in rows), strict=True))
+    means = [sum(values) / len(values) for values in columns]
+    stds = [
+        max(1e-6, math.sqrt(sum((value - mean) ** 2 for value in values) / len(values)))
+        for values, mean in zip(columns, means, strict=True)
+    ]
+
+    model = TrainedModel(
+        weights=[0.0] * len(rows[0].features),
+        bias=0.0,
+        feature_dim=len(rows[0].features),
+        epochs=1,
+        feature_means=means,
+        feature_stds=stds,
+        feature_signature=advanced_feature_signature(feature_cfg),
+    )
+
+    data_file = tmp_path / "history.json"
+    model_file = tmp_path / "model_default.json"
+    data_file.write_text("[]", encoding="utf-8")
+    serialize_model(model, model_file)
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: candles)
+
+    ok, lines = cli._readiness_report(input_path=str(data_file), model_path=str(model_file), online=False)
+
+    assert ok is True
+    assert any("[ok] model artifact" in line and "kind=advanced:default" in line for line in lines)
+    assert any("[ok] feature drift" in line for line in lines)
+
+
+def test_readiness_model_rejects_unknown_advanced_signature(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = StrategyConfig()
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+        feature_signature="advanced_version=unknown",
+    )
+    model_file = tmp_path / "model_unknown.json"
+    serialize_model(model, model_file)
+
+    assert cli._advanced_objective_for_model(model, strategy) is None
+
+    monkeypatch.setattr(
+        cli,
+        "_load_runtime_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ModelFeatureMismatchError("runtime mismatch")),
+    )
+    with pytest.raises(ModelFeatureMismatchError, match="runtime mismatch"):
+        cli._load_readiness_model(model_file, strategy)
 
 
 def test_build_order_notional_paths() -> None:

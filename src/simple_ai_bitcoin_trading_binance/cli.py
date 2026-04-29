@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence, TypeVar, cast
 
 from .api import BinanceAPIError, BinanceClient, Candle
+from .advanced_model import (
+    AdvancedFeatureConfig,
+    advanced_feature_signature,
+    default_config_for,
+    make_advanced_rows,
+)
 from .backtest import calibrate_threshold_for_backtest, risk_adjusted_backtest_score, run_backtest
 from .config import config_paths, load_runtime, load_strategy, prompt_runtime, save_runtime, save_strategy
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
@@ -43,6 +49,7 @@ from .model import (
     TrainedModel,
     walk_forward_report,
 )
+from .objective import available_objectives
 from .risk_controls import EntryRiskDecision, assess_entry_risk, build_risk_policy_report, render_risk_policy_report
 from . import risk_workflows
 from .storage import write_json_atomic
@@ -408,6 +415,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_train_suite.add_argument(
         "--objective", action="append", default=None,
         help="restrict suite to named objective(s); repeat to list multiple.",
+    )
+    parser_train_suite.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="parallel candidate workers; defaults to available CPU cores",
     )
     parser_train_suite.set_defaults(func=command_train_suite)
 
@@ -1012,11 +1025,11 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
     model_file = Path(model_path)
     if model_file.exists():
         try:
-            model = _load_runtime_model(model_file, strategy)
+            model, model_kind = _load_readiness_model(model_file, strategy)
         except (OSError, ModelFeatureMismatchError, ModelLoadError, ValueError) as exc:
             add(False, "model artifact", f"{model_file} is not usable with current strategy ({exc})")
         else:
-            add(True, "model artifact", f"{model_file} dim={model.feature_dim}")
+            add(True, "model artifact", f"{model_file} dim={model.feature_dim} kind={model_kind}")
             quality_score = getattr(model, "quality_score", None)
             if quality_score is not None:
                 warnings = list(getattr(model, "quality_warnings", []) or [])
@@ -1042,7 +1055,7 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
                     probability_detail,
                 )
             if candles is not None:
-                rows = _build_model_rows(candles, strategy)
+                rows = _readiness_model_rows(candles, strategy, model)
                 if rows:
                     drift = feature_drift_report(rows[-min(50, len(rows)):], model)
                     drift_warning = "; ".join(drift.warnings[:2]) or "none"
@@ -2069,6 +2082,48 @@ def _strategy_feature_signature(strategy: StrategyConfig) -> str:
         feature_version=strategy.feature_version,
         enabled_features=strategy.enabled_features,
     )
+
+
+def _advanced_objective_for_model(
+    model: TrainedModel,
+    strategy: StrategyConfig,
+) -> tuple[str, AdvancedFeatureConfig] | None:
+    model_signature = getattr(model, "feature_signature", None)
+    if not model_signature:
+        return None
+    for objective_name in available_objectives():
+        feature_cfg = default_config_for(objective_name, strategy.enabled_features)
+        if advanced_feature_signature(feature_cfg) == str(model_signature):
+            return objective_name, feature_cfg
+    return None
+
+
+def _load_readiness_model(model_path: Path, strategy: StrategyConfig) -> tuple[TrainedModel, str]:
+    try:
+        return _load_runtime_model(model_path, strategy), "runtime"
+    except ModelFeatureMismatchError as runtime_error:
+        model = load_model(
+            model_path,
+            expected_feature_version=strategy.feature_version,
+            expected_feature_dim=None,
+        )
+        advanced = _advanced_objective_for_model(model, strategy)
+        if advanced is None:
+            raise runtime_error
+        objective_name, _feature_cfg = advanced
+        return model, f"advanced:{objective_name}"
+
+
+def _readiness_model_rows(
+    candles: Sequence[Candle],
+    strategy: StrategyConfig,
+    model: TrainedModel,
+) -> list[ModelRow]:
+    advanced = _advanced_objective_for_model(model, strategy)
+    if advanced is not None:
+        _objective_name, feature_cfg = advanced
+        return make_advanced_rows(candles, feature_cfg)
+    return _build_model_rows(candles, strategy)
 
 
 def _load_runtime_model(model_path: Path, strategy: StrategyConfig) -> TrainedModel:
@@ -4259,6 +4314,7 @@ def command_train_suite(args: argparse.Namespace) -> int:
             market_type=runtime.market_type,
             starting_cash=args.starting_cash,
             output_dir=Path(args.output_dir),
+            max_workers=args.max_workers,
         )
     except ValueError as err:
         print(f"training suite failed: {err}", file=sys.stderr)
@@ -4267,7 +4323,9 @@ def command_train_suite(args: argparse.Namespace) -> int:
     for outcome in report.outcomes:
         print(
             f"  {outcome.objective:<14} score={outcome.best_score:+.4f} "
-            f"model={outcome.model_path}"
+            f"threshold={outcome.decision_threshold if outcome.decision_threshold is not None else 'n/a'} "
+            f"source={outcome.threshold_source or 'n/a'} "
+            f"candidates={outcome.explored_candidates} model={outcome.model_path}"
         )
     print(f"summary -> {report.summary_path}")
     return 0

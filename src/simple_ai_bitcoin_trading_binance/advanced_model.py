@@ -347,6 +347,8 @@ def train_advanced(
     learning_rate: float,
     l2_penalty: float,
     seed: int = 7,
+    validation_rows: Sequence[ModelRow] | None = None,
+    early_stopping_rounds: int | None = None,
 ) -> tuple[TrainedModel, AdvancedTrainingReport]:
     """Train a logistic regression on an expanded feature set.
 
@@ -364,6 +366,8 @@ def train_advanced(
         seed=seed,
         l2_penalty=l2_penalty,
         feature_signature=signature,
+        validation_rows=list(validation_rows or []),
+        early_stopping_rounds=early_stopping_rounds,
     )
     positives = sum(1 for row in rows if row.label == 1)
     report = AdvancedTrainingReport(
