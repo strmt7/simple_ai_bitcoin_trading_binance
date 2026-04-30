@@ -52,6 +52,7 @@ from .model import (
 from .objective import available_objectives
 from .risk_controls import EntryRiskDecision, assess_entry_risk, build_risk_policy_report, render_risk_policy_report
 from . import risk_workflows
+from .strategy_overrides import apply_model_strategy_overrides
 from .storage import write_json_atomic
 from .types import RuntimeConfig, StrategyConfig
 
@@ -1030,6 +1031,18 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
             add(False, "model artifact", f"{model_file} is not usable with current strategy ({exc})")
         else:
             add(True, "model artifact", f"{model_file} dim={model.feature_dim} kind={model_kind}")
+            effective_strategy = apply_model_strategy_overrides(strategy, model)
+            if effective_strategy.asdict() != strategy.asdict():
+                add(
+                    True,
+                    "model strategy overlay",
+                    (
+                        f"threshold={effective_strategy.signal_threshold:.3f} "
+                        f"risk={effective_strategy.risk_per_trade:.4f} "
+                        f"stop={effective_strategy.stop_loss_pct:.4f} "
+                        f"take={effective_strategy.take_profit_pct:.4f}"
+                    ),
+                )
             quality_score = getattr(model, "quality_score", None)
             if quality_score is not None:
                 warnings = list(getattr(model, "quality_warnings", []) or [])
@@ -1055,7 +1068,7 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
                     probability_detail,
                 )
             if candles is not None:
-                rows = _readiness_model_rows(candles, strategy, model)
+                rows = _readiness_model_rows(candles, effective_strategy, model)
                 if rows:
                     drift = feature_drift_report(rows[-min(50, len(rows)):], model)
                     drift_warning = "; ".join(drift.warnings[:2]) or "none"
@@ -2126,6 +2139,24 @@ def _readiness_model_rows(
     return _build_model_rows(candles, strategy)
 
 
+def _live_rows_for_model(
+    candles: Sequence[Candle],
+    strategy: StrategyConfig,
+    model: TrainedModel | None,
+) -> list[ModelRow]:
+    if model is None:
+        return _build_model_rows(candles, strategy)
+    return _readiness_model_rows(candles, strategy, model)
+
+
+def _live_model_feature_signature(model: TrainedModel | None, strategy: StrategyConfig) -> str:
+    if model is not None and _advanced_objective_for_model(model, strategy) is not None:
+        signature = getattr(model, "feature_signature", None)
+        if signature:
+            return str(signature)
+    return _strategy_feature_signature(strategy)
+
+
 def _load_runtime_model(model_path: Path, strategy: StrategyConfig) -> TrainedModel:
     strategy_signature = _strategy_feature_signature(strategy)
     return load_model(
@@ -2144,7 +2175,7 @@ def _load_live_start_model(
 ) -> tuple[TrainedModel | None, str | None, str | None]:
     if model_path.exists():
         try:
-            return _load_runtime_model(model_path, strategy), None, None
+            return _load_readiness_model(model_path, strategy)[0], None, None
         except (ModelLoadError, ModelFeatureMismatchError) as exc:
             if not effective_dry_run:
                 return None, f"Live mode requires a compatible model: {exc}", None
@@ -2253,6 +2284,7 @@ def _build_live_model(
     cfg: StrategyConfig,
     retrain_window: int,
     retrain_min_rows: int,
+    feature_signature: str | None = None,
 ) -> TrainedModel | None:
     if model is not None:
         if retrain_every <= 0:
@@ -2265,7 +2297,8 @@ def _build_live_model(
         return model
 
     epochs = max(20, int(cfg.training_epochs * 0.4))
-    return train(train_rows, epochs=epochs, feature_signature=_strategy_feature_signature(cfg))
+    signature = feature_signature or _strategy_feature_signature(cfg)
+    return train(train_rows, epochs=epochs, feature_signature=signature)
 
 
 def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str, threshold: float | None = None) -> int:
@@ -3406,12 +3439,13 @@ def command_backtest(args: argparse.Namespace) -> int:
     candles = _load_rows_for_command(args.input, label="Backtest data load failed")
     if candles is None:
         return 2
-    rows = _build_model_rows(candles, cfg)
     try:
-        model = _load_runtime_model(model_path, cfg)
+        model = _load_readiness_model(model_path, cfg)[0]
     except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
+    cfg = apply_model_strategy_overrides(cfg, model)
+    rows = _readiness_model_rows(candles, cfg, model)
     decision_threshold = model_decision_threshold(model, cfg.signal_threshold)
     result = run_backtest(rows, model, cfg, starting_cash=args.start_cash, market_type=runtime.market_type)
     artifact = {
@@ -3470,8 +3504,8 @@ def command_evaluate(args: argparse.Namespace) -> int:
     candles = _load_rows_for_command(args.input, label="Evaluation data load failed")
     if candles is None:
         return 2
-    rows = _build_model_rows(candles, cfg)
-    if not rows:
+    base_rows = _build_model_rows(candles, cfg)
+    if not base_rows:
         print("No rows available for evaluation. Fetch more data first.")
         return 2
 
@@ -3480,16 +3514,22 @@ def command_evaluate(args: argparse.Namespace) -> int:
         print(f"Model file not found: {model_path}")
         return 2
 
+    try:
+        model = _load_readiness_model(model_path, cfg)[0]
+    except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
+        print(f"Model load failed: {exc}", file=sys.stderr)
+        return 2
+    cfg = apply_model_strategy_overrides(cfg, model)
+    rows = _readiness_model_rows(candles, cfg, model)
+    if not rows:
+        print("No rows available for evaluation. Fetch more data first.")
+        return 2
+
     split = temporal_validation_split(rows)
     train_rows = split.train_rows
     calibration_rows = split.calibration_rows
     test_rows = split.validation_rows
 
-    try:
-        model = _load_runtime_model(model_path, cfg)
-    except (OSError, json.JSONDecodeError, ModelLoadError, ModelFeatureMismatchError) as exc:
-        print(f"Model load failed: {exc}", file=sys.stderr)
-        return 2
     threshold = model_decision_threshold(model, cfg.signal_threshold)
     if args.threshold is not None:
         threshold = float(args.threshold)
@@ -3653,12 +3693,8 @@ def command_live(args: argparse.Namespace) -> int:
         print("Choose either --paper or --live, not both.")
         return 2
     leverage_override = getattr(args, "leverage", None)
-    if leverage_override is not None:
-        requested = max(1.0, leverage_override)
-        if runtime.market_type == "futures":
-            cfg = StrategyConfig(**{**cfg.asdict(), "leverage": requested})
-        else:
-            print("Leverage override is spot-inactive; spot runs at 1x.")
+    if leverage_override is not None and runtime.market_type != "futures":
+        print("Leverage override is spot-inactive; spot runs at 1x.")
     external_override = getattr(args, "external_signals", None)
     if external_override is not None:
         cfg = StrategyConfig(**{**cfg.asdict(), "external_signals_enabled": bool(external_override)})
@@ -3679,6 +3715,20 @@ def command_live(args: argparse.Namespace) -> int:
     if not effective_dry_run and sleep_seconds < 1:
         print("Authenticated live mode uses minimum sleep=1s.")
         sleep_seconds = 1
+
+    model, model_error, model_notice = _load_live_start_model(model_path, cfg, effective_dry_run=effective_dry_run)
+    if model_error is not None:
+        print(model_error, file=sys.stderr)
+        return 2
+    if model is not None:
+        protected = ("leverage",) if leverage_override is not None else ()
+        cfg = apply_model_strategy_overrides(cfg, model, protected_keys=protected)
+    if leverage_override is not None and runtime.market_type == "futures":
+        cfg = StrategyConfig(**{**cfg.asdict(), "leverage": max(1.0, float(leverage_override))})
+    if external_override is not None:
+        cfg = StrategyConfig(**{**cfg.asdict(), "external_signals_enabled": bool(external_override)})
+    if model_notice is not None:
+        print(model_notice, file=sys.stderr)
 
     leverage = _resolve_futures_leverage(runtime, cfg)
     if runtime.market_type == "futures" and not effective_dry_run:
@@ -3714,13 +3764,6 @@ def command_live(args: argparse.Namespace) -> int:
     if not risk_policy.allowed:
         print(render_risk_policy_report(risk_policy), file=sys.stderr)
         return 2
-
-    model, model_error, model_notice = _load_live_start_model(model_path, cfg, effective_dry_run=effective_dry_run)
-    if model_error is not None:
-        print(model_error, file=sys.stderr)
-        return 2
-    if model_notice is not None:
-        print(model_notice, file=sys.stderr)
 
     mode_label = "paper" if effective_dry_run else "live"
     print(f"Starting {mode_label} loop for {args.steps} steps on {runtime.symbol} {runtime.interval} [{runtime.market_type}]")
@@ -3822,7 +3865,7 @@ def command_live(args: argparse.Namespace) -> int:
 
         steps_executed += 1
 
-        rows = _build_model_rows(candles, cfg)
+        rows = _live_rows_for_model(candles, cfg, model)
         if not rows:
             print("not enough historical data for live signal")
             live_events.append({"step": i + 1, "status": "no_rows"})
@@ -3850,6 +3893,7 @@ def command_live(args: argparse.Namespace) -> int:
             cfg=cfg,
             retrain_window=retrain_window,
             retrain_min_rows=retrain_min_rows,
+            feature_signature=_live_model_feature_signature(model, cfg),
         )
         if previous_model is None and model is not None:
             model_loads += 1
@@ -3864,7 +3908,7 @@ def command_live(args: argparse.Namespace) -> int:
             live_run["model_signature"] = str(model_signature) if model_signature else None
 
         if model is None:
-            model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
+            model = train(rows, epochs=40, feature_signature=_live_model_feature_signature(model, cfg))
             model_loads += 1
         latest = rows[-1]
         if hasattr(model, "feature_means") and hasattr(model, "feature_stds"):
@@ -3913,7 +3957,7 @@ def command_live(args: argparse.Namespace) -> int:
                 live_events.append({"step": i + 1, "status": "model_incompatible", "error": str(exc)})
                 break
             print(f"paper model incompatible; retraining: {exc}", file=sys.stderr)
-            model = train(rows, epochs=40, feature_signature=_strategy_feature_signature(cfg))
+            model = train(rows, epochs=40, feature_signature=_live_model_feature_signature(model, cfg))
             model_loads += 1
             raw_score = model.predict_proba(latest.features)
             threshold = model_decision_threshold(model, cfg.signal_threshold)
@@ -4325,6 +4369,8 @@ def command_train_suite(args: argparse.Namespace) -> int:
             f"  {outcome.objective:<14} score={outcome.best_score:+.4f} "
             f"threshold={outcome.decision_threshold if outcome.decision_threshold is not None else 'n/a'} "
             f"source={outcome.threshold_source or 'n/a'} "
+            f"validation={outcome.validation_score if outcome.validation_score is not None else 'n/a'} "
+            f"full={outcome.full_sample_score if outcome.full_sample_score is not None else 'n/a'} "
             f"candidates={outcome.explored_candidates} model={outcome.model_path}"
         )
     print(f"summary -> {report.summary_path}")

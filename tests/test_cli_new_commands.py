@@ -136,7 +136,9 @@ def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
             self.model_path = Path(f"/tmp/{name}.json")
             self.decision_threshold = 0.58
             self.threshold_source = "strategy"
-            self.explored_candidates = 432
+            self.validation_score = 0.13
+            self.full_sample_score = 0.11
+            self.explored_candidates = 1944
 
     class _Report:
         def __init__(self):

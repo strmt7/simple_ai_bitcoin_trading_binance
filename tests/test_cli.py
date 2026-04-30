@@ -243,7 +243,7 @@ def test_build_live_model_respects_existing_model_and_retrain_cadence(monkeypatc
     calls: list[tuple[list[int], int]] = []
 
     def fake_train(train_rows, *, epochs: int, **_kwargs):
-        calls.append((list(train_rows), epochs))
+        calls.append((list(train_rows), epochs, _kwargs.get("feature_signature")))
         return {"trained": True}
 
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.train", fake_train)
@@ -255,9 +255,10 @@ def test_build_live_model_respects_existing_model_and_retrain_cadence(monkeypatc
         cfg=cfg,
         retrain_window=5,
         retrain_min_rows=4,
+        feature_signature="custom-live-signature",
     )
     assert rebuilt == {"trained": True}
-    assert calls == [(rows[-5:], 40)]
+    assert calls == [(rows[-5:], 40, "custom-live-signature")]
 
 
 def test_build_live_model_returns_existing_when_rows_insufficient(monkeypatch) -> None:

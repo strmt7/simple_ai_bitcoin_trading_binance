@@ -52,6 +52,7 @@ from .objective import (
     get_objective,
     rank_candidates,
 )
+from .strategy_overrides import strategy_overrides_from_config
 from .types import StrategyConfig
 
 _DEFAULT_OUTPUT_DIR = Path("data")
@@ -74,6 +75,7 @@ class CandidateParams:
     take_profit_pct: float
     risk_per_trade: float
     confidence_beta: float = 0.85
+    seed: int = 7
 
     def asdict(self) -> dict[str, float | int]:
         return asdict(self)
@@ -101,6 +103,8 @@ class ObjectiveOutcome:
     calibration_score: float | None = None
     calibration_rows: int = 0
     validation_rows: int = 0
+    validation_score: float | None = None
+    full_sample_score: float | None = None
 
     def asdict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -162,13 +166,21 @@ def _strategy_for_candidate(base: StrategyConfig, candidate: CandidateParams,
     )
 
 
+def _attach_strategy_overrides(model: TrainedModel, strategy: StrategyConfig) -> TrainedModel:
+    """Persist execution parameters selected alongside the model weights."""
+
+    model.strategy_overrides = strategy_overrides_from_config(strategy)
+    return model
+
+
 def _candidate_grid(training: ObjectiveTraining) -> list[CandidateParams]:
     """Curated grid — broad enough for serious search without exploding runtime.
 
-    Three epochs × two lrs × two L2s × three thresholds × two stop/take profiles
-    × two risk levels × three confidence betas = 432 candidates before dedupe.
-    Collisions (e.g. ``learning_rate=0`` making both lr options identical) are
-    deduped; the tests rely on this behavior to verify the dedupe path.
+    Three epochs × two lrs × three L2s × three thresholds × two stop/take
+    profiles × three risk levels × three confidence betas × two SGD seeds =
+    1944 candidates before dedupe.  Collisions (e.g. ``learning_rate=0`` making
+    both lr options identical) are deduped; the tests rely on this behavior to
+    verify the dedupe path.
     """
 
     epoch_options = (
@@ -177,7 +189,7 @@ def _candidate_grid(training: ObjectiveTraining) -> list[CandidateParams]:
         max(training.epochs + 1, int(training.epochs * 1.5)),
     )
     lr_options = (training.learning_rate * 0.6, training.learning_rate)
-    l2_options = (training.l2_penalty, training.l2_penalty * 3.0)
+    l2_options = (training.l2_penalty * 0.3, training.l2_penalty, training.l2_penalty * 3.0)
     threshold_options = (
         training.signal_threshold - 0.03,
         training.signal_threshold,
@@ -187,13 +199,14 @@ def _candidate_grid(training: ObjectiveTraining) -> list[CandidateParams]:
         (training.stop_loss_pct, training.take_profit_pct),
         (training.stop_loss_pct * 0.75, training.take_profit_pct * 0.90),
     )
-    risk_options = (training.risk_per_trade * 0.75, training.risk_per_trade)
+    risk_options = (training.risk_per_trade * 0.50, training.risk_per_trade * 0.75, training.risk_per_trade)
     confidence_options = (0.75, 0.85, 1.0)
+    seed_options = (7, 11)
 
     candidates: list[CandidateParams] = []
-    for epochs, lr, l2, thr, stop_take, risk, confidence in product(
+    for epochs, lr, l2, thr, stop_take, risk, confidence, seed in product(
         epoch_options, lr_options, l2_options, threshold_options,
-        stop_take_options, risk_options, confidence_options,
+        stop_take_options, risk_options, confidence_options, seed_options,
     ):
         stop, take = stop_take
         candidates.append(CandidateParams(
@@ -205,6 +218,7 @@ def _candidate_grid(training: ObjectiveTraining) -> list[CandidateParams]:
             take_profit_pct=max(0.001, float(take)),
             risk_per_trade=max(0.0005, min(0.05, float(risk))),
             confidence_beta=max(0.0, min(1.0, float(confidence))),
+            seed=int(seed),
         ))
     # Deduplicate collisions produced by the arithmetic above.
     seen: set[tuple[float, ...]] = set()
@@ -249,25 +263,31 @@ def _calibrate_candidate_threshold(
 ) -> tuple[float, str, float | None]:
     if not rows:
         return strategy.signal_threshold, "strategy", None
-    threshold = calibrate_threshold(list(rows), model, start=0.05, end=0.95, steps=61)
-    source = "classification_f1"
-    baseline_report = evaluate_classification(list(rows), model, threshold=threshold)
+    strategy_threshold = float(strategy.signal_threshold)
+    classification_threshold = calibrate_threshold(list(rows), model, start=0.05, end=0.95, steps=61)
+    baseline_report = evaluate_classification(list(rows), model, threshold=strategy_threshold)
     profit_report = calibrate_threshold_for_backtest(
         list(rows),
         model,
         strategy,
         starting_cash=starting_cash,
         market_type=market_type,
-        baseline_threshold=threshold,
+        baseline_threshold=strategy_threshold,
         start=0.05,
         end=0.95,
         steps=121,
     )
     candidate_report = evaluate_classification(list(rows), model, threshold=profit_report.best_threshold)
     if profit_report.accepted and _threshold_guard(baseline_report, candidate_report):
-        threshold = profit_report.threshold
-        source = "profit_backtest"
-    return float(threshold), source, float(profit_report.score)
+        return float(profit_report.threshold), "profit_backtest", float(profit_report.score)
+    classification_report = evaluate_classification(list(rows), model, threshold=classification_threshold)
+    if (
+        abs(float(classification_threshold) - strategy_threshold) > 1e-12
+        and profit_report.baseline_score >= 0.0
+        and _threshold_guard(baseline_report, classification_report)
+    ):
+        return float(classification_threshold), "classification_f1", float(profit_report.baseline_score)
+    return strategy_threshold, "strategy", float(profit_report.baseline_score)
 
 
 def _walk_forward_split(rows: Sequence[ModelRow], *, eval_ratio: float = 0.25) -> tuple[list[ModelRow], list[ModelRow]]:
@@ -331,6 +351,7 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
         epochs=candidate.epochs,
         learning_rate=candidate.learning_rate,
         l2_penalty=candidate.l2_penalty,
+        seed=candidate.seed,
         validation_rows=calibration_rows,
         early_stopping_rounds=max(10, min(40, int(candidate.epochs) // 8)) if calibration_rows else None,
     )
@@ -363,9 +384,19 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         model.decision_threshold = float(strategy.signal_threshold)
         model.threshold_source = "strategy"
+    _attach_strategy_overrides(model, strategy)
     model.validation_size = len(rows_eval)
     result = run_backtest(rows_eval, model, strategy, starting_cash=starting_cash, market_type=market_type)
-    score = objective.score(result) if objective.accepts(result) else float("-inf")
+    validation_score = objective.score(result) if objective.accepts(result) else float("-inf")
+    full_result = run_backtest(
+        rows_train + rows_eval,
+        model,
+        strategy,
+        starting_cash=starting_cash,
+        market_type=market_type,
+    )
+    full_sample_score = objective.score(full_result) if objective.accepts(full_result) else float("-inf")
+    score = min(validation_score, full_sample_score)
     selected_calibration_rows = len(calibration_rows)
 
     if calibration_rows:
@@ -375,9 +406,11 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
             epochs=candidate.epochs,
             learning_rate=candidate.learning_rate,
             l2_penalty=candidate.l2_penalty,
+            seed=candidate.seed,
         )
         fallback_model.decision_threshold = float(strategy.signal_threshold)
         fallback_model.threshold_source = "strategy_full_fit"
+        _attach_strategy_overrides(fallback_model, strategy)
         fallback_model.validation_size = len(rows_eval)
         fallback_result = run_backtest(
             rows_eval,
@@ -386,17 +419,32 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
             starting_cash=starting_cash,
             market_type=market_type,
         )
-        fallback_score = (
+        fallback_validation_score = (
             objective.score(fallback_result)
             if objective.accepts(fallback_result)
             else float("-inf")
         )
+        fallback_full_result = run_backtest(
+            rows_train + rows_eval,
+            fallback_model,
+            strategy,
+            starting_cash=starting_cash,
+            market_type=market_type,
+        )
+        fallback_full_score = (
+            objective.score(fallback_full_result)
+            if objective.accepts(fallback_full_result)
+            else float("-inf")
+        )
+        fallback_score = min(fallback_validation_score, fallback_full_score)
         if fallback_score > score + 1e-12:
             score = fallback_score
             model = fallback_model
             report = fallback_report
             threshold_score = None
             selected_calibration_rows = 0
+            validation_score = fallback_validation_score
+            full_sample_score = fallback_full_score
 
     return {
         "score": float(score),
@@ -410,6 +458,8 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
         "threshold_score": threshold_score,
         "calibration_rows": selected_calibration_rows,
         "validation_rows": len(rows_eval),
+        "validation_score": float(validation_score),
+        "full_sample_score": float(full_sample_score),
     }
 
 
@@ -465,6 +515,7 @@ def train_for_objective(
                 objective, candidate, rows, base_strategy, feature_cfg,
                 market_type, starting_cash,
             )
+            _attach_strategy_overrides(model, strategy)
             results.append({
                 "score": float(score),
                 "candidate": candidate,
@@ -477,6 +528,8 @@ def train_for_objective(
                 "threshold_score": getattr(model, "threshold_calibration_score", None),
                 "calibration_rows": int(getattr(model, "calibration_size", 0)),
                 "validation_rows": len(eval_rows),
+                "validation_score": float(score),
+                "full_sample_score": None,
             })
     else:
         payloads = [
@@ -538,6 +591,16 @@ def train_for_objective(
         ),
         calibration_rows=int(best.get("calibration_rows", 0)),
         validation_rows=int(best.get("validation_rows", 0)),
+        validation_score=(
+            float(best["validation_score"])
+            if best.get("validation_score") is not None
+            else None
+        ),
+        full_sample_score=(
+            float(best["full_sample_score"])
+            if best.get("full_sample_score") is not None
+            else None
+        ),
     )
 
 

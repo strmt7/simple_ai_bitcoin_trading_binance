@@ -10,6 +10,7 @@ from typing import Sequence
 import pytest
 
 from simple_ai_bitcoin_trading_binance.api import Candle
+from simple_ai_bitcoin_trading_binance.backtest import BacktestResult
 from simple_ai_bitcoin_trading_binance.backtest_panel import (
     BacktestRequest,
     PanelListing,
@@ -367,6 +368,60 @@ def test_run_panel_end_to_end_with_objective(tmp_path: Path) -> None:
     # score is a float, accepted is bool
     assert isinstance(data["objective"]["score"], (int, float))
     assert isinstance(data["objective"]["accepted"], bool)
+
+
+def test_run_panel_applies_loaded_model_strategy_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    req = BacktestRequest(
+        interval="5m",
+        market_type="spot",
+        model_path="model.json",
+        data_path="ignored",
+        starting_cash=1000.0,
+        objective=None,
+        tag="overlay",
+    )
+    model = _zero_model(13)
+    model.strategy_overrides = {
+        "risk_per_trade": 0.005,
+        "signal_threshold": 0.64,
+        "take_profit_pct": 0.04,
+    }
+    captured: dict[str, float] = {}
+
+    def fake_run_backtest(rows, loaded_model, strategy, **kwargs):
+        captured["risk"] = strategy.risk_per_trade
+        captured["threshold"] = strategy.signal_threshold
+        captured["take"] = strategy.take_profit_pct
+        return BacktestResult(
+            starting_cash=1000.0,
+            ending_cash=1001.0,
+            realized_pnl=1.0,
+            win_rate=1.0,
+            trades=1,
+            max_drawdown=0.0,
+            closed_trades=1,
+            gross_exposure=10.0,
+            total_fees=0.1,
+            stopped_by_drawdown=False,
+            max_exposure=10.0,
+            trades_per_day_cap_hit=0,
+        )
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.backtest_panel.run_backtest", fake_run_backtest)
+
+    run_panel(
+        req,
+        StrategyConfig(risk_per_trade=0.02, signal_threshold=0.58, take_profit_pct=0.03),
+        candles_loader=lambda _path: _synthetic_candles(n=300),
+        model_loader=lambda _path: model,
+        report_dir=tmp_path / "reports",
+        clock=lambda: 1_700_000_000.0,
+    )
+
+    assert captured == {"risk": 0.005, "threshold": 0.64, "take": 0.04}
 
 
 def test_run_panel_rejects_mismatched_model_dimension(tmp_path: Path) -> None:

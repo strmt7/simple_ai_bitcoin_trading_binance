@@ -600,6 +600,148 @@ def test_readiness_model_rejects_unknown_advanced_signature(
         cli._load_readiness_model(model_file, strategy)
 
 
+def test_live_helpers_accept_train_suite_advanced_model(tmp_path) -> None:
+    strategy = StrategyConfig()
+    candles = _simple_candles(320)
+    feature_cfg = default_config_for("default", strategy.enabled_features)
+    advanced_rows = make_advanced_rows(candles, feature_cfg)
+    assert advanced_rows
+
+    model = TrainedModel(
+        weights=[0.0] * len(advanced_rows[0].features),
+        bias=0.0,
+        feature_dim=len(advanced_rows[0].features),
+        epochs=1,
+        feature_means=[0.0] * len(advanced_rows[0].features),
+        feature_stds=[1.0] * len(advanced_rows[0].features),
+        feature_signature=advanced_feature_signature(feature_cfg),
+    )
+    model_file = tmp_path / "model_default.json"
+    serialize_model(model, model_file)
+
+    loaded, error, notice = cli._load_live_start_model(model_file, strategy, effective_dry_run=False)
+
+    assert error is None
+    assert notice is None
+    assert loaded is not None
+    assert loaded.feature_signature == model.feature_signature
+    live_rows = cli._live_rows_for_model(candles, strategy, loaded)
+    assert live_rows
+    assert len(live_rows[0].features) == loaded.feature_dim
+    assert cli._live_model_feature_signature(loaded, strategy) == model.feature_signature
+
+    base_rows = cli._live_rows_for_model(candles, strategy, None)
+    assert base_rows
+    assert len(base_rows[0].features) == len(strategy.enabled_features)
+    assert cli._live_model_feature_signature(None, strategy) == cli._strategy_feature_signature(strategy)
+
+
+def test_evaluate_and_backtest_accept_train_suite_advanced_model(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    strategy = StrategyConfig()
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(strategy)
+    candles = _simple_candles(320)
+    feature_cfg = default_config_for("default", strategy.enabled_features)
+    rows = make_advanced_rows(candles, feature_cfg)
+    assert rows
+    data_file = tmp_path / "history.json"
+    data_file.write_text(
+        json.dumps([
+            {
+                "open_time": candle.open_time,
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+                "volume": candle.volume,
+                "close_time": candle.close_time,
+            }
+            for candle in candles
+        ]),
+        encoding="utf-8",
+    )
+    model_file = tmp_path / "model_default.json"
+    serialize_model(
+        TrainedModel(
+            weights=[0.0] * len(rows[0].features),
+            bias=0.0,
+            feature_dim=len(rows[0].features),
+            epochs=1,
+            feature_means=[0.0] * len(rows[0].features),
+            feature_stds=[1.0] * len(rows[0].features),
+            feature_signature=advanced_feature_signature(feature_cfg),
+            strategy_overrides={"risk_per_trade": 0.005, "signal_threshold": 0.64},
+        ),
+        model_file,
+    )
+
+    assert cli.command_evaluate(
+        argparse.Namespace(
+            input=str(data_file),
+            model=str(model_file),
+            threshold=None,
+            calibrate_threshold=False,
+        )
+    ) == 0
+    assert cli.command_backtest(
+        argparse.Namespace(input=str(data_file), model=str(model_file), start_cash=1000.0)
+    ) == 0
+
+
+def test_command_live_applies_model_strategy_overrides_before_risk_policy(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot"))
+    save_strategy(StrategyConfig(risk_per_trade=0.02, signal_threshold=0.58, take_profit_pct=0.03))
+    model = TrainedModel(
+        weights=[0.0] * 13,
+        bias=0.0,
+        feature_dim=13,
+        epochs=1,
+        feature_means=[0.0] * 13,
+        feature_stds=[1.0] * 13,
+        strategy_overrides={
+            "risk_per_trade": 0.005,
+            "signal_threshold": 0.64,
+            "take_profit_pct": 0.04,
+        },
+    )
+    captured: dict[str, float] = {}
+
+    def fake_policy(runtime, strategy, **kwargs):
+        captured["risk"] = strategy.risk_per_trade
+        captured["threshold"] = strategy.signal_threshold
+        captured["take"] = strategy.take_profit_pct
+        return SimpleNamespace(allowed=True, warning_count=0)
+
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FakeClient())
+    monkeypatch.setattr(cli, "_load_live_start_model", lambda *_args, **_kwargs: (model, None, None))
+    monkeypatch.setattr(cli, "_resolve_symbol_constraints", lambda *_args, **_kwargs: SymbolConstraints("BTCUSDC", 0.00001, 1.0, 0.00001, 5.0, 1000.0))
+    monkeypatch.setattr(cli, "build_risk_policy_report", fake_policy)
+    monkeypatch.setattr(cli, "build_live_run_payload", lambda **kwargs: {"events": []})
+    monkeypatch.setattr(cli, "_persist_run_artifact", lambda *_args, **_kwargs: tmp_path / "live.json")
+
+    assert cli.command_live(
+        argparse.Namespace(
+            steps=0,
+            sleep=0,
+            paper=True,
+            live=False,
+            model=str(tmp_path / "model.json"),
+            leverage=None,
+            retrain_interval=0,
+            retrain_window=300,
+            retrain_min_rows=240,
+            external_signals=None,
+        )
+    ) == 0
+
+    assert captured == {"risk": 0.005, "threshold": 0.64, "take": 0.04}
+
+
 def test_build_order_notional_paths() -> None:
     cfg = StrategyConfig(risk_per_trade=0.1, max_position_pct=0.4, leverage=3.0)
     client = SimpleNamespace(
@@ -1942,10 +2084,24 @@ def test_command_live_futures_leverage_failure_returns_nonzero(tmp_path, monkeyp
 
     monkeypatch.setenv("HOME", str(tmp_path))
     save_runtime(RuntimeConfig(testnet=True, dry_run=False, market_type="futures", api_key="k", api_secret="s"))
-    save_strategy(StrategyConfig(leverage=5.0))
+    strategy = StrategyConfig(leverage=5.0)
+    save_strategy(strategy)
+    model_file = tmp_path / "model.json"
+    serialize_model(
+        TrainedModel(
+            weights=[0.0] * 13,
+            bias=0.0,
+            feature_dim=13,
+            epochs=1,
+            feature_means=[0.0] * 13,
+            feature_stds=[1.0] * 13,
+            feature_signature=cli._strategy_feature_signature(strategy),
+        ),
+        model_file,
+    )
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _FailLeverageClient())
     monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 5.0)
-    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 2
+    assert cli.command_live(argparse.Namespace(steps=1, sleep=0, paper=False, model=str(model_file), leverage=None, retrain_interval=0, retrain_window=300, retrain_min_rows=240)) == 2
     assert "Failed to set leverage" in capsys.readouterr().err
 
 
@@ -2139,7 +2295,7 @@ def test_command_live_blocks_failed_feature_drift(tmp_path, monkeypatch, capsys)
     row = SimpleNamespace(
         timestamp=60_000,
         close=100.0,
-        features=(9.0,) + (0.0,) * (feature_count - 1),
+        features=(13.0,) + (0.0,) * (feature_count - 1),
         label=1,
     )
     model = TrainedModel(

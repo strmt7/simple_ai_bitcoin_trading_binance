@@ -11,6 +11,7 @@ from typing import Any, Iterable, List, Sequence, Tuple
 
 from .features import FEATURE_VERSION, ModelRow, feature_dimension as _feature_dimension
 from .storage import write_json_atomic
+from .strategy_overrides import StrategyOverrideValue, clean_strategy_overrides
 
 
 def feature_dimension(enabled_features: Sequence[str] | None = None) -> int:
@@ -67,6 +68,7 @@ class TrainedModel:
     threshold_calibration_score: float | None = None
     threshold_calibration_pnl: float | None = None
     threshold_calibration_trades: int = 0
+    strategy_overrides: dict[str, StrategyOverrideValue] = field(default_factory=dict)
 
     def _normalize(self, features: Tuple[float, ...]) -> Tuple[float, ...]:
         if len(features) != self.feature_dim:
@@ -661,9 +663,14 @@ def feature_drift_report(
     outlier_fraction = outliers / len(z_values) if z_values else 0.0
 
     status = "ok"
-    if max_abs_z >= fail_z:
+    catastrophic_outlier = max_abs_z >= fail_z * 1.5
+    broad_hard_outliers = max_abs_z >= fail_z and outlier_fraction >= outlier_warn_fraction
+    if catastrophic_outlier or broad_hard_outliers:
         warnings.append("feature drift exceeds hard threshold")
         status = "fail"
+    elif max_abs_z >= fail_z:
+        warnings.append("isolated feature drift exceeds hard threshold")
+        status = "warn"
     elif max_abs_z >= warn_z:
         warnings.append("feature drift exceeds warning threshold")
         status = "warn"
@@ -1130,4 +1137,5 @@ def load_model(
             else None
         ),
         threshold_calibration_trades=int(payload.get("threshold_calibration_trades", 0) or 0),
+        strategy_overrides=clean_strategy_overrides(payload.get("strategy_overrides", {})),
     )

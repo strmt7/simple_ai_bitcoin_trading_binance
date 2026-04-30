@@ -27,6 +27,7 @@ from .features import ModelRow, make_rows
 from .intervals import interval_minutes, supported_intervals, validate_interval
 from .model import ModelLoadError, TrainedModel, load_model
 from .objective import ObjectiveSpec, get_objective
+from .strategy_overrides import apply_model_strategy_overrides
 from .types import StrategyConfig
 
 _REPORT_DIR = Path("data/backtests")
@@ -247,6 +248,7 @@ def run_panel(
             enabled_features=strategy.enabled_features,
         )
     model, loaded, resolved = _load_model_or_baseline(request.model_path, rows, model_loader)
+    effective_strategy = apply_model_strategy_overrides(strategy, model) if loaded else strategy
     if rows and int(getattr(model, "feature_dim", 0)) != len(rows[0].features):
         raise ValueError(
             "model feature dimension "
@@ -258,7 +260,7 @@ def run_panel(
     result = run_backtest(
         rows,
         model,
-        strategy,
+        effective_strategy,
         starting_cash=request.starting_cash,
         market_type=request.market_type,
     )

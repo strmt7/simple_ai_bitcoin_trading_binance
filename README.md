@@ -152,8 +152,13 @@ number of fresh providers; negative signals can reduce score and risk sizing.
 
 Training is parallelized across a `ProcessPoolExecutor` (defaults to
 `os.cpu_count()`).  Feature expansion is computed once per objective and
-shared across every candidate in the hyperparameter grid; the full 3-objective
-suite on ~500 candles runs in seconds on a modern laptop.
+shared across every candidate in the hyperparameter grid.  Each objective now
+searches 1,944 candidates across epochs, learning rate, L2 strength, threshold,
+stop/take profile, risk sizing, confidence shrinkage, and SGD seed, then keeps
+a full-fit fallback when held-out calibration would reduce the objective score.
+The chosen model artifact also persists the selected execution overlay
+(threshold, risk size, stops/takes, fees, cooldown, and confidence shrinkage) so
+`backtest-panel`, readiness checks, and live startup reproduce the suite result.
 
 ### Backtest panel (independent)
 

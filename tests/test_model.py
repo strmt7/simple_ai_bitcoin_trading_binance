@@ -65,6 +65,7 @@ def test_load_model_backwards_compatibility(tmp_path: Path) -> None:
     assert model.decision_threshold is None
     assert model.calibration_size == 0
     assert model.validation_size == 0
+    assert model.strategy_overrides == {}
 
 
 def test_load_model_rejects_mismatched_version(tmp_path: Path) -> None:
@@ -238,6 +239,11 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
         threshold_calibration_score=12.3,
         threshold_calibration_pnl=4.5,
         threshold_calibration_trades=6,
+        strategy_overrides={
+            "risk_per_trade": 0.005,
+            "signal_threshold": 0.63,
+            "take_profit_pct": 0.04,
+        },
     )
     from simple_ai_bitcoin_trading_binance.model import serialize_model
 
@@ -255,6 +261,11 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
     assert loaded.threshold_calibration_score == 12.3
     assert loaded.threshold_calibration_pnl == 4.5
     assert loaded.threshold_calibration_trades == 6
+    assert loaded.strategy_overrides == {
+        "risk_per_trade": 0.005,
+        "signal_threshold": 0.63,
+        "take_profit_pct": 0.04,
+    }
     assert confidence_adjusted_probability(0.9, 0.5) == 0.7
     assert confidence_adjusted_probability(0.1, 0.5) == 0.3
     assert confidence_adjusted_probability("bad", 0.5) == 0.5
@@ -267,6 +278,35 @@ def test_decision_threshold_metadata_and_confidence_adjustment(tmp_path: Path) -
     assert model_decision_threshold(loaded, float("nan")) == 0.5
     loaded.decision_threshold = "bad"
     assert model_decision_threshold(loaded, 0.55) == 0.55
+
+
+def test_load_model_sanitizes_strategy_overrides(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.json"
+    model_payload = {
+        "weights": [0.1],
+        "feature_version": "v1",
+        "bias": 0.01,
+        "feature_dim": 1,
+        "epochs": 3,
+        "feature_means": [1.0],
+        "feature_stds": [1.0],
+        "strategy_overrides": {
+            "risk_per_trade": 0.004,
+            "signal_threshold": "0.7",
+            "feature_windows": [1, 2],
+            "take_profit_pct": float("nan"),
+            "cooldown_minutes": 3,
+            "max_trades_per_day": True,
+        },
+    }
+    model_path.write_text(json.dumps(model_payload), encoding="utf-8")
+
+    loaded = load_model(model_path, expected_feature_dim=1)
+
+    assert loaded.strategy_overrides == {
+        "risk_per_trade": 0.004,
+        "cooldown_minutes": 3,
+    }
 
 
 def test_temperature_calibration_softens_overconfident_probabilities() -> None:
