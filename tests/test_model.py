@@ -21,6 +21,7 @@ from simple_ai_bitcoin_trading_binance.model import (
     train,
     walk_forward_report,
 )
+from simple_ai_bitcoin_trading_binance.strategy_overrides import clean_strategy_overrides
 
 
 def _rows() -> list[ModelRow]:
@@ -307,6 +308,7 @@ def test_load_model_sanitizes_strategy_overrides(tmp_path: Path) -> None:
         "risk_per_trade": 0.004,
         "cooldown_minutes": 3,
     }
+    assert clean_strategy_overrides(["not", "a", "dict"]) == {}
 
 
 def test_temperature_calibration_softens_overconfident_probabilities() -> None:

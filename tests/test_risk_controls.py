@@ -40,6 +40,13 @@ def test_risk_policy_blocks_mainnet_live_missing_credentials_and_zero_cash(tmp_p
     assert labels["model path"] == "block"
     assert report.asdict()["allowed"] is False
 
+    demo = build_risk_policy_report(
+        RuntimeConfig(testnet=False, demo=True, dry_run=False, api_key="k", api_secret="s"),
+        StrategyConfig(),
+        effective_dry_run=False,
+    )
+    assert any(check.label == "execution environment" and "demo endpoint" in check.detail for check in demo.checks)
+
 
 def test_risk_policy_warns_on_aggressive_but_possible_settings(tmp_path) -> None:
     model_path = tmp_path / "model.json"

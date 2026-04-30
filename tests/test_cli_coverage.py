@@ -24,7 +24,7 @@ from simple_ai_bitcoin_trading_binance.model import (
     TrainedModel,
     serialize_model,
 )
-from simple_ai_bitcoin_trading_binance.features import feature_signature
+from simple_ai_bitcoin_trading_binance.features import ModelRow, feature_signature
 from simple_ai_bitcoin_trading_binance.types import StrategyConfig
 
 
@@ -557,6 +557,7 @@ def test_readiness_report_accepts_train_suite_advanced_model(tmp_path, monkeypat
         feature_means=means,
         feature_stds=stds,
         feature_signature=advanced_feature_signature(feature_cfg),
+        strategy_overrides={"risk_per_trade": 0.005, "signal_threshold": 0.64},
     )
 
     data_file = tmp_path / "history.json"
@@ -569,6 +570,7 @@ def test_readiness_report_accepts_train_suite_advanced_model(tmp_path, monkeypat
 
     assert ok is True
     assert any("[ok] model artifact" in line and "kind=advanced:default" in line for line in lines)
+    assert any("[ok] model strategy overlay" in line and "risk=0.0050" in line for line in lines)
     assert any("[ok] feature drift" in line for line in lines)
 
 
@@ -687,6 +689,42 @@ def test_evaluate_and_backtest_accept_train_suite_advanced_model(tmp_path, monke
     assert cli.command_backtest(
         argparse.Namespace(input=str(data_file), model=str(model_file), start_cash=1000.0)
     ) == 0
+
+
+def test_command_evaluate_reports_no_rows_after_model_specific_row_build(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_runtime(RuntimeConfig())
+    save_strategy(StrategyConfig())
+    model_file = tmp_path / "model.json"
+    model_file.write_text("{}", encoding="utf-8")
+    row = ModelRow(1, 100.0, (0.0,), 1)
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+    )
+
+    monkeypatch.setattr(cli, "_load_rows_for_command", lambda *_args, **_kwargs: [object()])
+    monkeypatch.setattr(cli, "_build_model_rows", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(cli, "_load_readiness_model", lambda *_args, **_kwargs: (model, "runtime"))
+    monkeypatch.setattr(cli, "_readiness_model_rows", lambda *_args, **_kwargs: [])
+
+    assert cli.command_evaluate(
+        argparse.Namespace(
+            input="history.json",
+            model=str(model_file),
+            threshold=None,
+            calibrate_threshold=False,
+        )
+    ) == 2
+    assert "No rows available" in capsys.readouterr().out
 
 
 def test_command_live_applies_model_strategy_overrides_before_risk_policy(

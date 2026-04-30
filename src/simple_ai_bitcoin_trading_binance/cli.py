@@ -2151,9 +2151,7 @@ def _live_rows_for_model(
 
 def _live_model_feature_signature(model: TrainedModel | None, strategy: StrategyConfig) -> str:
     if model is not None and _advanced_objective_for_model(model, strategy) is not None:
-        signature = getattr(model, "feature_signature", None)
-        if signature:
-            return str(signature)
+        return str(model.feature_signature)
     return _strategy_feature_signature(strategy)
 
 
