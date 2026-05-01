@@ -139,6 +139,8 @@ def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
             self.validation_score = 0.13
             self.full_sample_score = 0.11
             self.ensemble_refined = True
+            self.ensemble_refinement_candidates = 3
+            self.local_refinement_candidates = 10
             self.explored_candidates = 1944
 
     class _Report:
@@ -165,6 +167,8 @@ def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "default" in out
     assert "ensemble=yes" in out
+    assert "local_checks=10" in out
+    assert "ensemble_checks=3" in out
 
 
 # --------------------------------------------------------------------------- #

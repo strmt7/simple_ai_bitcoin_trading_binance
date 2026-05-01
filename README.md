@@ -158,14 +158,18 @@ stop/take profile, risk sizing, confidence shrinkage, and SGD seed, then keeps
 a full-fit fallback when held-out calibration would reduce the objective score.
 The default objective expands pairwise interactions across all enabled base
 features, which improved the verified BTCUSDC benchmark objective from
-`0.0795225461` to `0.0848076422` on the 619-candle testnet sample used during
-this pass.
+`0.0795225461` to `0.0848076422` on the 619-candle testnet sample. The local
+refinement pass then selected a smaller risk size and raised the same objective
+to `0.0849038204` without changing the base grid size.
 The chosen model artifact also persists the selected execution overlay
 (threshold, risk size, stops/takes, fees, cooldown, and confidence shrinkage) so
 `backtest-panel`, readiness checks, and live startup reproduce the suite result.
-After the best candidate is found, the suite also tests a small seed ensemble
-for that candidate and only promotes it when the same validation/full-sample
-objective score improves.
+After the base grid is ranked, the suite probes a small local neighborhood
+around the winner so boundary candidates can be improved without expanding the
+whole grid.
+After ranking the base grid, the suite also tests small seed ensembles across
+the top candidates and only promotes an ensemble when the same
+validation/full-sample objective score improves.
 
 ### Backtest panel (independent)
 

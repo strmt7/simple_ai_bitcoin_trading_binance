@@ -19,7 +19,6 @@ spawning subprocesses.
 
 from __future__ import annotations
 
-import json
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -36,7 +35,7 @@ from .advanced_model import (
     train_advanced,
 )
 from .api import Candle
-from .backtest import calibrate_threshold_for_backtest, run_backtest
+from .backtest import BacktestResult, calibrate_threshold_for_backtest, run_backtest
 from .features import ModelRow
 from .model import (
     TrainedModel,
@@ -53,9 +52,11 @@ from .objective import (
     rank_candidates,
 )
 from .strategy_overrides import strategy_overrides_from_config
+from .storage import write_json_atomic
 from .types import StrategyConfig
 
 _DEFAULT_OUTPUT_DIR = Path("data")
+_ENSEMBLE_REFINEMENT_CANDIDATES = 3
 
 
 # ==========================================================================
@@ -106,6 +107,8 @@ class ObjectiveOutcome:
     validation_score: float | None = None
     full_sample_score: float | None = None
     ensemble_refined: bool = False
+    ensemble_refinement_candidates: int = 0
+    local_refinement_candidates: int = 0
 
     def asdict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -302,6 +305,43 @@ def _walk_forward_split(rows: Sequence[ModelRow], *, eval_ratio: float = 0.25) -
 def _ensemble_seed_pack(seed: int) -> tuple[int, int, int]:
     base = int(seed)
     return base, base + 17, base + 37
+
+
+def _candidate_variant(candidate: CandidateParams, **updates: float) -> CandidateParams:
+    payload = candidate.asdict()
+    payload.update(updates)
+    return CandidateParams(
+        epochs=max(1, int(payload["epochs"])),
+        learning_rate=max(1e-6, float(payload["learning_rate"])),
+        l2_penalty=max(0.0, float(payload["l2_penalty"])),
+        signal_threshold=max(0.05, min(0.95, float(payload["signal_threshold"]))),
+        stop_loss_pct=max(0.001, float(payload["stop_loss_pct"])),
+        take_profit_pct=max(0.001, float(payload["take_profit_pct"])),
+        risk_per_trade=max(0.0005, min(0.05, float(payload["risk_per_trade"]))),
+        confidence_beta=max(0.0, min(1.0, float(payload["confidence_beta"]))),
+        seed=int(payload["seed"]),
+    )
+
+
+def _local_refinement_candidates(candidate: CandidateParams) -> list[CandidateParams]:
+    """Small post-grid search around the current winner.
+
+    The broad grid keeps runtime predictable; this local pass exists for
+    boundary cases where the winner sits on a coarse grid edge.
+    """
+
+    return [
+        _candidate_variant(candidate, learning_rate=candidate.learning_rate * 0.75),
+        _candidate_variant(candidate, learning_rate=candidate.learning_rate * 1.25),
+        _candidate_variant(candidate, l2_penalty=candidate.l2_penalty / 3.0),
+        _candidate_variant(candidate, l2_penalty=candidate.l2_penalty * 3.0),
+        _candidate_variant(candidate, signal_threshold=candidate.signal_threshold - 0.01),
+        _candidate_variant(candidate, signal_threshold=candidate.signal_threshold + 0.01),
+        _candidate_variant(candidate, risk_per_trade=candidate.risk_per_trade * 0.50),
+        _candidate_variant(candidate, risk_per_trade=candidate.risk_per_trade * 1.25),
+        _candidate_variant(candidate, stop_loss_pct=candidate.stop_loss_pct * 0.85),
+        _candidate_variant(candidate, take_profit_pct=candidate.take_profit_pct * 1.10),
+    ]
 
 
 def _default_training(objective: ObjectiveSpec) -> ObjectiveTraining:
@@ -564,20 +604,40 @@ def train_for_objective(
 
     results.sort(key=lambda entry: entry["score"], reverse=True)
     best = results[0]
+    ensemble_refinement_candidates = 0
+    local_refinement_candidates = 0
+    local_results: list[dict[str, Any]] = []
     if runner is None:
-        ensemble_best = _evaluate_candidate({
-            "candidate": best["candidate"],
-            "rows_train": train_rows,
-            "rows_eval": eval_rows,
-            "feature_cfg": feature_cfg,
-            "base_strategy": base_strategy,
-            "objective": objective.name,
-            "market_type": market_type,
-            "starting_cash": starting_cash,
-            "ensemble_seeds": _ensemble_seed_pack(int(best["candidate"].seed)),
-        })
-        if ensemble_best["score"] > best["score"] + 1e-12:
-            best = ensemble_best
+        for local_candidate in _local_refinement_candidates(best["candidate"]):
+            local_refinement_candidates += 1
+            local_result = _evaluate_candidate({
+                "candidate": local_candidate,
+                "rows_train": train_rows,
+                "rows_eval": eval_rows,
+                "feature_cfg": feature_cfg,
+                "base_strategy": base_strategy,
+                "objective": objective.name,
+                "market_type": market_type,
+                "starting_cash": starting_cash,
+            })
+            local_results.append(local_result)
+        ranked_pool = sorted([*results, *local_results], key=lambda entry: entry["score"], reverse=True)
+        best = ranked_pool[0]
+        for base_result in ranked_pool[:_ENSEMBLE_REFINEMENT_CANDIDATES]:
+            ensemble_refinement_candidates += 1
+            ensemble_result = _evaluate_candidate({
+                "candidate": base_result["candidate"],
+                "rows_train": train_rows,
+                "rows_eval": eval_rows,
+                "feature_cfg": feature_cfg,
+                "base_strategy": base_strategy,
+                "objective": objective.name,
+                "market_type": market_type,
+                "starting_cash": starting_cash,
+                "ensemble_seeds": _ensemble_seed_pack(int(base_result["candidate"].seed)),
+            })
+            if ensemble_result["score"] > best["score"] + 1e-12:
+                best = ensemble_result
 
     rejected = sum(1 for entry in results if entry["score"] == float("-inf"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +686,8 @@ def train_for_objective(
             else None
         ),
         ensemble_refined=bool(best.get("ensemble_refined", False)),
+        ensemble_refinement_candidates=ensemble_refinement_candidates,
+        local_refinement_candidates=local_refinement_candidates,
     )
 
 
@@ -678,10 +740,7 @@ def run_training_suite(
         objectives_run=list(names),
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(
-        json.dumps(report.asdict(), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    write_json_atomic(summary_path, report.asdict(), indent=2, sort_keys=True)
     return report
 
 
@@ -708,11 +767,19 @@ def preview_candidates() -> list[dict[str, object]]:
     return rows
 
 
-def rank_report(candidates_with_results) -> list[dict[str, object]]:
-    """Expose ``rank_candidates`` for callers that already have fresh backtest results."""
+def rank_report(
+    candidates_with_results: Sequence[tuple[dict[str, object], BacktestResult]],
+    objective: str | ObjectiveSpec = "default",
+) -> list[dict[str, object]]:
+    """Rank precomputed backtest results under an objective.
 
-    del candidates_with_results
-    return []
+    This is the public convenience wrapper for callers that already evaluated
+    candidates and only need the same accept/reject annotations used by the
+    training suite.
+    """
+
+    spec = get_objective(objective) if isinstance(objective, str) else objective
+    return rank_candidates(list(candidates_with_results), spec)
 
 
 __all__ = [

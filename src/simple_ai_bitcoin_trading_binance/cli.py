@@ -4370,6 +4370,8 @@ def command_train_suite(args: argparse.Namespace) -> int:
             f"validation={outcome.validation_score if outcome.validation_score is not None else 'n/a'} "
             f"full={outcome.full_sample_score if outcome.full_sample_score is not None else 'n/a'} "
             f"ensemble={'yes' if getattr(outcome, 'ensemble_refined', False) else 'no'} "
+            f"local_checks={getattr(outcome, 'local_refinement_candidates', 0)} "
+            f"ensemble_checks={getattr(outcome, 'ensemble_refinement_candidates', 0)} "
             f"candidates={outcome.explored_candidates} model={outcome.model_path}"
         )
     print(f"summary -> {report.summary_path}")

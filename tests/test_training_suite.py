@@ -30,6 +30,7 @@ from simple_ai_bitcoin_trading_binance.training_suite import (
     _ensemble_seed_pack,
     _calibrate_candidate_threshold,
     _evaluate_candidate,
+    _local_refinement_candidates,
     _strategy_for_candidate,
     _threshold_guard,
     _walk_forward_split,
@@ -627,6 +628,7 @@ def test_train_for_objective_promotes_better_seed_ensemble(
         seed=11,
     )
     monkeypatch.setattr(training_suite, "_candidate_grid", lambda _training: [candidate])
+    monkeypatch.setattr(training_suite, "_local_refinement_candidates", lambda _candidate: [])
 
     def fake_evaluate(payload):
         refined = bool(payload.get("ensemble_seeds"))
@@ -662,6 +664,7 @@ def test_train_for_objective_promotes_better_seed_ensemble(
     assert _ensemble_seed_pack(11) == (11, 28, 48)
     assert outcome.best_score == 2.0
     assert outcome.ensemble_refined is True
+    assert outcome.ensemble_refinement_candidates == 1
 
 
 def test_train_for_objective_rejects_weaker_seed_ensemble(
@@ -680,6 +683,7 @@ def test_train_for_objective_rejects_weaker_seed_ensemble(
         seed=7,
     )
     monkeypatch.setattr(training_suite, "_candidate_grid", lambda _training: [candidate])
+    monkeypatch.setattr(training_suite, "_local_refinement_candidates", lambda _candidate: [])
 
     def fake_evaluate(payload):
         refined = bool(payload.get("ensemble_seeds"))
@@ -714,6 +718,131 @@ def test_train_for_objective_rejects_weaker_seed_ensemble(
 
     assert outcome.best_score == 1.5
     assert outcome.ensemble_refined is False
+    assert outcome.ensemble_refinement_candidates == 1
+
+
+def test_train_for_objective_promotes_better_local_refinement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    objective = get_objective("default")
+    candidate = CandidateParams(
+        epochs=2,
+        learning_rate=0.05,
+        l2_penalty=1e-4,
+        signal_threshold=0.55,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.03,
+        risk_per_trade=0.01,
+        seed=7,
+    )
+    monkeypatch.setattr(training_suite, "_candidate_grid", lambda _training: [candidate])
+
+    def fake_evaluate(payload):
+        refined = bool(payload.get("ensemble_seeds"))
+        candidate_ = payload["candidate"]
+        score = 2.0 if candidate_.risk_per_trade < candidate.risk_per_trade and not refined else 1.0
+        return {
+            "score": score,
+            "candidate": candidate_,
+            "strategy": StrategyConfig(),
+            "model": _fake_trained_model(),
+            "row_count": 10,
+            "positive_rate": 0.5,
+            "threshold": 0.55,
+            "threshold_source": "strategy",
+            "threshold_score": None,
+            "calibration_rows": 0,
+            "validation_rows": 5,
+            "validation_score": score,
+            "full_sample_score": score,
+            "ensemble_refined": refined,
+        }
+
+    monkeypatch.setattr(training_suite, "_evaluate_candidate", fake_evaluate)
+
+    outcome = train_for_objective(
+        _synthetic_candles(n=220),
+        StrategyConfig(),
+        objective,
+        output_dir=tmp_path,
+        market_type="spot",
+        starting_cash=1000.0,
+        max_workers=1,
+    )
+
+    assert len(_local_refinement_candidates(candidate)) == 10
+    assert outcome.best_score == 2.0
+    assert outcome.best_params["risk_per_trade"] == pytest.approx(0.005)
+    assert outcome.local_refinement_candidates == 10
+    assert outcome.ensemble_refined is False
+
+
+def test_train_for_objective_checks_top_candidates_for_seed_ensembles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    objective = get_objective("default")
+    candidates = [
+        CandidateParams(epochs=2, learning_rate=0.05, l2_penalty=1e-4,
+                        signal_threshold=0.55, stop_loss_pct=0.02,
+                        take_profit_pct=0.03, risk_per_trade=0.01, seed=7),
+        CandidateParams(epochs=2, learning_rate=0.05, l2_penalty=1e-4,
+                        signal_threshold=0.55, stop_loss_pct=0.02,
+                        take_profit_pct=0.03, risk_per_trade=0.01, seed=11),
+        CandidateParams(epochs=2, learning_rate=0.05, l2_penalty=1e-4,
+                        signal_threshold=0.55, stop_loss_pct=0.02,
+                        take_profit_pct=0.03, risk_per_trade=0.01, seed=13),
+        CandidateParams(epochs=2, learning_rate=0.05, l2_penalty=1e-4,
+                        signal_threshold=0.55, stop_loss_pct=0.02,
+                        take_profit_pct=0.03, risk_per_trade=0.01, seed=17),
+    ]
+    monkeypatch.setattr(training_suite, "_candidate_grid", lambda _training: candidates)
+    monkeypatch.setattr(training_suite, "_local_refinement_candidates", lambda _candidate: [])
+
+    base_scores = {7: 3.0, 11: 2.0, 13: 1.0, 17: 0.5}
+    ensemble_scores = {7: 2.5, 11: 4.0, 13: 1.1}
+    evaluated: list[tuple[int, bool]] = []
+
+    def fake_evaluate(payload):
+        seed = int(payload["candidate"].seed)
+        refined = bool(payload.get("ensemble_seeds"))
+        evaluated.append((seed, refined))
+        score = ensemble_scores[seed] if refined else base_scores[seed]
+        return {
+            "score": score,
+            "candidate": payload["candidate"],
+            "strategy": StrategyConfig(),
+            "model": _fake_trained_model(),
+            "row_count": 10,
+            "positive_rate": 0.5,
+            "threshold": 0.55,
+            "threshold_source": "strategy",
+            "threshold_score": None,
+            "calibration_rows": 0,
+            "validation_rows": 5,
+            "validation_score": score,
+            "full_sample_score": score,
+            "ensemble_refined": refined,
+        }
+
+    monkeypatch.setattr(training_suite, "_evaluate_candidate", fake_evaluate)
+
+    outcome = train_for_objective(
+        _synthetic_candles(n=220),
+        StrategyConfig(),
+        objective,
+        output_dir=tmp_path,
+        market_type="spot",
+        starting_cash=1000.0,
+        max_workers=1,
+    )
+
+    assert outcome.best_score == 4.0
+    assert outcome.best_params["seed"] == 11
+    assert outcome.ensemble_refined is True
+    assert outcome.ensemble_refinement_candidates == 3
+    assert evaluated[-3:] == [(7, True), (11, True), (13, True)]
 
 
 # ----- run_training_suite --------------------------------------------------
@@ -831,11 +960,21 @@ def test_preview_candidates_shape() -> None:
         assert "first_candidate" in row
 
 
-# ----- rank_report placeholder ---------------------------------------------
+# ----- rank_report ---------------------------------------------------------
 
 
-def test_rank_report_returns_empty_list() -> None:
-    assert rank_report([("whatever", "any")]) == []
+def test_rank_report_ranks_precomputed_backtests() -> None:
+    ranked = rank_report([
+        ({"name": "low"}, _make_result(realized_pnl=5.0, closed_trades=4, win_rate=0.25)),
+        ({"name": "high"}, _make_result(realized_pnl=60.0, closed_trades=4, win_rate=0.75)),
+        ({"name": "reject"}, _make_result(realized_pnl=80.0, closed_trades=0, win_rate=0.0)),
+    ])
+
+    assert ranked[0]["params"] == {"name": "high"}
+    assert ranked[0]["accepted"] is True
+    assert ranked[-1]["params"] == {"name": "reject"}
+    assert ranked[-1]["accepted"] is False
+    assert ranked[-1]["reject_reason"] == "closed_trades<3"
 
 
 # ----- real-runner smoke test for train_for_objective ----------------------
