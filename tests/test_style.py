@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 
 
 from simple_ai_bitcoin_trading_binance import style
@@ -20,6 +22,11 @@ class _StreamNoIsatty:
     pass
 
 
+class _EncodingStream:
+    def __init__(self, encoding: str | None):
+        self.encoding = encoding
+
+
 def test_supports_color_no_color_env(monkeypatch):
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.delenv("FORCE_COLOR", raising=False)
@@ -35,6 +42,7 @@ def test_supports_color_force_color_env(monkeypatch):
 def test_supports_color_tty_true(monkeypatch):
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setattr(style.os, "name", "posix")
     assert style.supports_color(_FakeStream(tty=True)) is True
 
 
@@ -69,6 +77,109 @@ def test_supports_color_default_uses_sys_stdout(monkeypatch):
     # it returns a bool and does not crash.
     result = style.supports_color()
     assert isinstance(result, bool)
+
+
+def test_supports_unicode_stream_encodings():
+    assert style.supports_unicode(_EncodingStream(None)) is True
+    assert style.supports_unicode(_EncodingStream("utf-8")) is True
+    assert style.supports_unicode(_EncodingStream("cp1252")) is False
+    assert style.supports_unicode(_EncodingStream("not-a-codec")) is False
+
+
+def test_supports_color_windows_virtual_terminal(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setattr(style.os, "name", "nt")
+    monkeypatch.setattr(style, "_enable_windows_virtual_terminal", lambda _stream: True)
+    assert style.supports_color(_FakeStream(tty=True)) is True
+    monkeypatch.setattr(style, "_enable_windows_virtual_terminal", lambda _stream: False)
+    assert style.supports_color(_FakeStream(tty=True)) is False
+
+
+def test_enable_windows_virtual_terminal_edges(monkeypatch):
+    assert style._enable_windows_virtual_terminal(_StreamNoIsatty()) is False
+
+    class BadFileno:
+        def fileno(self):
+            raise OSError("closed")
+
+    assert style._enable_windows_virtual_terminal(BadFileno()) is False
+
+    class GoodStream:
+        def fileno(self):
+            return 1
+
+    real_import = __import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "msvcrt":
+            raise ImportError("missing msvcrt")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", blocked_import)
+    assert style._enable_windows_virtual_terminal(GoodStream()) is False
+    monkeypatch.undo()
+
+    monkeypatch.setattr("builtins.__import__", real_import)
+
+    class CULong:
+        def __init__(self, value=0):
+            self.value = value
+
+    class Kernel32:
+        def __init__(self, *, get_ok: bool = True, set_ok: bool = True, initial_mode: int = 0):
+            self.get_ok = get_ok
+            self.set_ok = set_ok
+            self.initial_mode = initial_mode
+            self.updated = None
+
+        def GetConsoleMode(self, _handle, mode):
+            if not self.get_ok:
+                return 0
+            mode.value = self.initial_mode
+            return 1
+
+        def SetConsoleMode(self, _handle, mode):
+            self.updated = mode
+            return 1 if self.set_ok else 0
+
+    def install_fake_modules(kernel32):
+        monkeypatch.setitem(
+            style.sys.modules,
+            "ctypes",
+            types.SimpleNamespace(
+                c_ulong=CULong,
+                byref=lambda value: value,
+                windll=types.SimpleNamespace(kernel32=kernel32),
+            ),
+        )
+        monkeypatch.setitem(
+            style.sys.modules,
+            "msvcrt",
+            types.SimpleNamespace(get_osfhandle=lambda fd: fd + 100),
+        )
+
+    kernel32 = Kernel32(get_ok=False)
+    install_fake_modules(kernel32)
+    assert style._enable_windows_virtual_terminal(GoodStream()) is False
+
+    kernel32 = Kernel32(get_ok=True, set_ok=False, initial_mode=0)
+    install_fake_modules(kernel32)
+    assert style._enable_windows_virtual_terminal(GoodStream()) is False
+    assert kernel32.updated == style._ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+    kernel32 = Kernel32(get_ok=True, set_ok=True, initial_mode=0)
+    install_fake_modules(kernel32)
+    assert style._enable_windows_virtual_terminal(GoodStream()) is True
+    assert kernel32.updated == style._ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+    kernel32 = Kernel32(
+        get_ok=True,
+        initial_mode=style._ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    )
+    install_fake_modules(kernel32)
+    assert style._enable_windows_virtual_terminal(GoodStream()) is True
+    assert kernel32.updated is None
 
 
 def test_color_disabled_returns_text():
@@ -150,6 +261,14 @@ def test_frame_disabled_palette_and_empty_lines():
     assert rows[2].startswith("├")
     # only top, header, divider, bottom = 4 rows (no content)
     assert len(rows) == 4
+
+
+def test_frame_ascii_border_fallback():
+    rows = style.frame("Title", ["body"], width=20, enabled=False, unicode_enabled=False)
+    assert rows[0] == "+" + "-" * 18 + "+"
+    assert rows[1].startswith("|")
+    assert rows[2] == "+" + "-" * 18 + "+"
+    assert rows[-1] == "+" + "-" * 18 + "+"
 
 
 def test_frame_narrow_width_truncates_long_text_with_ansi():

@@ -299,6 +299,7 @@ def test_main_without_args_routes_to_menu(monkeypatch) -> None:
 def test_command_menu_routes_to_tui_when_tty(monkeypatch) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_color", lambda _stream: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.tui.launch_tui", lambda **_kwargs: 0)
     from simple_ai_bitcoin_trading_binance.cli import command_menu
 
@@ -312,6 +313,16 @@ def test_command_menu_rejects_without_tty(monkeypatch, capsys) -> None:
 
     assert command_menu(argparse.Namespace()) == 2
     assert "Interactive console requires a real terminal" in capsys.readouterr().err
+
+
+def test_command_menu_rejects_without_ansi_terminal(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_color", lambda _stream: False)
+    from simple_ai_bitcoin_trading_binance.cli import command_menu
+
+    assert command_menu(argparse.Namespace()) == 2
+    assert "virtual-terminal support" in capsys.readouterr().err
 
 
 def test_tui_runtime_action_saves_runtime(monkeypatch) -> None:

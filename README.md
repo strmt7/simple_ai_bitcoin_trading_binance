@@ -42,6 +42,19 @@ If your shell does not expose the console entrypoint:
 PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli shell
 ```
 
+On Windows from this checkout, prefer the GPU-capable Python 3.11 environment:
+
+```powershell
+cd C:\trader\simple_ai_bitcoin_trading_binance
+.\.venv311\Scripts\simple-ai-trading.exe shell
+.\.venv311\Scripts\simple-ai-trading.exe menu
+```
+
+`shell` is the robust slash-command REPL and falls back to plain ASCII when a
+legacy Windows console cannot render ANSI colors or Unicode glyphs. `menu` is
+the full-screen Textual operator console; use Windows Terminal for it, because
+full-screen terminal UIs require ANSI/virtual-terminal support.
+
 The `shell` command opens a slash-command REPL inspired by Claude Code — tab
 completion, a muted-gradient palette, live status bar, and fall-through to the
 rest of the CLI (type `status` or `/status`; both work).  The `menu` command

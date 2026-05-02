@@ -713,7 +713,8 @@ def feature_drift_report(
     outlier_fraction = outliers / len(z_values) if z_values else 0.0
 
     status = "ok"
-    catastrophic_outlier = max_abs_z >= fail_z * 1.5
+    catastrophic_multiplier = 1.5 if len(rows) == 1 else 3.0
+    catastrophic_outlier = max_abs_z >= fail_z * catastrophic_multiplier
     broad_hard_outliers = max_abs_z >= fail_z and outlier_fraction >= outlier_warn_fraction
     if catastrophic_outlier or broad_hard_outliers:
         warnings.append("feature drift exceeds hard threshold")

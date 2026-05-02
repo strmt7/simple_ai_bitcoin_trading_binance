@@ -56,6 +56,7 @@ from . import risk_workflows
 from .strategy_overrides import apply_model_strategy_overrides
 from .storage import write_json_atomic
 from .source_grading import grade_sources, render_source_grade_run
+from .style import supports_color
 from .types import RuntimeConfig, StrategyConfig
 
 _JITTER_RANDOM = random.SystemRandom()
@@ -203,7 +204,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_report.set_defaults(doctor=True)
     parser_report.set_defaults(func=command_report)
 
-    parser_menu = subparsers.add_parser("menu", help="launch the interactive operator console")
+    parser_menu = subparsers.add_parser("menu", help="launch the full-screen operator console")
     parser_menu.set_defaults(func=command_menu)
 
     parser_fetch = subparsers.add_parser("fetch", help="download BTCUSDC klines")
@@ -505,7 +506,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--source-grade-max-age-hours", type=float, default=None)
     parser_strategy.set_defaults(func=command_strategy)
 
-    parser_shell = subparsers.add_parser("shell", help="launch the Claude-Code-inspired interactive shell")
+    parser_shell = subparsers.add_parser("shell", help="launch the fallback-friendly slash-command shell")
     parser_shell.set_defaults(func=command_shell)
 
     parser_objectives = subparsers.add_parser("objectives", help="list registered training objectives")
@@ -2123,6 +2124,13 @@ def _tui_actions():
 def command_menu(_: argparse.Namespace) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("Interactive console requires a real terminal (TTY).", file=sys.stderr)
+        return 2
+    if not supports_color(sys.stdout):
+        print(
+            "Interactive console needs ANSI/virtual-terminal support. "
+            "Use Windows Terminal, or run `simple-ai-trading shell` for the plain fallback.",
+            file=sys.stderr,
+        )
         return 2
 
     from .tui import launch_tui

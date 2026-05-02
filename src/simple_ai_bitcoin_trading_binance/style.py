@@ -40,6 +40,47 @@ _COLORS: dict[str, str] = {
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+
+def _enable_windows_virtual_terminal(stream) -> bool:
+    """Enable ANSI escape handling for classic Windows consoles when possible."""
+
+    fileno = getattr(stream, "fileno", None)
+    if fileno is None:
+        return False
+    try:
+        fd = int(fileno())
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        import ctypes
+        import msvcrt
+    except ImportError:
+        return False
+    handle = msvcrt.get_osfhandle(fd)
+    mode = ctypes.c_ulong()
+    kernel32 = ctypes.windll.kernel32
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return False
+    updated = mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    if updated == mode.value:
+        return True
+    return bool(kernel32.SetConsoleMode(handle, updated))
+
+
+def supports_unicode(stream=None, sample: str = "▸❯┌─┐│└┘├┤") -> bool:
+    """Return True when ``stream`` can encode the shell's display glyphs."""
+
+    target = stream if stream is not None else sys.stdout
+    encoding = getattr(target, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        sample.encode(str(encoding))
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
 
 
 def supports_color(stream=None) -> bool:
@@ -54,9 +95,13 @@ def supports_color(stream=None) -> bool:
     if isatty is None:
         return False
     try:
-        return bool(isatty())
+        if not bool(isatty()):
+            return False
     except (ValueError, OSError):
         return False
+    if os.name == "nt":
+        return _enable_windows_virtual_terminal(target)
+    return True
 
 
 @dataclass(frozen=True)
@@ -132,8 +177,15 @@ def pad_visible(text: str, width: int) -> str:
     return text + " " * (width - visible)
 
 
-def frame(title: str, lines: Iterable[str], *, width: int = 72, enabled: bool = True,
-          palette: Palette | None = None) -> list[str]:
+def frame(
+    title: str,
+    lines: Iterable[str],
+    *,
+    width: int = 72,
+    enabled: bool = True,
+    palette: Palette | None = None,
+    unicode_enabled: bool = True,
+) -> list[str]:
     """Render a single-line-border box around ``lines`` with a title header.
 
     The returned list is suitable for ``"\n".join`` rendering or for the TUI
@@ -149,10 +201,11 @@ def frame(title: str, lines: Iterable[str], *, width: int = 72, enabled: bool = 
     padded_header = pad_visible(header_text, inner)
     styled_header = bold(color(padded_header, palette.heading, enabled=enabled), enabled=enabled)
 
-    top = "┌" + "─" * inner + "┐"
-    bot = "└" + "─" * inner + "┘"
-    rows: list[str] = [top, f"│{styled_header}│"]
-    rows.append("├" + "─" * inner + "┤")
+    border = ("┌", "─", "┐", "│", "├", "┤", "└", "┘") if unicode_enabled else ("+", "-", "+", "|", "+", "+", "+", "+")
+    top = border[0] + border[1] * inner + border[2]
+    bot = border[6] + border[1] * inner + border[7]
+    rows: list[str] = [top, f"{border[3]}{styled_header}{border[3]}"]
+    rows.append(border[4] + border[1] * inner + border[5])
     for raw in lines:
         text = str(raw)
         if visible_len(text) > inner:
@@ -179,7 +232,7 @@ def frame(title: str, lines: Iterable[str], *, width: int = 72, enabled: bool = 
             text = pad_visible(text, inner)
         else:
             text = pad_visible(text, inner)
-        rows.append(f"│{text}│")
+        rows.append(f"{border[3]}{text}{border[3]}")
     rows.append(bot)
     return rows
 

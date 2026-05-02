@@ -71,6 +71,16 @@ def test_banner_and_prompt_unstyled(tmp_path):
     assert "❯" in shell.prompt_text()
 
 
+def test_banner_prompt_and_status_ascii_fallback(tmp_path):
+    shell, recorder, _ctrl, _pos = _make_shell(tmp_path)
+    shell.state.unicode_enabled = False
+    assert "> binance testnet" in shell.banner()
+    assert shell.prompt_text() == "simple-ai > "
+    assert shell.dispatch("/status") == 0
+    assert any(line.startswith("+") for line in recorder.lines)
+    assert not any("┌" in line or "│" in line for line in recorder.lines)
+
+
 def test_banner_styled(tmp_path):
     shell, _recorder, _ctrl, _pos = _make_shell(tmp_path, color_enabled=True)
     banner = shell.banner()

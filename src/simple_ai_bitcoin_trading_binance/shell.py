@@ -47,6 +47,7 @@ from .style import (
     muted,
     ok,
     supports_color,
+    supports_unicode,
     warn,
 )
 
@@ -70,6 +71,7 @@ class ShellState:
     history: list[str] = field(default_factory=list)
     last_exit: int = 0
     color_enabled: bool = False
+    unicode_enabled: bool = True
 
 
 def _default_cli_runner(argv: list[str]) -> int:
@@ -102,6 +104,7 @@ class Shell:
         self.palette = palette or Palette()
         self.state = ShellState()
         self.state.color_enabled = supports_color() if color_enabled is None else bool(color_enabled)
+        self.state.unicode_enabled = supports_unicode()
         self.cli_runner = cli_runner
         self.control_factory = control_factory
         self.positions_factory = positions_factory
@@ -123,9 +126,10 @@ class Shell:
 
     def banner(self) -> str:
         enabled = self.state.color_enabled
+        marker = "▸" if self.state.unicode_enabled else ">"
         line1 = bold(
             color("  simple-ai ", self.palette.heading, enabled=enabled)
-            + color("▸ binance testnet", self.palette.accent, enabled=enabled),
+            + color(f"{marker} binance testnet", self.palette.accent, enabled=enabled),
             enabled=enabled,
         )
         line2 = muted("  type /help for commands, /quit to exit",
@@ -133,8 +137,9 @@ class Shell:
         return f"{line1}\n{line2}"
 
     def prompt_text(self) -> str:
+        marker = "❯" if self.state.unicode_enabled else ">"
         return bold(
-            color("simple-ai ❯ ", self.palette.primary, enabled=self.state.color_enabled),
+            color(f"simple-ai {marker} ", self.palette.primary, enabled=self.state.color_enabled),
             enabled=self.state.color_enabled,
         )
 
@@ -270,6 +275,7 @@ def _cmd_status(shell: Shell, _args: list[str]) -> int:
         width=60,
         enabled=enabled,
         palette=shell.palette,
+        unicode_enabled=shell.state.unicode_enabled,
     )
     shell.println("\n".join(lines))
     return 0

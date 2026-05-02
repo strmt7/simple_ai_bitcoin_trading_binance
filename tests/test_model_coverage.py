@@ -253,6 +253,35 @@ def test_feature_drift_report_statuses_and_edges() -> None:
     assert isolated_high_dimensional.status == "warn"
     assert any("isolated" in warning for warning in isolated_high_dimensional.warnings)
 
+    sparse_window_spike = feature_drift_report(
+        [SimpleNamespace(features=(14.0,) + (0.0,) * 12, label=1)]
+        + [SimpleNamespace(features=(0.0,) * 13, label=0) for _ in range(49)],
+        TrainedModel(
+            weights=[0.0] * 13,
+            bias=0.0,
+            feature_dim=13,
+            epochs=1,
+            feature_means=[0.0] * 13,
+            feature_stds=[1.0] * 13,
+        ),
+    )
+    assert sparse_window_spike.status == "warn"
+    assert any("isolated" in warning for warning in sparse_window_spike.warnings)
+
+    isolated_catastrophic = feature_drift_report(
+        [SimpleNamespace(features=(25.0,) + (0.0,) * 99, label=1)],
+        TrainedModel(
+            weights=[0.0] * 100,
+            bias=0.0,
+            feature_dim=100,
+            epochs=1,
+            feature_means=[0.0] * 100,
+            feature_stds=[1.0] * 100,
+        ),
+    )
+    assert isolated_catastrophic.status == "fail"
+    assert any("hard threshold" in warning for warning in isolated_catastrophic.warnings)
+
     outlier_fail = feature_drift_report(
         [SimpleNamespace(features=(2.0, 2.0), label=1)],
         model,
