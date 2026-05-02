@@ -133,7 +133,7 @@ def test_command_train_suite_all_objectives(tmp_path, monkeypatch, capsys):
         def __init__(self, name):
             self.objective = name
             self.best_score = 0.12
-            self.model_path = Path(f"/tmp/{name}.json")
+            self.model_path = tmp_path / f"{name}.json"
             self.decision_threshold = 0.58
             self.threshold_source = "strategy"
             self.validation_score = 0.13

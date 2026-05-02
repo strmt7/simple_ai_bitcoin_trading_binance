@@ -14,8 +14,8 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 from typing import Any, Callable, Mapping
-import xml.etree.ElementTree as ET
 
+from defusedxml import ElementTree as ET
 import requests
 
 from .compute import BackendInfo, resolve_backend
@@ -25,6 +25,7 @@ from .storage import write_json_atomic
 FetchJson = Callable[[str, float], object]
 FetchText = Callable[[str, float], str]
 PostJson = Callable[[str, Mapping[str, object], float], object]
+_JITTER_RANDOM = random.SystemRandom()
 
 COINGECKO_SIMPLE_PRICE_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
@@ -802,7 +803,7 @@ def _fetch_rss_news_feed(
     provider_jitter_seconds: float = 0.0,
 ) -> ProviderFetchResult:
     if provider_jitter_seconds > 0.0:
-        time.sleep(random.uniform(0.0, float(provider_jitter_seconds)))
+        time.sleep(_JITTER_RANDOM.uniform(0.0, float(provider_jitter_seconds)))
     xml_text = fetch_text(provider.url, timeout)
     items = _extract_feed_items(xml_text, now_ms=now_ms, limit=items_per_provider)
     if not items:

@@ -179,7 +179,7 @@ def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
 
 def test_rss_provider_parser_jitter_and_ollama_error(tmp_path, monkeypatch) -> None:
     sleeps: list[float] = []
-    monkeypatch.setattr(signals.random, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(signals._JITTER_RANDOM, "uniform", lambda _low, high: high)
     monkeypatch.setattr(signals.time, "sleep", lambda seconds: sleeps.append(seconds))
     result = signals._fetch_rss_news_feed(
         signals.NewsFeedProvider("feed", "https://example.test/rss", 0.5),

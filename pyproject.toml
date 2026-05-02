@@ -9,6 +9,7 @@ description = "BTCUSDC paper-trading CLI with conservative Binance testnet workf
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "defusedxml>=0.7.1,<1",
     "requests>=2.32.0,<3",
     "textual==8.1.1",
 ]

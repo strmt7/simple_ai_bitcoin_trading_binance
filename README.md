@@ -98,6 +98,7 @@ simple-ai-trading signals --refresh --news-provider-limit 40 --provider-parallel
 simple-ai-trading signals --loop --sleep 15 --jitter 3 --news-provider-limit 40
 simple-ai-trading signals-benchmark --provider-limit 30 --parallelism 12 --iterations 2
 simple-ai-trading source-grades --window-hours 24
+python tools/run_real_data_soak.py --duration-seconds 3660 --python .venv311/Scripts/python.exe
 python tools/quality_metrics.py --compare-ref HEAD
 simple-ai-trading spot-roundtrip --mode auto --quantity 0.00008 --yes
 simple-ai-trading compute --backend auto
@@ -169,6 +170,22 @@ success count, and latency on the current host before choosing an interval.
 `source-grades` reviews stored telemetry over a time window and writes integer
 0-10 grades per source/horizon; it uses Ollama when available and falls back to
 deterministic evidence scoring when unavailable.
+
+For an auditable real-data production soak, run:
+
+```bash
+python tools/run_real_data_soak.py --duration-seconds 3660 \
+    --python .venv311/Scripts/python.exe \
+    --db data/trading_telemetry.sqlite \
+    --cache data/signals/hour_soak_external_signals.json
+```
+
+The soak runner polls the free external providers with jitter for at least an
+hour, uses the configured Ollama model for news review on each iteration,
+persists all raw telemetry into `data/trading_telemetry.sqlite`, then runs
+`source-grades` over the fresh window and prints database row counts. This is
+the quickest repeatable proof that provider polling, local AI news review,
+SQLite raw storage, and source grading are working together with live data.
 
 GPU training and backtest scoring backends are selected with `compute`, `train
 --compute-backend`, `train-suite --compute-backend`, and `backtest

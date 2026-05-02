@@ -58,6 +58,8 @@ from .storage import write_json_atomic
 from .source_grading import grade_sources, render_source_grade_run
 from .types import RuntimeConfig, StrategyConfig
 
+_JITTER_RANDOM = random.SystemRandom()
+
 
 _TRAINING_PRESETS: dict[str, dict[str, object]] = {
     "custom": {},
@@ -2141,7 +2143,7 @@ def _clamp(value: float, low: float, high: float) -> float:
 def _jittered_seconds(base_seconds: float, jitter_seconds: float) -> float:
     base = max(0.0, float(base_seconds))
     jitter = max(0.0, float(jitter_seconds))
-    return base + (random.uniform(0.0, jitter) if jitter else 0.0)
+    return base + (_JITTER_RANDOM.uniform(0.0, jitter) if jitter else 0.0)
 
 
 def _rows_from_json(path: str):

@@ -1,0 +1,27 @@
+version = 1
+
+exclude_patterns = [
+  ".venv/**",
+  ".venv*/**",
+  "build/**",
+  "data/**",
+  "dist/**",
+  "htmlcov/**",
+  "tests/**",
+]
+
+test_patterns = [
+  "tests/**",
+  "test_*.py",
+  "**/test_*.py",
+]
+
+[[analyzers]]
+name = "python"
+enabled = true
+
+  [analyzers.meta]
+  runtime_version = "3.x.x"
+  max_line_length = 180
+  skip_doc_coverage = ["module", "magic", "init", "class", "nonpublic"]
+  cyclomatic_complexity_threshold = "high"

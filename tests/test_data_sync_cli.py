@@ -427,7 +427,7 @@ def test_command_signals_loop_and_errors(tmp_path, monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(cli, "collect_external_signals", fake_collect)
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
-    monkeypatch.setattr(cli.random, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(cli._JITTER_RANDOM, "uniform", lambda _low, high: high)
     args = argparse.Namespace(
         model=str(tmp_path / "model.json"),
         cache=None,
