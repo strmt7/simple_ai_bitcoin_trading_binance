@@ -242,7 +242,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--short-reaction-refresh-seconds", type=int, default=20)
     parser.add_argument("--ollama-model", default="gemma4:e4b")
     parser.add_argument("--ollama-timeout-seconds", type=float, default=20.0)
-    parser.add_argument("--grade-ollama-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--grade-ollama-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--grade-window-hours", type=float, default=1.25)
     parser.add_argument("--skip-grading", action="store_true")
     return parser.parse_args(argv)

@@ -4087,7 +4087,7 @@ def command_source_grades(args: argparse.Namespace) -> int:
             ollama_timeout_seconds=_clamp(
                 float(getattr(args, "ollama_timeout", None) or cfg.external_news_ai_timeout_seconds),
                 0.1,
-                30.0,
+                120.0,
             ),
         )
     except Exception as exc:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Mapping
 
 from .external_signals import DEFAULT_OLLAMA_NEWS_MODEL, DEFAULT_OLLAMA_URL, PostJson, _post_json
 from .telemetry_store import SourceGrade, TradingTelemetryStore
+
+_GRADE_PAIR_RE = re.compile(r'"?([A-Za-z0-9_.:-]+)\|(short|medium|long)"?\s*:\s*(10|[0-9])')
+_INTEGER_GRADE_RE = re.compile(r"\b(10|[0-9])\b")
 
 
 @dataclass(frozen=True)
@@ -73,9 +77,25 @@ def _grade_prompt(rollups: list[dict[str, object]]) -> str:
     ]
     return (
         "Grade BTCUSDC data sources 0-10. Higher=timely, replayable, actionable, consistent. "
-        "Return JSON only: {\"grades\":{\"source|horizon\":grade,...}}.\n"
+        "Return a compact JSON object only, no markdown and no string values: "
+        "{\"grades\":{\"source|horizon\":5}}.\n"
         + "\n".join(compact)
     )
+
+
+def _single_grade_prompt(row: Mapping[str, object]) -> str:
+    return (
+        "Grade this BTCUSDC data source 0-10. Higher=timely, replayable, actionable, consistent. "
+        "Return JSON only: {\"grade\":5,\"reason\":\"brief reason\"}.\n"
+        f"{row['source']}|{row['horizon']}|s={row['sample_count']}|"
+        f"score={float(row['avg_score']):+.2f}|abs={float(row['avg_abs_score']):.2f}|"
+        f"conf={float(row['avg_confidence']):.2f}|raw={row['raw_records']}|"
+        f"comp={row['component_records']}"
+    )
+
+
+def _recover_grade_mapping(text: str) -> dict[str, int]:
+    return {f"{match.group(1)}|{match.group(2)}": int(match.group(3)) for match in _GRADE_PAIR_RE.finditer(text)}
 
 
 def _json_mapping_from_text(text: str) -> Mapping[str, object]:
@@ -117,10 +137,20 @@ def _ai_grade_batch(
     latency_ms = int((time.perf_counter() - started) * 1000)
     if not isinstance(payload, Mapping):
         raise ValueError("unexpected Ollama grading payload")
-    parsed = _json_mapping_from_text(str(payload.get("response") or ""))
-    raw_grades = parsed.get("grades")
-    if not isinstance(raw_grades, (Mapping, list)):
-        raise ValueError("Ollama grading response missed grades")
+    response_text = str(payload.get("response") or "")
+    try:
+        parsed = _json_mapping_from_text(response_text)
+        raw_grades = parsed.get("grades")
+        if not isinstance(raw_grades, (Mapping, list)):
+            raise ValueError("Ollama grading response missed grades")
+    except (json.JSONDecodeError, ValueError):
+        recovered = _recover_grade_mapping(response_text)
+        if not recovered:
+            raise
+        return {
+            tuple(key.split("|", 1)): (_clamp_int(value, 0, 10, 5), "AI grade (recovered JSON)")
+            for key, value in recovered.items()
+        }, latency_ms
     output: dict[tuple[str, str], tuple[int, str]] = {}
     if isinstance(raw_grades, Mapping):
         for key, grade_value in raw_grades.items():
@@ -152,6 +182,46 @@ def _ai_grade_batch(
     return output, latency_ms
 
 
+def _ai_grade_single(
+    rollup: dict[str, object],
+    *,
+    model: str,
+    base_url: str,
+    timeout_seconds: float,
+    post_json: PostJson,
+) -> tuple[tuple[str, str], tuple[int, str], int]:
+    started = time.perf_counter()
+    endpoint = f"{str(base_url or DEFAULT_OLLAMA_URL).rstrip('/')}/api/generate"
+    payload = post_json(
+        endpoint,
+        {
+            "model": model,
+            "prompt": _single_grade_prompt(rollup),
+            "stream": False,
+            "format": "json",
+            "keep_alive": "30m",
+            "options": {"temperature": 0, "num_ctx": 1024, "num_predict": 128},
+        },
+        timeout_seconds,
+    )
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    if not isinstance(payload, Mapping):
+        raise ValueError("unexpected Ollama grading payload")
+    response_text = str(payload.get("response") or "")
+    reason = "AI single-source grade"
+    try:
+        parsed = _json_mapping_from_text(response_text)
+        grade_value = parsed.get("grade")
+        reason = " ".join(str(parsed.get("reason") or reason).split())[:220]
+    except json.JSONDecodeError:
+        match = _INTEGER_GRADE_RE.search(response_text)
+        if match is None:
+            raise
+        grade_value = match.group(1)
+    key = (str(rollup["source"]), str(rollup["horizon"] or "medium"))
+    return key, (_clamp_int(grade_value, 0, 10, 5), reason), latency_ms
+
+
 def _ai_grades(
     rollups: list[dict[str, object]],
     *,
@@ -162,7 +232,7 @@ def _ai_grades(
 ) -> tuple[dict[tuple[str, str], tuple[int, str]], int]:
     output: dict[tuple[str, str], tuple[int, str]] = {}
     total_latency_ms = 0
-    batch_size = 10
+    batch_size = 6
     for start in range(0, len(rollups), batch_size):
         batch_output, latency_ms = _ai_grade_batch(
             rollups[start:start + batch_size],
@@ -173,6 +243,22 @@ def _ai_grades(
         )
         output.update(batch_output)
         total_latency_ms += latency_ms
+        for rollup in rollups[start:start + batch_size]:
+            key = (str(rollup["source"]), str(rollup["horizon"] or "medium"))
+            if key in output:
+                continue
+            try:
+                single_key, single_output, single_latency_ms = _ai_grade_single(
+                    rollup,
+                    model=model,
+                    base_url=base_url,
+                    timeout_seconds=timeout_seconds,
+                    post_json=post_json,
+                )
+            except Exception:
+                continue
+            output[single_key] = single_output
+            total_latency_ms += single_latency_ms
     return output, total_latency_ms
 
 
@@ -223,23 +309,34 @@ def grade_sources(
                 ai_status = "error"
                 warnings.append(f"ollama grading unavailable: {exc}")
         grades: list[SourceGrade] = []
+        missing_ai_grades = 0
         for rollup in rollups:
             source = str(rollup["source"])
             horizon = str(rollup["horizon"] or "medium")
             heuristic_grade, heuristic_reason = _heuristic_grade(rollup)
-            grade, reason = ai_output.get((source, horizon), (heuristic_grade, heuristic_reason))
-            store.record_source_grade(
-                source=source,
-                horizon=horizon,
-                window_start_ms=start,
-                window_end_ms=now,
-                grade=grade,
-                sample_count=int(rollup["sample_count"]),
-                model=model if ai_status == "ok" else "heuristic",
-                reason=reason,
-                evidence=rollup,
+            ai_key = (source, horizon)
+            used_ai = ai_status == "ok" and ai_key in ai_output
+            if used_ai:
+                grade, reason = ai_output[ai_key]
+            else:
+                grade, reason = heuristic_grade, heuristic_reason
+                if ai_status == "ok":
+                    missing_ai_grades += 1
+            grades.append(
+                store.record_source_grade(
+                    source=source,
+                    horizon=horizon,
+                    window_start_ms=start,
+                    window_end_ms=now,
+                    grade=grade,
+                    sample_count=int(rollup["sample_count"]),
+                    model=model if used_ai else "heuristic",
+                    reason=reason,
+                    evidence=rollup,
+                )
             )
-        grades = store.recent_grades(limit=len(rollups))
+        if missing_ai_grades:
+            warnings.append(f"ollama grading missed {missing_ai_grades} source horizons; heuristic filled them")
     return SourceGradeRun(
         status="ok" if not warnings else "warn",
         db_path=str(db_path),

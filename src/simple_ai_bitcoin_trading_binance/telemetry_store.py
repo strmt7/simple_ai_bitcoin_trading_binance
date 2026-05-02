@@ -283,8 +283,10 @@ class TradingTelemetryStore:
         model: str,
         reason: str,
         evidence: Mapping[str, object],
-    ) -> int:
+    ) -> SourceGrade:
         bounded_grade = max(0, min(10, int(grade)))
+        created_at_ms = self._now_ms()
+        evidence_payload = dict(evidence)
         cursor = self.connect().execute(
             """
             INSERT OR REPLACE INTO source_grades (
@@ -294,7 +296,7 @@ class TradingTelemetryStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                self._now_ms(),
+                created_at_ms,
                 str(source),
                 str(horizon or "medium"),
                 int(window_start_ms),
@@ -303,11 +305,23 @@ class TradingTelemetryStore:
                 max(0, int(sample_count)),
                 str(model),
                 str(reason)[:240],
-                self._payload_json(dict(evidence)),
+                self._payload_json(evidence_payload),
             ),
         )
         self.connect().commit()
-        return int(cast(int, cursor.lastrowid))
+        return SourceGrade(
+            id=int(cast(int, cursor.lastrowid)),
+            created_at_ms=created_at_ms,
+            source=str(source),
+            horizon=str(horizon or "medium"),
+            window_start_ms=int(window_start_ms),
+            window_end_ms=int(window_end_ms),
+            grade=bounded_grade,
+            sample_count=max(0, int(sample_count)),
+            model=str(model),
+            reason=str(reason)[:240],
+            evidence=evidence_payload,
+        )
 
     def recent_grades(self, *, limit: int = 50) -> list[SourceGrade]:
         rows = self.connect().execute(

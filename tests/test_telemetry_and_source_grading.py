@@ -68,6 +68,9 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
                 {
                     "grades": {
                         "cointelegraph|short": 9,
+                        "dict_component|medium": 5,
+                        "raw_0|medium": 5,
+                        "raw_1|medium": 5,
                     }
                 }
             )
@@ -86,6 +89,10 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
     assert cointelegraph.grade == 9
     assert run.asdict()["graded_sources"] >= 1
     assert cointelegraph.asdict()["source"] == "cointelegraph"
+    with TradingTelemetryStore(db) as store:
+        recent_grades = store.recent_grades(limit=2)
+    assert len(recent_grades) == 2
+    assert recent_grades[0].model == "gemma4:e4b"
     assert "cointelegraph" in render_source_grade_run(run)
 
 
@@ -122,11 +129,36 @@ def test_source_grading_empty_and_ollama_fallback(tmp_path) -> None:
     assert heuristic.ai_status == "disabled"
     assert heuristic.status == "ok"
 
+    calls = {"count": 0}
+
+    def post_json_missing(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"response": json.dumps({"grades": {}})}
+        return []
+
+    partial = grade_sources(
+        db_path=db,
+        window_hours=1,
+        ollama_enabled=True,
+        post_json=post_json_missing,
+        now_ms=NOW_MS + 2,
+    )
+    assert partial.status == "warn"
+    assert partial.ai_status == "ok"
+    assert partial.grades[0].model == "heuristic"
+    assert "missed" in partial.warnings[0]
+
 
 def test_source_grading_helper_edges() -> None:
     assert isinstance(source_grading._now_ms(), int)
     assert source_grading._clamp_int("bad", 0, 10, 5) == 5
     assert source_grading._clamp_int(99, 0, 10, 5) == 10
+    assert source_grading._recover_grade_mapping("no grades") == {}
+    assert source_grading._recover_grade_mapping('{"grades":{"x|medium":8,"y|short":10}}') == {
+        "x|medium": 8,
+        "y|short": 10,
+    }
     assert source_grading._json_mapping_from_text("prefix {\"grades\": []} suffix") == {"grades": []}
     with pytest.raises(json.JSONDecodeError):
         source_grading._json_mapping_from_text("no json")
@@ -181,6 +213,88 @@ def test_source_grading_helper_edges() -> None:
     )
     assert grades[("x", "medium")] == (5, "AI grade")
     assert grades[("list_source", "medium")] == (7, "AI grade")
+    single_key, single_grade, _latency = source_grading._ai_grade_single(
+        {**rollups[0], "source": "single", "horizon": "short"},
+        model="gemma4:e4b",
+        base_url="http://localhost:11434",
+        timeout_seconds=1.0,
+        post_json=lambda *_args, **_kwargs: {"response": "grade: 6"},
+    )
+    assert single_key == ("single", "short")
+    assert single_grade == (6, "AI single-source grade")
+    with pytest.raises(ValueError, match="unexpected Ollama"):
+        source_grading._ai_grade_single(
+            rollups[0],
+            model="gemma4:e4b",
+            base_url="http://localhost:11434",
+            timeout_seconds=1.0,
+            post_json=lambda *_args, **_kwargs: [],
+        )
+    with pytest.raises(json.JSONDecodeError):
+        source_grading._ai_grade_single(
+            rollups[0],
+            model="gemma4:e4b",
+            base_url="http://localhost:11434",
+            timeout_seconds=1.0,
+            post_json=lambda *_args, **_kwargs: {"response": "not parseable"},
+        )
+    recovered, _latency = source_grading._ai_grades(
+        rollups,
+        model="gemma4:e4b",
+        base_url="http://localhost:11434",
+        timeout_seconds=1.0,
+        post_json=lambda *_args, **_kwargs: {
+            "response": '{"grades":{"x|medium":8,"list_source|medium":7,"bad":"'
+        },
+    )
+    assert recovered[("x", "medium")] == (8, "AI grade (recovered JSON)")
+    assert recovered[("list_source", "medium")] == (7, "AI grade (recovered JSON)")
+    two_rollups = [
+        rollups[0],
+        {
+            "source": "missing",
+            "horizon": "short",
+            "sample_count": 2,
+            "avg_score": 0.1,
+            "avg_abs_score": 0.1,
+            "avg_confidence": 0.2,
+            "raw_records": 1,
+            "component_records": 1,
+        },
+    ]
+    calls = {"count": 0}
+
+    def post_json_partial(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"response": json.dumps({"grades": {"x|medium": 8}})}
+        return {"response": json.dumps({"grade": 9, "reason": "single fill"})}
+
+    filled, _latency = source_grading._ai_grades(
+        two_rollups,
+        model="gemma4:e4b",
+        base_url="http://localhost:11434",
+        timeout_seconds=1.0,
+        post_json=post_json_partial,
+    )
+    assert filled[("x", "medium")] == (8, "AI grade")
+    assert filled[("missing", "short")] == (9, "single fill")
+    calls["count"] = 0
+
+    def post_json_single_failure(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"response": json.dumps({"grades": {"x|medium": 8}})}
+        return []
+
+    partial_fill, _latency = source_grading._ai_grades(
+        two_rollups,
+        model="gemma4:e4b",
+        base_url="http://localhost:11434",
+        timeout_seconds=1.0,
+        post_json=post_json_single_failure,
+    )
+    assert partial_fill == {("x", "medium"): (8, "AI grade")}
     mapped, _latency = source_grading._ai_grades(
         rollups,
         model="gemma4:e4b",
