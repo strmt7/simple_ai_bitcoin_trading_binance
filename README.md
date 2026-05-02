@@ -170,6 +170,10 @@ success count, and latency on the current host before choosing an interval.
 `source-grades` reviews stored telemetry over a time window and writes integer
 0-10 grades per source/horizon; it uses Ollama when available and falls back to
 deterministic evidence scoring when unavailable.
+Live signal collection then uses the latest fresh grade for each source/horizon
+to downweight unreliable sources and modestly boost proven ones. The grade age
+cap is configurable with `--source-grade-max-age-hours` or the matching strategy
+setting; use `0` only when you intentionally want no age cap.
 
 For an auditable real-data production soak, run:
 

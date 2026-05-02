@@ -361,6 +361,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_signals.add_argument("--ollama-url", default=None)
     parser_signals.add_argument("--ollama-timeout", type=float, default=None)
     parser_signals.add_argument("--telemetry-db", default=None, help="SQLite raw telemetry DB path")
+    parser_signals.add_argument("--source-grade-max-age-hours", type=float, default=None, help="ignore source grades older than this; 0 disables the age cap")
     parser_signals.add_argument("--no-telemetry", action="store_true", help="do not journal raw provider/model payloads")
     parser_signals.add_argument("--loop", action="store_true", help="poll repeatedly with jitter instead of one collection")
     parser_signals.add_argument("--iterations", type=int, default=0, help="loop iterations; 0 means until interrupted")
@@ -501,6 +502,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser_strategy.add_argument("--no-source-grading", action="store_false", dest="source_grading")
     parser_strategy.add_argument("--source-grading-interval", type=int, default=None)
     parser_strategy.add_argument("--source-grading-window-hours", type=int, default=None)
+    parser_strategy.add_argument("--source-grade-max-age-hours", type=float, default=None)
     parser_strategy.set_defaults(func=command_strategy)
 
     parser_shell = subparsers.add_parser("shell", help="launch the Claude-Code-inspired interactive shell")
@@ -812,6 +814,7 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             source_grading=None,
             source_grading_interval=None,
             source_grading_window_hours=None,
+            source_grade_max_age_hours=None,
         )
     enabled_features = normalize_enabled_features(selected_features)
     payload = await ui.form(
@@ -850,6 +853,7 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             FormField("telemetry_db", "Raw telemetry DB", str(cfg.telemetry_db_path)),
             FormField("source_grading", "Hourly source grading [yes/no]", str(cfg.source_grading_enabled)),
             FormField("source_grading_interval", "Source grading interval seconds", str(cfg.source_grading_interval_seconds)),
+            FormField("source_grade_max_age_hours", "Source grade max age hours", str(cfg.source_grade_max_age_hours)),
         ],
     )
     if payload is None:
@@ -894,6 +898,7 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             source_grading=None,
             source_grading_interval=None,
             source_grading_window_hours=None,
+            source_grade_max_age_hours=None,
         )
     profile = _parse_strategy_profile(payload["profile"])
 
@@ -1031,6 +1036,13 @@ async def _ui_edit_strategy_args(ui, cfg: StrategyConfig) -> argparse.Namespace:
             minimum=60,
         ),
         source_grading_window_hours=None,
+        source_grade_max_age_hours=field_float(
+            "source_grade_max_age_hours",
+            cfg.source_grade_max_age_hours,
+            "Source grade max age hours",
+            minimum=0.0,
+            maximum=8760.0,
+        ),
     )
 
 
@@ -3107,6 +3119,8 @@ def command_strategy(args: argparse.Namespace) -> int:
         updates["source_grading_interval_seconds"] = max(60, int(args.source_grading_interval))
     if getattr(args, "source_grading_window_hours", None) is not None:
         updates["source_grading_window_hours"] = max(1, int(args.source_grading_window_hours))
+    if getattr(args, "source_grade_max_age_hours", None) is not None:
+        updates["source_grade_max_age_hours"] = _clamp(float(args.source_grade_max_age_hours), 0.0, 8760.0)
     feature_window_short = getattr(args, "feature_window_short", None)
     feature_window_long = getattr(args, "feature_window_long", None)
     if feature_window_short is not None or feature_window_long is not None:
@@ -4036,6 +4050,15 @@ def command_signals(args: argparse.Namespace) -> int:
                     30.0,
                 ),
                 telemetry_path=telemetry_path,
+                source_grade_max_age_hours=_clamp(
+                    float(
+                        cfg.source_grade_max_age_hours
+                        if getattr(args, "source_grade_max_age_hours", None) is None
+                        else getattr(args, "source_grade_max_age_hours")
+                    ),
+                    0.0,
+                    8760.0,
+                ),
             )
         except Exception as exc:
             print(f"External signal collection failed: {exc}", file=sys.stderr)
@@ -4142,6 +4165,7 @@ def command_signals_benchmark(args: argparse.Namespace) -> int:
                             30.0,
                         ),
                         telemetry_path=None if getattr(args, "no_telemetry", False) or not cfg.telemetry_enabled else cfg.telemetry_db_path,
+                        source_grade_max_age_hours=cfg.source_grade_max_age_hours,
                     )
                     status = report.status
                     fresh_counts.append(report.fresh_count)
@@ -4523,6 +4547,7 @@ def command_live(args: argparse.Namespace) -> int:
                     ollama_url=cfg.external_news_ai_url,
                     ollama_timeout_seconds=cfg.external_news_ai_timeout_seconds,
                     telemetry_path=cfg.telemetry_db_path if cfg.telemetry_enabled else None,
+                    source_grade_max_age_hours=cfg.source_grade_max_age_hours,
                 )
                 score, decision_cfg, applied_adjustment = _apply_external_signal_to_score(
                     score,

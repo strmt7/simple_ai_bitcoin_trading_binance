@@ -138,6 +138,7 @@ class StrategyConfig:
     source_grading_enabled: bool = True
     source_grading_interval_seconds: int = 3600
     source_grading_window_hours: int = 24
+    source_grade_max_age_hours: float = 168.0
 
     def __post_init__(self) -> None:
         windows = tuple(self.feature_windows) if isinstance(self.feature_windows, (list, tuple)) else (10, 40)
@@ -205,6 +206,10 @@ class StrategyConfig:
         self.source_grading_enabled = _coerce_bool(self.source_grading_enabled, True)
         self.source_grading_interval_seconds = max(60, _coerce_int(self.source_grading_interval_seconds, 3600))
         self.source_grading_window_hours = max(1, _coerce_int(self.source_grading_window_hours, 24))
+        self.source_grade_max_age_hours = min(
+            8760.0,
+            max(0.0, _finite_float(self.source_grade_max_age_hours, 168.0)),
+        )
         self.enabled_features = normalize_enabled_features(self.enabled_features)
 
     def asdict(self) -> Dict[str, Any]:

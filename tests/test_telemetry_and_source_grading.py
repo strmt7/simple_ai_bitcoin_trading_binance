@@ -96,6 +96,60 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
     assert "cointelegraph" in render_source_grade_run(run)
 
 
+def test_latest_source_grades_selects_latest_and_filters_stale(tmp_path) -> None:
+    db = tmp_path / "latest-grades.sqlite"
+    with TradingTelemetryStore(db) as store:
+        old_duplicate = store.record_source_grade(
+            source="coingecko_bitcoin",
+            horizon="medium",
+            window_start_ms=NOW_MS - 7_200_000,
+            window_end_ms=NOW_MS - 3_600_000,
+            grade=2,
+            sample_count=4,
+            model="heuristic",
+            reason="old",
+            evidence={},
+        )
+        fresh_duplicate = store.record_source_grade(
+            source="coingecko_bitcoin",
+            horizon="medium",
+            window_start_ms=NOW_MS - 3_600_000,
+            window_end_ms=NOW_MS - 1,
+            grade=8,
+            sample_count=9,
+            model="gemma4:e4b",
+            reason="fresh",
+            evidence={"latency_ms": 42},
+        )
+        stale_only = store.record_source_grade(
+            source="old_feed",
+            horizon="long",
+            window_start_ms=NOW_MS - 7_200_000,
+            window_end_ms=NOW_MS - 3_600_000,
+            grade=9,
+            sample_count=2,
+            model="heuristic",
+            reason="stale",
+            evidence={},
+        )
+        store.connect().executemany(
+            "UPDATE source_grades SET created_at_ms = ? WHERE id = ?",
+            [
+                (NOW_MS - 5_000, old_duplicate.id),
+                (NOW_MS - 1_000, fresh_duplicate.id),
+                (NOW_MS - 5_000, stale_only.id),
+            ],
+        )
+        store.connect().commit()
+        latest = store.latest_source_grades()
+        fresh = store.latest_source_grades(max_age_ms=2_000, now_ms=NOW_MS)
+
+    assert latest[("coingecko_bitcoin", "medium")].grade == 8
+    assert latest[("old_feed", "long")].grade == 9
+    assert fresh[("coingecko_bitcoin", "medium")].grade == 8
+    assert ("old_feed", "long") not in fresh
+
+
 def test_source_grading_empty_and_ollama_fallback(tmp_path) -> None:
     empty = grade_sources(db_path=tmp_path / "empty.sqlite", window_hours=1, ollama_enabled=False, now_ms=NOW_MS)
     assert empty.status == "empty"

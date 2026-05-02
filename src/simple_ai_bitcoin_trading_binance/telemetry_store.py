@@ -350,3 +350,41 @@ class TradingTelemetryStore:
             )
             for row in rows
         ]
+
+    def latest_source_grades(
+        self,
+        *,
+        max_age_ms: int | None = None,
+        now_ms: int | None = None,
+    ) -> dict[tuple[str, str], SourceGrade]:
+        params: list[object] = []
+        query = """
+            SELECT id, created_at_ms, source, horizon, window_start_ms, window_end_ms,
+                   grade, sample_count, model, reason, evidence_json
+            FROM source_grades
+            """
+        if max_age_ms is not None:
+            reference_ms = self._now_ms() if now_ms is None else int(now_ms)
+            query += " WHERE created_at_ms >= ?"
+            params.append(reference_ms - max(0, int(max_age_ms)))
+        query += " ORDER BY created_at_ms DESC, window_end_ms DESC, id DESC"
+        rows = self.connect().execute(query, params).fetchall()
+        latest: dict[tuple[str, str], SourceGrade] = {}
+        for row in rows:
+            key = (str(row["source"]), str(row["horizon"]))
+            if key in latest:
+                continue
+            latest[key] = SourceGrade(
+                id=int(row["id"]),
+                created_at_ms=int(row["created_at_ms"]),
+                source=str(row["source"]),
+                horizon=str(row["horizon"]),
+                window_start_ms=int(row["window_start_ms"]),
+                window_end_ms=int(row["window_end_ms"]),
+                grade=int(row["grade"]),
+                sample_count=int(row["sample_count"]),
+                model=str(row["model"]),
+                reason=str(row["reason"]),
+                evidence=cast(dict[str, object], json.loads(str(row["evidence_json"]))),
+            )
+        return latest

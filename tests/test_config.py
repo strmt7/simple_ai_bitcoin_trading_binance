@@ -255,6 +255,7 @@ def test_runtime_and_strategy_configs_coerce_nonfinite_and_string_values(tmp_pat
         telemetry_enabled="no",
         telemetry_db_path="",
         source_grading_interval_seconds=1,
+        source_grade_max_age_hours=float("inf"),
     )
     assert strategy.leverage == 1.0
     assert strategy.risk_per_trade == 0.01
@@ -275,6 +276,7 @@ def test_runtime_and_strategy_configs_coerce_nonfinite_and_string_values(tmp_pat
     assert strategy.telemetry_enabled is False
     assert strategy.telemetry_db_path == "data/trading_telemetry.sqlite"
     assert strategy.source_grading_interval_seconds == 60
+    assert strategy.source_grade_max_age_hours == 168.0
 
     monkeypatch.setenv("HOME", str(tmp_path))
     cfg_file = config_paths()["strategy"]

@@ -418,6 +418,7 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
                 "telemetry_db": "data/trading_telemetry.sqlite",
                 "source_grading": "yes",
                 "source_grading_interval": "3600",
+                "source_grade_max_age_hours": "168",
             }
         ],
     )
@@ -434,6 +435,7 @@ def test_tui_strategy_action_builds_full_strategy_args(monkeypatch) -> None:
     assert captured["args"].external_signal_min_providers == 3
     assert captured["args"].external_news_ai is True
     assert captured["args"].external_news_provider_limit == 40
+    assert captured["args"].source_grade_max_age_hours == 168.0
     assert captured["args"].set_features == "momentum_1,rsi"
 
 

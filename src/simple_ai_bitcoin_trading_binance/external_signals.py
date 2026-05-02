@@ -192,6 +192,9 @@ class ExternalSignalComponent:
     cached: bool = False
     horizon: str = "medium"
     urgency: float = 0.0
+    source_grade: int | None = None
+    source_grade_model: str = ""
+    source_grade_weight_multiplier: float = 1.0
 
     def asdict(self) -> dict[str, object]:
         return asdict(self)
@@ -1046,9 +1049,69 @@ def _component_from_payload(payload: Mapping[str, object]) -> ExternalSignalComp
             cached=bool(payload.get("cached", False)),
             horizon=str(payload.get("horizon") or "medium"),
             urgency=_safe_float(payload.get("urgency"), 0.0),
+            source_grade=(
+                None
+                if payload.get("source_grade") is None
+                else int(_clamp(_safe_float(payload.get("source_grade"), 0.0), 0.0, 10.0))
+            ),
+            source_grade_model=str(payload.get("source_grade_model") or ""),
+            source_grade_weight_multiplier=_safe_float(payload.get("source_grade_weight_multiplier"), 1.0),
         )
     except (TypeError, ValueError):
         return None
+
+
+def _grade_weight_multiplier(grade: object) -> float:
+    bounded = int(_clamp(_safe_float(grade, 5.0), 0.0, 10.0))
+    if bounded <= 5:
+        return _clamp(0.25 + bounded * 0.15, 0.25, 1.0)
+    return _clamp(1.0 + (bounded - 5) * 0.05, 1.0, 1.25)
+
+
+def _source_grade_for_component(
+    component: ExternalSignalComponent,
+    source_grades: Mapping[tuple[str, str], object],
+) -> object | None:
+    horizons = [component.horizon]
+    if component.horizon != "medium":
+        horizons.append("medium")
+    for horizon in horizons:
+        grade = source_grades.get((component.provider, horizon))
+        if grade is not None:
+            return grade
+    return None
+
+
+def _apply_source_grade_weights(
+    components: list[ExternalSignalComponent],
+    source_grades: Mapping[tuple[str, str], object],
+) -> list[ExternalSignalComponent]:
+    if not source_grades:
+        return components
+    adjusted: list[ExternalSignalComponent] = []
+    for component in components:
+        source_grade = _source_grade_for_component(component, source_grades)
+        if source_grade is None or component.status != "ok" or component.weight <= 0.0:
+            adjusted.append(component)
+            continue
+        grade_value = int(_clamp(_safe_float(getattr(source_grade, "grade", 5), 5.0), 0.0, 10.0))
+        multiplier = _grade_weight_multiplier(grade_value)
+        model = str(getattr(source_grade, "model", "") or "")
+        grade_note = f"source_grade={grade_value}/10 multiplier={multiplier:.2f}"
+        if model:
+            grade_note = f"{grade_note} grade_model={model}"
+        payload = component.asdict()
+        payload.update(
+            {
+                "weight": component.weight * multiplier,
+                "detail": f"{component.detail} {grade_note}".strip(),
+                "source_grade": grade_value,
+                "source_grade_model": model,
+                "source_grade_weight_multiplier": multiplier,
+            }
+        )
+        adjusted.append(ExternalSignalComponent(**payload))
+    return adjusted
 
 
 def report_from_payload(payload: Mapping[str, object]) -> ExternalSignalReport | None:
@@ -1139,6 +1202,7 @@ def _combine_components(
     news_ai_model: str = DEFAULT_OLLAMA_NEWS_MODEL,
     news_ai_latency_ms: int = 0,
     news_ai_reason: str = "",
+    extra_warnings: list[str] | None = None,
 ) -> ExternalSignalReport:
     usable = [component for component in components if component.status == "ok" and component.weight > 0.0]
     warnings = [
@@ -1146,6 +1210,7 @@ def _combine_components(
         for component in components
         if component.status == "error" and component.error
     ]
+    warnings.extend(extra_warnings or [])
     total_weight = sum(component.weight for component in usable)
     raw_score = sum(component.score * component.weight for component in usable) / total_weight if total_weight else 0.0
     horizon_scores: dict[str, float] = {}
@@ -1236,6 +1301,7 @@ def collect_external_signals(
     ollama_timeout_seconds: float = 3.0,
     post_json: PostJson = _post_json,
     telemetry_path: str | Path | None = None,
+    source_grade_max_age_hours: float = 168.0,
     now_ms: int | None = None,
 ) -> ExternalSignalReport:
     now = _now_ms() if now_ms is None else int(now_ms)
@@ -1343,6 +1409,21 @@ def collect_external_signals(
             news_ai_status = "error"
             news_ai_reason = str(exc)[:180]
 
+    source_grade_warnings: list[str] = []
+    if telemetry_path is not None:
+        try:
+            from .telemetry_store import TradingTelemetryStore
+
+            max_age_hours = _safe_float(source_grade_max_age_hours, 168.0)
+            max_age_ms = None if max_age_hours <= 0.0 else int(max_age_hours * 3_600_000)
+            with TradingTelemetryStore(telemetry_path) as store:
+                components = _apply_source_grade_weights(
+                    components,
+                    store.latest_source_grades(max_age_ms=max_age_ms, now_ms=now),
+                )
+        except Exception as exc:  # pragma: no cover - telemetry must never block trading signals
+            source_grade_warnings.append(f"source grade weighting unavailable: {exc.__class__.__name__}")
+
     report = _combine_components(
         components,
         max_adjustment=max_adjustment,
@@ -1355,6 +1436,7 @@ def collect_external_signals(
         news_ai_model=ollama_model,
         news_ai_latency_ms=news_ai_latency_ms,
         news_ai_reason=news_ai_reason,
+        extra_warnings=source_grade_warnings,
     )
     cache.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(cache, report.asdict(), indent=2, sort_keys=True)

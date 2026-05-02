@@ -177,6 +177,69 @@ def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
     assert any(isinstance(item.payload, dict) and "parsed" in item.payload for item in observations)
 
 
+def test_collect_external_signals_uses_source_grades_for_live_weights(tmp_path) -> None:
+    from simple_ai_bitcoin_trading_binance.telemetry_store import TradingTelemetryStore
+
+    telemetry = tmp_path / "graded.sqlite"
+    with TradingTelemetryStore(telemetry) as store:
+        high = store.record_source_grade(
+            source="coingecko_bitcoin",
+            horizon="medium",
+            window_start_ms=NOW_MS - 3_600_000,
+            window_end_ms=NOW_MS - 1,
+            grade=10,
+            sample_count=8,
+            model="gemma4:e4b",
+            reason="strong source",
+            evidence={"hit_rate": 0.9},
+        )
+        low = store.record_source_grade(
+            source="cryptocompare_btc_news",
+            horizon="short",
+            window_start_ms=NOW_MS - 3_600_000,
+            window_end_ms=NOW_MS - 1,
+            grade=0,
+            sample_count=8,
+            model="gemma4:e4b",
+            reason="bad short-term source",
+            evidence={"hit_rate": 0.1},
+        )
+        store.connect().execute(
+            "UPDATE source_grades SET created_at_ms = ? WHERE id IN (?, ?)",
+            (NOW_MS - 1_000, high.id, low.id),
+        )
+        store.connect().commit()
+
+    report = signals.collect_external_signals(
+        cache_path=tmp_path / "graded-signals.json",
+        fetch_json=_good_fetch,
+        force_refresh=True,
+        now_ms=NOW_MS,
+        telemetry_path=telemetry,
+        source_grade_max_age_hours=1.0,
+    )
+    coingecko = [component for component in report.components if component.provider == "coingecko_bitcoin"][0]
+    cryptocompare = [component for component in report.components if component.provider == "cryptocompare_btc_news"][0]
+    assert coingecko.source_grade == 10
+    assert coingecko.source_grade_model == "gemma4:e4b"
+    assert coingecko.source_grade_weight_multiplier == pytest.approx(1.25)
+    assert coingecko.weight == pytest.approx(0.875)
+    assert "source_grade=10/10" in coingecko.detail
+    assert cryptocompare.source_grade == 0
+    assert cryptocompare.source_grade_weight_multiplier == pytest.approx(0.25)
+    assert cryptocompare.weight == pytest.approx(0.1375)
+
+    unbounded = signals.collect_external_signals(
+        cache_path=tmp_path / "graded-signals-unbounded.json",
+        fetch_json=_good_fetch,
+        force_refresh=True,
+        now_ms=NOW_MS,
+        telemetry_path=telemetry,
+        source_grade_max_age_hours=0.0,
+    )
+    assert [component for component in unbounded.components if component.provider == "coingecko_bitcoin"][0].source_grade == 10
+
+
 def test_rss_provider_parser_jitter_and_ollama_error(tmp_path, monkeypatch) -> None:
     sleeps: list[float] = []
     monkeypatch.setattr(signals._JITTER_RANDOM, "uniform", lambda _low, high: high)
@@ -413,6 +476,27 @@ def test_external_signal_payload_cache_and_helpers(tmp_path, monkeypatch) -> Non
     scores, backend = signals._score_news_texts(["Bitcoin adoption rally", "Bitcoin hack"], compute_backend="cpu")
     assert scores == [1.0, -1.0]
     assert backend.kind == "cpu"
+    assert signals._grade_weight_multiplier(0) == pytest.approx(0.25)
+    assert signals._grade_weight_multiplier(5) == pytest.approx(1.0)
+    assert signals._grade_weight_multiplier(10) == pytest.approx(1.25)
+    assert signals._apply_source_grade_weights([], {}) == []
+    fallback_component = signals.ExternalSignalComponent(
+        provider="graded_provider",
+        status="ok",
+        score=0.0,
+        weight=1.0,
+        value=None,
+        detail="",
+        known_at_ms=NOW_MS,
+        horizon="short",
+    )
+    fallback_grade = type("Grade", (), {"grade": 5, "model": ""})()
+    fallback_adjusted = signals._apply_source_grade_weights(
+        [fallback_component],
+        {("graded_provider", "medium"): fallback_grade},
+    )[0]
+    assert fallback_adjusted.source_grade == 5
+    assert fallback_adjusted.source_grade_model == ""
     assert signals._parse_epoch_ms(NOW_MS, 0) == NOW_MS
     assert signals._parse_gdelt_seen_ms("", NOW_MS) == NOW_MS
     assert signals._parse_gdelt_seen_ms("bad", NOW_MS) == NOW_MS
@@ -420,6 +504,19 @@ def test_external_signal_payload_cache_and_helpers(tmp_path, monkeypatch) -> Non
     assert signals._binance_symbol_candidates("btcusdc") == ["BTCUSDC", "BTCUSDT"]
     assert signals.report_from_payload({"components": "bad"}) is None
     assert signals.report_from_payload({"components": [{"provider": ""}, {"provider": "x", "score": "bad"}]}) is not None
+    graded_payload = signals._component_from_payload(
+        {
+            "provider": "graded",
+            "weight": 1.0,
+            "source_grade": 9,
+            "source_grade_model": "gemma4:e4b",
+            "source_grade_weight_multiplier": 1.2,
+        }
+    )
+    assert graded_payload is not None
+    assert graded_payload.source_grade == 9
+    assert graded_payload.source_grade_model == "gemma4:e4b"
+    assert graded_payload.source_grade_weight_multiplier == pytest.approx(1.2)
     monkeypatch.setattr(signals, "ExternalSignalComponent", lambda **_kwargs: (_ for _ in ()).throw(TypeError("bad")))
     assert signals._component_from_payload({"provider": "x"}) is None
     monkeypatch.undo()

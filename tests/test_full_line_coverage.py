@@ -108,6 +108,7 @@ def _strategy_form(**overrides: str) -> dict[str, str]:
         "telemetry_db": str(cfg.telemetry_db_path),
         "source_grading": str(cfg.source_grading_enabled),
         "source_grading_interval": str(cfg.source_grading_interval_seconds),
+        "source_grade_max_age_hours": str(cfg.source_grade_max_age_hours),
     }
     payload.update(overrides)
     return payload

@@ -3009,6 +3009,7 @@ def test_tui_strategy_profile_uses_unchanged_fields_as_profile_defaults(tmp_path
         "telemetry_db": "data/trading_telemetry.sqlite",
         "source_grading": "True",
         "source_grading_interval": "3600",
+        "source_grade_max_age_hours": "72",
     }
 
     class _UI:
@@ -3032,6 +3033,7 @@ def test_tui_strategy_profile_uses_unchanged_fields_as_profile_defaults(tmp_path
     assert updated.risk_per_trade == 0.015
     assert updated.signal_threshold == 0.55
     assert updated.external_signals_enabled is True
+    assert updated.source_grade_max_age_hours == 72.0
 
 
 def test_existing_position_detection_helpers() -> None:
