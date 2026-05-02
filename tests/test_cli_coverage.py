@@ -97,6 +97,35 @@ def test_threshold_classification_guard_modes() -> None:
     assert guard["precision_floor"] == 0.38
 
 
+def test_threshold_capital_preservation_guard_modes() -> None:
+    accepted = SimpleNamespace(
+        accepted=True,
+        best_score=0.10,
+        baseline_score=-0.90,
+        realized_pnl=-0.02,
+        baseline_realized_pnl=-0.50,
+        closed_trades=1,
+        baseline_closed_trades=30,
+    )
+    guard = cli._threshold_capital_preservation_guard(accepted)
+    assert guard["passed"] is True
+    assert guard["mode"] == "capital_preservation"
+    assert guard["closed_trades"] == 1
+
+    weak = SimpleNamespace(
+        accepted=True,
+        best_score=-0.88,
+        baseline_score=-0.90,
+        realized_pnl=-0.49,
+        baseline_realized_pnl=-0.50,
+        closed_trades=1,
+        baseline_closed_trades=30,
+    )
+    rejected = cli._threshold_capital_preservation_guard(weak)
+    assert rejected["passed"] is False
+    assert rejected["mode"] == "rejected"
+
+
 def test_parse_args_and_main_dispatch(monkeypatch) -> None:
     args = cli._parse_args(["status"])
     assert callable(args.func)
@@ -1223,6 +1252,12 @@ def test_command_train_accepts_profit_threshold_candidate(tmp_path, monkeypatch,
         accepted = True
         threshold = 0.7
         best_threshold = 0.7
+        best_score = 3.0
+        baseline_score = 1.0
+        realized_pnl = 2.0
+        baseline_realized_pnl = -1.0
+        closed_trades = 4
+        baseline_closed_trades = 18
 
         def asdict(self) -> dict[str, object]:
             return {
@@ -1230,8 +1265,10 @@ def test_command_train_accepts_profit_threshold_candidate(tmp_path, monkeypatch,
                 "realized_pnl": 2.0,
                 "closed_trades": 4,
                 "best_threshold": 0.7,
-                "best_score": 3.0,
-                "baseline_score": 1.0,
+                "best_score": self.best_score,
+                "baseline_score": self.baseline_score,
+                "baseline_realized_pnl": self.baseline_realized_pnl,
+                "baseline_closed_trades": self.baseline_closed_trades,
             }
 
     reports = [
@@ -1247,15 +1284,15 @@ def test_command_train_accepts_profit_threshold_candidate(tmp_path, monkeypatch,
             false_negative=3,
         ),
         SimpleNamespace(
-            accuracy=0.56,
-            precision=0.41,
+            accuracy=0.80,
+            precision=0.0,
             recall=0.20,
-            f1=0.25,
+            f1=0.0,
             threshold=0.7,
-            true_positive=2,
+            true_positive=0,
             false_positive=3,
             true_negative=15,
-            false_negative=8,
+            false_negative=10,
         ),
     ]
     monkeypatch.setattr(cli, "calibrate_threshold_for_backtest", lambda *_a, **_k: _ProfitCalibration())

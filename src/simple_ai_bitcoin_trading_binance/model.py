@@ -870,6 +870,31 @@ def _torch_device_for_backend(backend: BackendInfo):  # pragma: no cover - optio
     return backend.device
 
 
+def _maybe_promote_averaged_params(
+    rows: List[ModelRow],
+    validation_rows: List[ModelRow],
+    weights: List[float],
+    bias: float,
+    means: List[float],
+    stds: List[float],
+    averaged_weights: List[float],
+    averaged_bias: float,
+    averaged_count: int,
+    *,
+    min_delta: float,
+) -> tuple[List[float], float]:
+    if averaged_count <= 0:
+        return weights, bias
+    candidate_weights = [value / averaged_count for value in averaged_weights]
+    candidate_bias = averaged_bias / averaged_count
+    selector_rows = validation_rows if validation_rows else rows
+    current_loss = _log_loss(selector_rows, weights, bias, means, stds)
+    candidate_loss = _log_loss(selector_rows, candidate_weights, candidate_bias, means, stds)
+    if candidate_loss < current_loss - float(min_delta):
+        return candidate_weights, candidate_bias
+    return weights, bias
+
+
 def _train_torch(  # pragma: no cover - exercised by GPU smoke verification, not CI
     rows: List[ModelRow],
     *,
@@ -912,6 +937,10 @@ def _train_torch(  # pragma: no cover - exercised by GPU smoke verification, not
     batch = max(1, min(int(batch_size or len(rows)), len(rows)))
     pos_weight = torch.tensor(float(class_weight_pos), dtype=torch.float32, device=device)
     neg_weight = torch.tensor(float(class_weight_neg), dtype=torch.float32, device=device)
+    averaged_weights = [0.0] * feature_dim
+    averaged_bias = 0.0
+    averaged_count = 0
+    average_start_epoch = max(1, int(epochs) // 2)
 
     for epoch_index in range(1, int(epochs) + 1):
         for start in range(0, len(rows), batch):
@@ -929,6 +958,10 @@ def _train_torch(  # pragma: no cover - exercised by GPU smoke verification, not
             optimizer.step()
         current_weights = [float(value) for value in weights.detach().cpu().tolist()]
         current_bias = float(bias.detach().cpu().item())
+        if epoch_index >= average_start_epoch:
+            averaged_weights = [left + right for left, right in zip(averaged_weights, current_weights, strict=True)]
+            averaged_bias += current_bias
+            averaged_count += 1
         if validation_rows:
             current_loss = _log_loss(validation_rows, current_weights, current_bias, means, stds)
             if current_loss < best_validation_loss - float(min_delta):
@@ -951,6 +984,18 @@ def _train_torch(  # pragma: no cover - exercised by GPU smoke verification, not
     else:
         final_weights = [float(value) for value in weights.detach().cpu().tolist()]
         final_bias = float(bias.detach().cpu().item())
+    final_weights, final_bias = _maybe_promote_averaged_params(
+        rows,
+        validation_rows,
+        final_weights,
+        final_bias,
+        means,
+        stds,
+        averaged_weights,
+        averaged_bias,
+        averaged_count,
+        min_delta=min_delta,
+    )
 
     training_loss = _log_loss(rows, final_weights, final_bias, means, stds)
     validation_loss = _log_loss(validation_rows, final_weights, final_bias, means, stds) if validation_rows else None
@@ -1033,6 +1078,10 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
     best_validation_loss = float("inf")
     rounds_without_improvement = 0
     patience = int(early_stopping_rounds or 0)
+    averaged_weights = [0.0] * feature_dim
+    averaged_bias = 0.0
+    averaged_count = 0
+    average_start_epoch = max(1, int(epochs) // 2)
 
     for epoch_index in range(1, int(epochs) + 1):
         rng.shuffle(indices)
@@ -1049,6 +1098,10 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
                 grad = error * xi + l2_penalty * weights[i]
                 weights[i] -= learning_rate * grad
             bias -= learning_rate * error
+        if epoch_index >= average_start_epoch:
+            averaged_weights = [left + right for left, right in zip(averaged_weights, weights, strict=True)]
+            averaged_bias += bias
+            averaged_count += 1
         if validation_rows:
             current_loss = _log_loss(validation_rows, weights, bias, means, stds)
             if current_loss < best_validation_loss - float(min_delta):
@@ -1065,6 +1118,18 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
     if validation_rows and best_epoch is not None:
         weights = best_weights
         bias = best_bias
+    weights, bias = _maybe_promote_averaged_params(
+        rows,
+        validation_rows,
+        weights,
+        bias,
+        means,
+        stds,
+        averaged_weights,
+        averaged_bias,
+        averaged_count,
+        min_delta=min_delta,
+    )
 
     training_loss = _log_loss(rows, weights, bias, means, stds)
     validation_loss = _log_loss(validation_rows, weights, bias, means, stds) if validation_rows else None

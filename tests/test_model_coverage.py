@@ -21,6 +21,7 @@ from simple_ai_bitcoin_trading_binance.model import (
     _expected_calibration_error,
     _model_log_loss,
     _majority_baseline,
+    _maybe_promote_averaged_params,
     _normalize_rows,
     _positive_rate,
     _probability_stats,
@@ -66,6 +67,59 @@ def test_collect_feature_stats_and_normalize_rows() -> None:
 
     with pytest.raises(ValueError, match="No rows to collect statistics"):
         _collect_feature_stats([])
+
+
+def test_polyak_averaged_candidate_is_only_promoted_when_loss_improves() -> None:
+    rows = [
+        SimpleNamespace(features=(1.0,), label=1),
+        SimpleNamespace(features=(-1.0,), label=0),
+    ]
+    means = [0.0]
+    stds = [1.0]
+    promoted_weights, promoted_bias = _maybe_promote_averaged_params(
+        rows,
+        [],
+        [-4.0],
+        0.0,
+        means,
+        stds,
+        [4.0],
+        0.0,
+        1,
+        min_delta=1e-9,
+    )
+    assert promoted_weights == [4.0]
+    assert promoted_bias == 0.0
+
+    kept_weights, kept_bias = _maybe_promote_averaged_params(
+        rows,
+        [],
+        [4.0],
+        0.0,
+        means,
+        stds,
+        [-4.0],
+        0.0,
+        1,
+        min_delta=1e-9,
+    )
+    assert kept_weights == [4.0]
+    assert kept_bias == 0.0
+
+    no_average_weights, no_average_bias = _maybe_promote_averaged_params(
+        rows,
+        [],
+        [1.0],
+        0.5,
+        means,
+        stds,
+        [0.0],
+        0.0,
+        0,
+        min_delta=1e-9,
+    )
+    assert no_average_weights == [1.0]
+    assert no_average_bias == 0.5
 
 
 def test_validate_model_rows_rejects_malformed_inputs() -> None:

@@ -60,8 +60,8 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
     def post_json(_url: str, payload: dict[str, object], _timeout: float):
         assert payload["model"] == "gemma4:e4b"
         assert payload["keep_alive"] == "30m"
-        assert payload["options"]["num_ctx"] == 2048
-        assert payload["options"]["num_predict"] == 768
+        assert payload["options"]["num_ctx"] == 4096
+        assert payload["options"]["num_predict"] == 1536
         assert "cointelegraph|short" in str(payload["prompt"])
         return {
             "response": json.dumps(
@@ -349,6 +349,28 @@ def test_source_grading_helper_edges() -> None:
         post_json=post_json_single_failure,
     )
     assert partial_fill == {("x", "medium"): (8, "AI grade")}
+    many_rollups = [
+        {**rollups[0], "source": f"source_{index}", "horizon": "medium"}
+        for index in range(source_grading._AI_SINGLE_FILL_LIMIT + 2)
+    ]
+    single_calls = {"count": 0}
+
+    def post_json_limited_singles(*_args, **_kwargs):
+        single_calls["count"] += 1
+        if single_calls["count"] == 1:
+            return {"response": json.dumps({"grades": {"source_0|medium": 8}})}
+        return {"response": json.dumps({"grade": 6, "reason": "limited fill"})}
+
+    limited, _latency = source_grading._ai_grades(
+        many_rollups,
+        model="gemma4:e4b",
+        base_url="http://localhost:11434",
+        timeout_seconds=1.0,
+        post_json=post_json_limited_singles,
+    )
+    assert len(limited) == source_grading._AI_SINGLE_FILL_LIMIT + 1
+    assert ("source_0", "medium") in limited
+    assert (f"source_{source_grading._AI_SINGLE_FILL_LIMIT + 1}", "medium") not in limited
     mapped, _latency = source_grading._ai_grades(
         rollups,
         model="gemma4:e4b",

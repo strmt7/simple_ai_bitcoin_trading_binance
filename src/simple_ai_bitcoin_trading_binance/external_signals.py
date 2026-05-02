@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from html import unescape
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -137,6 +138,85 @@ class OllamaNewsEvaluation:
     reason: str
     raw_payload: object | None = None
 
+
+@dataclass(frozen=True)
+class NewsTrigger:
+    term: str
+    polarity: float
+    importance: float
+    urgency: float
+    category: str
+    horizon: str = "medium"
+
+
+@dataclass(frozen=True)
+class NewsClassification:
+    score: float
+    positive_weight: float
+    negative_weight: float
+    importance: int
+    urgency: float
+    horizon: str
+    category: str
+    matched_terms: tuple[str, ...]
+
+    def asdict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+_NEWS_TRIGGERS: tuple[NewsTrigger, ...] = (
+    NewsTrigger("spot bitcoin etf approval", 1.0, 10.0, 0.90, "regulatory", "short"),
+    NewsTrigger("bitcoin etf approval", 1.0, 9.0, 0.88, "regulatory", "short"),
+    NewsTrigger("etf approval", 1.0, 8.5, 0.84, "regulatory", "short"),
+    NewsTrigger("etf inflow", 1.0, 7.0, 0.72, "liquidity", "short"),
+    NewsTrigger("institutional adoption", 1.0, 7.0, 0.55, "adoption", "medium"),
+    NewsTrigger("institutional buying", 1.0, 7.0, 0.62, "liquidity", "short"),
+    NewsTrigger("reserve demand", 1.0, 6.0, 0.52, "adoption", "medium"),
+    NewsTrigger("upgrade", 0.7, 4.5, 0.30, "technology", "long"),
+    NewsTrigger("breakout", 0.7, 5.0, 0.55, "market", "short"),
+    NewsTrigger("rally", 0.6, 4.5, 0.45, "market", "short"),
+    NewsTrigger("fed rate cut", 0.7, 7.0, 0.70, "macro", "short"),
+    NewsTrigger("sec approval", 0.9, 8.5, 0.84, "regulatory", "short"),
+    NewsTrigger("blackrock inflow", 0.8, 7.0, 0.72, "liquidity", "short"),
+    NewsTrigger("etf denial", -1.0, 9.0, 0.88, "regulatory", "short"),
+    NewsTrigger("etf rejection", -1.0, 9.0, 0.88, "regulatory", "short"),
+    NewsTrigger("approval denied", -1.0, 8.5, 0.86, "regulatory", "short"),
+    NewsTrigger("rejected etf", -1.0, 8.5, 0.86, "regulatory", "short"),
+    NewsTrigger("hack", -1.0, 9.0, 0.92, "security", "short"),
+    NewsTrigger("exploit", -1.0, 9.0, 0.92, "security", "short"),
+    NewsTrigger("exchange exploit", -1.0, 9.5, 0.95, "security", "short"),
+    NewsTrigger("bankruptcy", -1.0, 9.0, 0.90, "counterparty", "short"),
+    NewsTrigger("liquidation", -0.9, 7.5, 0.82, "market", "short"),
+    NewsTrigger("selloff", -0.9, 7.0, 0.78, "market", "short"),
+    NewsTrigger("outflow", -0.7, 6.5, 0.62, "liquidity", "short"),
+    NewsTrigger("ban", -1.0, 9.0, 0.92, "regulatory", "short"),
+    NewsTrigger("crackdown", -1.0, 8.5, 0.86, "regulatory", "short"),
+    NewsTrigger("lawsuit", -0.8, 7.0, 0.74, "regulatory", "short"),
+    NewsTrigger("sec lawsuit", -0.9, 8.0, 0.80, "regulatory", "short"),
+    NewsTrigger("fraud", -1.0, 9.0, 0.90, "counterparty", "short"),
+    NewsTrigger("outage", -0.7, 6.5, 0.76, "infrastructure", "short"),
+    NewsTrigger("fed rate hike", -0.8, 8.0, 0.82, "macro", "short"),
+    NewsTrigger("hawkish fed", -0.7, 7.0, 0.70, "macro", "short"),
+    NewsTrigger("war", -0.6, 7.0, 0.68, "geopolitical", "medium"),
+    NewsTrigger("sanctions", -0.6, 7.0, 0.68, "geopolitical", "medium"),
+    NewsTrigger("bitcoin core release", 0.5, 4.5, 0.20, "technology", "long"),
+)
+
+_NEGATION_TERMS = (
+    "avoid",
+    "avoids",
+    "avoided",
+    "contained",
+    "denies",
+    "fake",
+    "false",
+    "mitigated",
+    "no",
+    "not",
+    "resolved",
+    "without",
+)
+
 _POSITIVE_NEWS_TERMS = (
     "adoption",
     "approval",
@@ -257,32 +337,114 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return parsed
 
 
-def _keyword_sentiment(text: str) -> float:
+@lru_cache(maxsize=256)
+def _term_pattern(term: str) -> re.Pattern[str]:
+    escaped = re.escape(term.lower()).replace(r"\ ", r"\s+")
+    return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])")
+
+
+def _match_negated(text: str, match_start: int) -> bool:
+    prefix = text[max(0, match_start - 42): match_start]
+    words = re.findall(r"[a-z]+", prefix.lower())
+    return any(word in _NEGATION_TERMS for word in words[-5:])
+
+
+def _recency_factor(age_ms: int) -> float:
+    age_minutes = max(0.0, age_ms / 60_000.0)
+    if age_minutes <= 15.0:
+        return 1.0
+    if age_minutes <= 180.0:
+        return 0.82
+    if age_minutes <= 1_440.0:
+        return 0.58
+    return 0.28
+
+
+def _classify_news_text(text: str, *, age_ms: int = 0) -> NewsClassification:
     normalized = f" {text.lower()} "
-    positive = sum(1 for term in _POSITIVE_NEWS_TERMS if term in normalized)
-    negative = sum(1 for term in _NEGATIVE_NEWS_TERMS if term in normalized)
+    positive = 0.0
+    negative = 0.0
+    urgency = 0.0
+    matched_terms: list[str] = []
+    category_weights: dict[str, float] = {}
+    horizon_weights: dict[str, float] = {}
+    recency = _recency_factor(age_ms)
+
+    for trigger in _NEWS_TRIGGERS:
+        match = _term_pattern(trigger.term).search(normalized)
+        if match is None:
+            continue
+        negated = _match_negated(normalized, match.start())
+        if negated and trigger.polarity > 0.0:
+            continue
+        weight = float(trigger.importance)
+        polarity = float(trigger.polarity)
+        if negated and polarity < 0.0:
+            weight *= 0.25
+            polarity = 0.0
+        if polarity > 0.0:
+            positive += weight * polarity
+        elif polarity < 0.0:
+            negative += weight * abs(polarity)
+        matched_terms.append(trigger.term)
+        category_weights[trigger.category] = category_weights.get(trigger.category, 0.0) + weight
+        horizon_weights[trigger.horizon] = horizon_weights.get(trigger.horizon, 0.0) + weight
+        urgency = max(urgency, float(trigger.urgency) * recency)
+
     total = positive + negative
-    if total == 0:
-        return 0.0
-    return _clamp((positive - negative) / float(total), -1.0, 1.0)
+    score = 0.0 if total <= 0.0 else _clamp((positive - negative) / total, -1.0, 1.0)
+    top_weight = max(category_weights.values(), default=0.0)
+    density_bonus = min(1.5, max(0, len(matched_terms) - 1) * 0.35)
+    importance = int(round(_clamp((top_weight + density_bonus) * recency, 0.0, 10.0)))
+    urgency = _clamp(max(urgency, 0.10 if matched_terms else 0.0) + abs(score) * 0.12 + importance / 100.0, 0.0, 1.0)
+    category = max(category_weights.items(), key=lambda item: item[1], default=("general", 0.0))[0]
+    if urgency >= 0.78 or (importance >= 7 and horizon_weights.get("short", 0.0) > 0.0):
+        horizon = "short"
+    elif horizon_weights and max(horizon_weights, key=horizon_weights.get) == "long" and age_ms >= 86_400_000:
+        horizon = "long"
+    elif age_ms > 86_400_000 and not horizon_weights.get("short"):
+        horizon = "long"
+    else:
+        horizon = "medium"
+    return NewsClassification(
+        score=score,
+        positive_weight=float(positive),
+        negative_weight=float(negative),
+        importance=importance,
+        urgency=urgency,
+        horizon=horizon,
+        category=category,
+        matched_terms=tuple(matched_terms),
+    )
 
 
-def _keyword_counts(text: str) -> tuple[int, int]:
+def _keyword_sentiment(text: str) -> float:
+    return _classify_news_text(text).score
+
+
+def _keyword_counts(text: str, *, age_ms: int = 0) -> tuple[float, float]:
+    classification = _classify_news_text(text, age_ms=age_ms)
+    if classification.positive_weight or classification.negative_weight:
+        return classification.positive_weight, classification.negative_weight
     normalized = f" {text.lower()} "
-    positive = sum(1 for term in _POSITIVE_NEWS_TERMS if term in normalized)
-    negative = sum(1 for term in _NEGATIVE_NEWS_TERMS if term in normalized)
+    positive = float(sum(1 for term in _POSITIVE_NEWS_TERMS if term in normalized))
+    negative = float(sum(1 for term in _NEGATIVE_NEWS_TERMS if term in normalized))
     return positive, negative
 
 
 def _news_urgency(text: str, *, age_ms: int) -> float:
+    classification = _classify_news_text(text, age_ms=age_ms)
+    if classification.matched_terms:
+        return classification.urgency
     normalized = f" {text.lower()} "
     term_hit = any(term in normalized for term in _SHORT_TERM_TERMS)
-    age_minutes = max(0.0, age_ms / 60_000.0)
-    recency = 1.0 if age_minutes <= 15.0 else (0.65 if age_minutes <= 180.0 else 0.25)
-    return _clamp((0.65 if term_hit else 0.15) + recency * 0.35, 0.0, 1.0)
+    return _clamp((0.65 if term_hit else 0.15) + _recency_factor(age_ms) * 0.35, 0.0, 1.0)
 
 
 def _news_horizon(text: str, *, age_ms: int) -> str:
+    classification = _classify_news_text(text, age_ms=age_ms)
+    if classification.matched_terms:
+        return classification.horizon
     urgency = _news_urgency(text, age_ms=age_ms)
     if urgency >= 0.75:
         return "short"
@@ -303,8 +465,14 @@ def _score_news_texts(
     texts: list[str],
     *,
     compute_backend: str | None = None,
+    ages_ms: list[int] | None = None,
 ) -> tuple[list[float], BackendInfo]:
-    counts = [_keyword_counts(text) for text in texts]
+    if ages_ms is None:
+        ages = [0 for _text in texts]
+    else:
+        ages = [max(0, int(age)) for age in ages_ms[: len(texts)]]
+        ages.extend([0] * max(0, len(texts) - len(ages)))
+    counts = [_keyword_counts(text, age_ms=age) for text, age in zip(texts, ages, strict=True)]
     backend = resolve_backend(compute_backend or "cpu")
     if backend.kind != "cpu" and counts:
         try:  # pragma: no cover - covered by host GPU smoke, not CI
@@ -329,6 +497,26 @@ def _score_news_texts(
         total = positive + negative
         scores.append(0.0 if total == 0 else _clamp((positive - negative) / float(total), -1.0, 1.0))
     return scores, backend
+
+
+def _weighted_news_classifications(weighted_texts: list[tuple[str, float, int]], *, now_ms: int) -> list[NewsClassification]:
+    return [
+        _classify_news_text(text, age_ms=max(0, now_ms - known_at))
+        for text, _weight, known_at in weighted_texts
+    ]
+
+
+def _dominant_news_classification(
+    classifications: list[NewsClassification],
+    *,
+    default_horizon: str = "medium",
+) -> NewsClassification:
+    if not classifications:
+        return NewsClassification(0.0, 0.0, 0.0, 0, 0.0, default_horizon, "general", ())
+    return max(
+        classifications,
+        key=lambda item: (item.urgency, item.importance, abs(item.score)),
+    )
 
 
 def _average_sentiment(items: list[tuple[float, float]]) -> float:
@@ -672,24 +860,29 @@ def _fetch_cryptocompare_news(
         newest_ms = max(newest_ms, _parse_epoch_ms(entry.get("published_on"), now_ms))
     if not weighted_texts:
         raise ValueError("CryptoCompare news contained no usable titles")
-    scores, backend = _score_news_texts([text for text, _weight, _known_at in weighted_texts], compute_backend=compute_backend)
+    ages = [max(0, now_ms - known_at) for _text, _weight, known_at in weighted_texts]
+    scores, backend = _score_news_texts(
+        [text for text, _weight, _known_at in weighted_texts],
+        compute_backend=compute_backend,
+        ages_ms=ages,
+    )
+    classifications = _weighted_news_classifications(weighted_texts, now_ms=now_ms)
+    dominant = _dominant_news_classification(classifications)
     scored = [(score, weight) for score, (_text, weight, _known_at) in zip(scores, weighted_texts, strict=True)]
     score = _average_sentiment(scored)
-    urgencies = [
-        _news_urgency(text, age_ms=max(0, now_ms - known_at))
-        for text, _weight, known_at in weighted_texts
-    ]
-    horizon = "short" if any(value >= 0.75 for value in urgencies) else "medium"
     return _component(
         "cryptocompare_btc_news",
         score=score,
         weight=0.55,
         value=float(len(scored)),
-        detail=f"articles={len(scored)} sources={','.join(domains[:3]) or 'unknown'}",
+        detail=(
+            f"articles={len(scored)} sources={','.join(domains[:3]) or 'unknown'} "
+            f"importance={dominant.importance}/10 category={dominant.category}"
+        ),
         known_at_ms=newest_ms,
         source_symbol="BTC",
-        horizon=horizon,
-        urgency=max(urgencies) if urgencies else 0.0,
+        horizon=dominant.horizon,
+        urgency=dominant.urgency,
     ), backend
 
 
@@ -721,24 +914,29 @@ def _fetch_gdelt_news(
         newest_ms = max(newest_ms, _parse_gdelt_seen_ms(entry.get("seendate"), now_ms))
     if not weighted_texts:
         raise ValueError("GDELT articles contained no usable titles")
-    scores, backend = _score_news_texts([text for text, _weight, _known_at in weighted_texts], compute_backend=compute_backend)
+    ages = [max(0, now_ms - known_at) for _text, _weight, known_at in weighted_texts]
+    scores, backend = _score_news_texts(
+        [text for text, _weight, _known_at in weighted_texts],
+        compute_backend=compute_backend,
+        ages_ms=ages,
+    )
+    classifications = _weighted_news_classifications(weighted_texts, now_ms=now_ms)
+    dominant = _dominant_news_classification(classifications)
     scored = [(score, weight) for score, (_text, weight, _known_at) in zip(scores, weighted_texts, strict=True)]
     score = _average_sentiment(scored)
-    urgencies = [
-        _news_urgency(text, age_ms=max(0, now_ms - known_at))
-        for text, _weight, known_at in weighted_texts
-    ]
-    horizon = "short" if any(value >= 0.75 for value in urgencies) else "medium"
     return _component(
         "gdelt_bitcoin_news",
         score=score,
         weight=0.45,
         value=float(len(scored)),
-        detail=f"articles={len(scored)} domains={','.join(domains[:3]) or 'unknown'}",
+        detail=(
+            f"articles={len(scored)} domains={','.join(domains[:3]) or 'unknown'} "
+            f"importance={dominant.importance}/10 category={dominant.category}"
+        ),
         known_at_ms=newest_ms,
         source_symbol="BTC",
-        horizon=horizon,
-        urgency=max(urgencies) if urgencies else 0.0,
+        horizon=dominant.horizon,
+        urgency=dominant.urgency,
     ), backend
 
 
@@ -775,24 +973,26 @@ def _fetch_hackernews_bitcoin(
             weighted_texts.append((title, weight, known_at))
     if not weighted_texts:
         raise ValueError("Hacker News hits contained no usable titles")
-    scores, backend = _score_news_texts([text for text, _weight, _known_at in weighted_texts], compute_backend=compute_backend)
+    ages = [max(0, now_ms - known_at) for _text, _weight, known_at in weighted_texts]
+    scores, backend = _score_news_texts(
+        [text for text, _weight, _known_at in weighted_texts],
+        compute_backend=compute_backend,
+        ages_ms=ages,
+    )
+    classifications = _weighted_news_classifications(weighted_texts, now_ms=now_ms)
+    dominant = _dominant_news_classification(classifications)
     scored = [(score, weight) for score, (_text, weight, _known_at) in zip(scores, weighted_texts, strict=True)]
     score = _average_sentiment(scored)
-    urgencies = [
-        _news_urgency(text, age_ms=max(0, now_ms - known_at))
-        for text, _weight, known_at in weighted_texts
-    ]
-    horizon = "short" if any(value >= 0.75 for value in urgencies) else "medium"
     return _component(
         "hackernews_bitcoin_attention",
         score=score,
         weight=0.25,
         value=float(len(scored)),
-        detail=f"stories={len(scored)}",
+        detail=f"stories={len(scored)} importance={dominant.importance}/10 category={dominant.category}",
         known_at_ms=newest_ms,
         source_symbol="BTC",
-        horizon=horizon,
-        urgency=max(urgencies) if urgencies else 0.0,
+        horizon=dominant.horizon,
+        urgency=dominant.urgency,
     ), backend
 
 
@@ -823,34 +1023,34 @@ def _fetch_rss_news_feed(
     scores, backend = _score_news_texts(
         [text for text, _weight, _known_at in weighted_texts],
         compute_backend=compute_backend,
+        ages_ms=[max(0, now_ms - known_at) for _text, _weight, known_at in weighted_texts],
     )
+    classifications = _weighted_news_classifications(weighted_texts, now_ms=now_ms)
+    dominant = _dominant_news_classification(classifications, default_horizon=provider.horizon)
     scored = [(score, weight) for score, (_text, weight, _known_at) in zip(scores, weighted_texts, strict=True)]
     score = _average_sentiment(scored)
-    urgencies = [
-        _news_urgency(text, age_ms=max(0, now_ms - known_at))
-        for text, _weight, known_at in weighted_texts
-    ]
-    item_horizons = [
-        _news_horizon(text, age_ms=max(0, now_ms - known_at))
-        for text, _weight, known_at in weighted_texts
-    ]
-    horizon = "short" if "short" in item_horizons else provider.horizon
+    horizon = "short" if dominant.horizon == "short" else provider.horizon
     component = _component(
         provider.provider,
         score=score,
         weight=provider.weight,
         value=float(len(scored)),
-        detail=f"scope={provider.scope} items={len(scored)}",
+        detail=f"scope={provider.scope} items={len(scored)} importance={dominant.importance}/10 category={dominant.category}",
         known_at_ms=newest_ms or now_ms,
         source_symbol="BTCUSDC" if provider.scope == "crypto" else provider.scope,
         horizon=horizon,
-        urgency=max(urgencies) if urgencies else 0.0,
+        urgency=dominant.urgency,
     )
     return ProviderFetchResult(
         component=component,
         backend=backend,
         news_texts=tuple(text for text, _weight, _known_at in weighted_texts),
-        raw_payload={**_provider_news_payload(component, items), "url": provider.url, "raw_xml": xml_text},
+        raw_payload={
+            **_provider_news_payload(component, items),
+            "url": provider.url,
+            "raw_xml": xml_text,
+            "classifications": [classification.asdict() for classification in classifications],
+        },
     )
 
 

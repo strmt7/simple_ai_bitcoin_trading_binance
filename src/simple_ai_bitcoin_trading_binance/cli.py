@@ -3297,6 +3297,35 @@ def _threshold_classification_guard(baseline: object, candidate: object) -> dict
     }
 
 
+def _threshold_capital_preservation_guard(profit_calibration: object) -> dict[str, float | int | str | bool]:
+    baseline_score = float(getattr(profit_calibration, "baseline_score", 0.0))
+    best_score = float(getattr(profit_calibration, "best_score", baseline_score))
+    baseline_pnl = float(getattr(profit_calibration, "baseline_realized_pnl", 0.0))
+    realized_pnl = float(getattr(profit_calibration, "realized_pnl", baseline_pnl))
+    closed_trades = max(0, int(getattr(profit_calibration, "closed_trades", 0)))
+    baseline_closed_trades = max(0, int(getattr(profit_calibration, "baseline_closed_trades", 0)))
+    score_delta = best_score - baseline_score
+    pnl_delta = realized_pnl - baseline_pnl
+    material_pnl_improvement = pnl_delta >= max(1e-9, abs(baseline_pnl) * 0.10)
+    tolerated_loss = -abs(baseline_pnl) * 0.10 if baseline_pnl < 0.0 else baseline_pnl
+    passed = (
+        bool(getattr(profit_calibration, "accepted", False))
+        and closed_trades > 0
+        and score_delta >= 0.05
+        and material_pnl_improvement
+        and realized_pnl >= tolerated_loss
+    )
+    return {
+        "passed": bool(passed),
+        "mode": "capital_preservation" if passed else "rejected",
+        "score_delta": float(score_delta),
+        "pnl_delta": float(pnl_delta),
+        "closed_trades": int(closed_trades),
+        "baseline_closed_trades": int(baseline_closed_trades),
+        "tolerated_loss": float(tolerated_loss),
+    }
+
+
 def command_train(args: argparse.Namespace) -> int:
     from .compute import describe_backend, BackendInfo
 
@@ -3419,7 +3448,9 @@ def command_train(args: argparse.Namespace) -> int:
         profit_report = evaluate_classification(calibration_rows, model, threshold=profit_calibration.best_threshold)
         classification_guard = _threshold_classification_guard(classification_report, profit_report)
         classification_guard_passed = bool(classification_guard["passed"])
-        if profit_calibration.accepted and classification_guard_passed:
+        capital_guard = _threshold_capital_preservation_guard(profit_calibration)
+        capital_guard_passed = bool(capital_guard["passed"])
+        if profit_calibration.accepted and (classification_guard_passed or capital_guard_passed):
             threshold = profit_calibration.threshold
             threshold_source = "profit_backtest"
         threshold_calibration = {
@@ -3428,6 +3459,7 @@ def command_train(args: argparse.Namespace) -> int:
             "profit_candidate": _classification_payload(profit_report),
             "profit_backtest": profit_calibration.asdict(),
             "classification_guard": classification_guard,
+            "capital_guard": capital_guard,
         }
     model.decision_threshold = float(threshold)
     model.calibration_size = len(calibration_rows) if args.calibrate_threshold else 0

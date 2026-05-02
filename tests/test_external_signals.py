@@ -174,6 +174,12 @@ def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
     with TradingTelemetryStore(telemetry) as store:
         observations = store.recent_observations(since_ms=NOW_MS - 10_000, limit=500)
     assert any(item.kind == "raw_provider_payload" for item in observations)
+    assert any(
+        item.kind == "raw_provider_payload"
+        and isinstance(item.payload, dict)
+        and item.payload.get("classifications")
+        for item in observations
+    )
     assert any(isinstance(item.payload, dict) and "parsed" in item.payload for item in observations)
 
 
@@ -468,12 +474,36 @@ def test_external_signal_payload_cache_and_helpers(tmp_path, monkeypatch) -> Non
     assert signals._keyword_sentiment("Bitcoin adoption rally") > 0
     assert signals._keyword_sentiment("Bitcoin hack crackdown") < 0
     assert signals._keyword_sentiment("Bitcoin sideways") == 0
+    security = signals._classify_news_text("Breaking SEC bitcoin ETF denial after exchange hack", age_ms=30_000)
+    assert security.score < -0.9
+    assert security.horizon == "short"
+    assert security.importance >= 8
+    assert security.urgency >= 0.85
+    assert security.category in {"security", "regulatory"}
+    assert "hack" in security.matched_terms
+    assert "etf denial" in security.matched_terms
+    negated = signals._classify_news_text("Bitcoin upgrade avoids hack concerns", age_ms=1_000)
+    assert negated.score > 0
+    assert negated.category == "technology"
+    assert negated.importance > 0
+    old_release = signals._classify_news_text("Bitcoin core release improves wallet behavior", age_ms=172_800_000)
+    assert old_release.horizon == "long"
+    assert 0 < old_release.importance <= 3
+    fake_approval = signals._classify_news_text("Fake bitcoin ETF approval report denied by issuer", age_ms=1_000)
+    assert fake_approval.score == 0.0
+    assert fake_approval.category == "general"
+    assert signals._recency_factor(600 * 60_000) == pytest.approx(0.58)
+    assert signals._news_urgency("Bitcoin hack confirmed", age_ms=1_000) >= 0.9
     assert signals._news_horizon("Breaking Bitcoin ETF inflow", age_ms=1_000) == "short"
+    assert signals._news_horizon("Breaking Bitcoin headline", age_ms=1_000) == "short"
     assert signals._news_horizon("Bitcoin sideways", age_ms=3_600_000) == "medium"
     assert signals._news_horizon("Bitcoin sideways", age_ms=172_800_000) == "long"
     assert signals._average_sentiment([(1.0, 1.0), (-1.0, 1.0)]) == 0.0
     assert signals._average_sentiment([]) == 0.0
-    scores, backend = signals._score_news_texts(["Bitcoin adoption rally", "Bitcoin hack"], compute_backend="cpu")
+    default_classification = signals._dominant_news_classification([], default_horizon="long")
+    assert default_classification.horizon == "long"
+    assert default_classification.importance == 0
+    scores, backend = signals._score_news_texts(["Bitcoin adoption rally", "Bitcoin hack"], compute_backend="cpu", ages_ms=[0, 1_000])
     assert scores == [1.0, -1.0]
     assert backend.kind == "cpu"
     assert signals._grade_weight_multiplier(0) == pytest.approx(0.25)

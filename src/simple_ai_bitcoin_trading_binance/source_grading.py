@@ -25,6 +25,8 @@ _AI_GRADING_RECOVERABLE_ERRORS = (
     TypeError,
     ValueError,
 )
+_AI_GRADE_BATCH_SIZE = 24
+_AI_SINGLE_FILL_LIMIT = 8
 
 
 @dataclass(frozen=True)
@@ -140,7 +142,7 @@ def _ai_grade_batch(
             "stream": False,
             "format": "json",
             "keep_alive": "30m",
-            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 768},
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 1536},
         },
         timeout_seconds,
     )
@@ -243,7 +245,8 @@ def _ai_grades(
 ) -> tuple[dict[tuple[str, str], tuple[int, str]], int]:
     output: dict[tuple[str, str], tuple[int, str]] = {}
     total_latency_ms = 0
-    batch_size = 6
+    batch_size = _AI_GRADE_BATCH_SIZE
+    single_fills = 0
     for start in range(0, len(rollups), batch_size):
         batch_output, latency_ms = _ai_grade_batch(
             rollups[start:start + batch_size],
@@ -258,6 +261,8 @@ def _ai_grades(
             key = (str(rollup["source"]), str(rollup["horizon"] or "medium"))
             if key in output:
                 continue
+            if single_fills >= _AI_SINGLE_FILL_LIMIT:
+                continue
             try:
                 single_key, single_output, single_latency_ms = _ai_grade_single(
                     rollup,
@@ -269,6 +274,7 @@ def _ai_grades(
             except _AI_GRADING_RECOVERABLE_ERRORS:
                 continue
             output[single_key] = single_output
+            single_fills += 1
             total_latency_ms += single_latency_ms
     return output, total_latency_ms
 
