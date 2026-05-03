@@ -215,7 +215,8 @@ def _batch_probabilities_torch(  # pragma: no cover - exercised by host GPU smok
             logits = torch.clamp(logits / temperature, min=-50.0, max=50.0)
             probs = torch.sigmoid(logits)
             chunk_probs = probs if chunk_probs is None else chunk_probs + probs
-        assert chunk_probs is not None
+        if chunk_probs is None:  # pragma: no cover - model_specs is always populated above
+            raise RuntimeError("No model probabilities were produced.")
         if len(model_specs) > 1:
             chunk_probs = chunk_probs / float(len(model_specs))
         probabilities.extend(float(value) for value in chunk_probs.detach().cpu().tolist())

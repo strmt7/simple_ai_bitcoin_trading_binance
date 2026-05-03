@@ -93,14 +93,32 @@ def _disable_app_timers(app: OperatorApp, monkeypatch) -> list[tuple[str, str]]:
 def test_confirm_screen_behaviors(monkeypatch) -> None:
     screen = ConfirmScreen("Confirm?")
 
+    class _FakeButton:
+        def __init__(self) -> None:
+            self.focused = False
+
+        def focus(self) -> None:
+            self.focused = True
+
+    cancel = _FakeButton()
     dismissed: list[bool] = []
+    monkeypatch.setattr(screen, "query_one", lambda _selector, _cls=None: cancel)
     monkeypatch.setattr(screen, "dismiss", lambda value: dismissed.append(value))
+
+    screen.on_mount()
+    assert cancel.focused is True
 
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "confirm"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
+    screen.focused = type("Focused", (), {"id": "confirm"})()
+    screen.action_activate_focused()
+    screen.focused = type("Focused", (), {"id": "cancel"})()
+    screen.action_activate_focused()
+    screen.focused = None
+    screen.action_activate_focused()
     screen.action_dismiss_false()
 
-    assert dismissed == [True, False, False]
+    assert dismissed == [True, False, True, False, False, False]
 
 
 def test_form_screen_behaviors(monkeypatch) -> None:
@@ -526,6 +544,7 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
         async with confirm_app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(confirm_app.screen_stack[-1], ConfirmScreen)
+            assert confirm_app.focused.id == "cancel"
 
         form_app = _FormApp(
             title_text="console",
@@ -634,6 +653,39 @@ def test_modal_keyboard_fallbacks_in_textual_runtime() -> None:
             await pilot.pause()
             assert len(form_app.screen_stack) == 1
             assert form_app.focused.id == "actions"
+
+        class _ConfirmApp(OperatorApp):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self.push_screen(ConfirmScreen("Confirm?"))
+
+        confirm_cancel_app = _ConfirmApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with confirm_cancel_app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            assert confirm_cancel_app.focused.id == "cancel"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(confirm_cancel_app.screen_stack) == 1
+            assert confirm_cancel_app.focused.id == "actions"
+
+        confirm_accept_app = _ConfirmApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with confirm_accept_app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert confirm_accept_app.focused.id == "confirm"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(confirm_accept_app.screen_stack) == 1
+            assert confirm_accept_app.focused.id == "actions"
 
     asyncio.run(runner())
 

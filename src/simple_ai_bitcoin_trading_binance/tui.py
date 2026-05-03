@@ -34,7 +34,10 @@ class FormField:
 
 
 class ConfirmScreen(ModalScreen[bool]):
-    BINDINGS = [Binding("escape", "dismiss_false", "Cancel", show=False)]
+    BINDINGS = [
+        Binding("escape", "dismiss_false", "Cancel", show=False, priority=True),
+        Binding("enter", "activate_focused", "Choose", show=False, priority=True),
+    ]
 
     def __init__(self, message: str) -> None:
         super().__init__()
@@ -51,8 +54,14 @@ class ConfirmScreen(ModalScreen[bool]):
             id="confirm-dialog",
         )
 
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm")
+
+    def action_activate_focused(self) -> None:
+        self.dismiss(getattr(self.focused, "id", "") == "confirm")
 
     def action_dismiss_false(self) -> None:
         self.dismiss(False)

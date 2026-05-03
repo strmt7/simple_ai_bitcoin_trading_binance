@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import re
@@ -29,6 +30,7 @@ from .storage import write_json_atomic
 FetchJson = Callable[[str, float], object]
 FetchText = Callable[[str, float], str]
 PostJson = Callable[[str, Mapping[str, object], float], object]
+_LOGGER = logging.getLogger(__name__)
 _JITTER_RANDOM = random.SystemRandom()
 
 COINGECKO_SIMPLE_PRICE_URL = (
@@ -1962,8 +1964,8 @@ def collect_external_signals(
 
             with TradingTelemetryStore(telemetry_path) as store:
                 store.record_signal_report(report, raw_payloads=raw_records)
-        except Exception:  # pragma: no cover - telemetry must never block trading signals
-            pass
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:  # pragma: no cover - telemetry must never block trading signals
+            _LOGGER.debug("external signal telemetry recording skipped: %s", exc)
     return report
 
 

@@ -584,8 +584,12 @@ def test_tui_funds_menu_is_keyboard_navigable_in_textual_runtime(monkeypatch) ->
                 if len(app.screen_stack) > 1 and app.focused is not None:
                     break
             assert type(app.screen_stack[-1]).__name__ == "MenuScreen"
-            for _ in range(5):
+            for _ in range(4):
                 await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert type(app.screen_stack[-1]).__name__ == "ConfirmScreen"
+            assert app.focused.id == "cancel"
             await pilot.press("enter")
             await pilot.pause()
             assert type(app.screen_stack[-1]).__name__ == "MenuScreen"
@@ -596,6 +600,55 @@ def test_tui_funds_menu_is_keyboard_navigable_in_textual_runtime(monkeypatch) ->
             await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(runner())
+
+
+def test_tui_signed_actions_default_confirmation_to_cancel_in_textual_runtime(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
+        lambda: _runtime_config(testnet=True, dry_run=False),
+    )
+    live_calls = []
+    roundtrip_calls = []
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.command_live",
+        lambda args: live_calls.append(args) or 0,
+    )
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.command_spot_roundtrip",
+        lambda args: roundtrip_calls.append(args) or 0,
+    )
+
+    async def drive(title: str) -> None:
+        app = OperatorApp(
+            title_text="console",
+            actions=[_action(title)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            task = asyncio.create_task(app.action_run_selected())
+            for _ in range(5):
+                await pilot.pause()
+                if len(app.screen_stack) > 1 and app.focused is not None:
+                    break
+            assert type(app.screen_stack[-1]).__name__ == "FormScreen"
+            await pilot.press("ctrl+s")
+            for _ in range(5):
+                await pilot.pause()
+                if type(app.screen_stack[-1]).__name__ == "ConfirmScreen":
+                    break
+            assert type(app.screen_stack[-1]).__name__ == "ConfirmScreen"
+            assert app.focused.id == "cancel"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert "complete" in str(app.query_one("#status").content)
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(drive("Testnet loop"))
+    asyncio.run(drive("Spot roundtrip"))
+    assert live_calls == []
+    assert roundtrip_calls == []
 
 
 def test_tui_fetch_train_tune_and_backtest_actions_build_expected_args(monkeypatch) -> None:
