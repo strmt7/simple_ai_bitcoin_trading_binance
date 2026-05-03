@@ -53,6 +53,18 @@ class _FakeOptionList:
     def action_cursor_up(self) -> None:
         self.highlighted = 0
 
+    def action_page_down(self) -> None:
+        self.highlighted = 2
+
+    def action_page_up(self) -> None:
+        self.highlighted = 0
+
+    def action_first(self) -> None:
+        self.highlighted = 0
+
+    def action_last(self) -> None:
+        self.highlighted = 99
+
     def focus(self) -> None:
         self.focused = True
 
@@ -153,6 +165,8 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
             self.focused = False
             self.selected_all = False
             self.cleared = False
+            self.highlighted = 0
+            self.selected_calls = 0
 
         def focus(self) -> None:
             self.focused = True
@@ -164,6 +178,31 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
         def deselect_all(self) -> None:
             self.cleared = True
             self.selected = []
+
+        def action_cursor_down(self) -> None:
+            self.highlighted = 1
+
+        def action_cursor_up(self) -> None:
+            self.highlighted = 0
+
+        def action_page_down(self) -> None:
+            self.highlighted = 2
+
+        def action_page_up(self) -> None:
+            self.highlighted = 0
+
+        def action_first(self) -> None:
+            self.highlighted = 0
+
+        def action_last(self) -> None:
+            self.highlighted = 99
+
+        def action_select(self) -> None:
+            self.selected_calls += 1
+            if "rsi" in self.selected:
+                self.selected = [value for value in self.selected if value != "rsi"]
+            else:
+                self.selected.append("rsi")
 
     screen = MultiSelectScreen("Features", ["momentum_1", "rsi"], ["momentum_1"], help_text="help")
     selection_list = _FakeSelectionList()
@@ -180,10 +219,29 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "save"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
     screen.action_dismiss_none()
+    screen.action_cursor_down()
+    screen.action_cursor_up()
+    screen.action_page_down()
+    screen.action_page_up()
+    screen.action_first()
+    screen.action_last()
+    screen.action_toggle_highlighted()
+    screen.focused = type("Focused", (), {"id": "all"})()
+    screen.action_activate_focused()
+    screen.focused = type("Focused", (), {"id": "none"})()
+    screen.action_activate_focused()
+    screen.focused = type("Focused", (), {"id": "feature-list"})()
+    screen.action_activate_focused()
+    screen.focused = type("Focused", (), {"id": "save"})()
+    screen.action_activate_focused()
+    screen.focused = type("Focused", (), {"id": "cancel"})()
+    screen.action_activate_focused()
+    screen.action_save()
 
     assert selection_list.selected_all is True
     assert selection_list.cleared is True
-    assert dismissed == [[], None, None]
+    assert selection_list.selected_calls == 2
+    assert dismissed == [[], None, None, ["rsi"], None, ["rsi"]]
 
 
 def test_terminal_ui_methods() -> None:
@@ -454,6 +512,11 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
             super().on_mount()
             self.push_screen(MultiSelectScreen("Features", ["momentum_1"], ["momentum_1"]))
 
+    class _MenuApp(OperatorApp):
+        def on_mount(self) -> None:
+            super().on_mount()
+            self.push_screen(MenuScreen("Settings", [("runtime", "Runtime"), ("strategy", "Strategy")]))
+
     async def runner() -> None:
         confirm_app = _ConfirmApp(
             title_text="console",
@@ -492,6 +555,86 @@ def test_modal_screens_compose_in_textual_runtime() -> None:
             await pilot.pause()
             assert multi_app.focused.id == "all"
 
+        menu_app = _MenuApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with menu_app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(menu_app.screen_stack[-1], MenuScreen)
+            assert menu_app.focused.id == "menu-list"
+
+    asyncio.run(runner())
+
+
+def test_modal_keyboard_fallbacks_in_textual_runtime() -> None:
+    async def runner() -> None:
+        class _MenuApp(OperatorApp):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self.push_screen(MenuScreen("Hub", [("one", "One"), ("two", "Two")]))
+
+        menu_app = _MenuApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with menu_app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            menu = menu_app.screen.query_one("#menu-list")
+            assert menu_app.focused.id == "menu-list"
+            await pilot.press("down")
+            await pilot.pause()
+            assert menu.highlighted == 1
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(menu_app.screen_stack) == 1
+            assert menu_app.focused.id == "actions"
+
+        class _MultiApp(OperatorApp):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self.push_screen(MultiSelectScreen("Features", ["momentum_1", "rsi"], ["momentum_1"]))
+
+        multi_app = _MultiApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with multi_app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            features = multi_app.screen.query_one("#feature-list")
+            assert multi_app.focused.id == "feature-list"
+            await pilot.press("down")
+            await pilot.pause()
+            assert features.highlighted == 1
+            await pilot.press("space")
+            await pilot.pause()
+            assert "rsi" in features.selected
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert len(multi_app.screen_stack) == 1
+            assert multi_app.focused.id == "actions"
+
+        class _FormApp(OperatorApp):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self.push_screen(FormScreen("Runtime", [FormField("interval", "Interval", "15m")]))
+
+        form_app = _FormApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with form_app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            assert form_app.focused.id == "field-interval"
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert len(form_app.screen_stack) == 1
+            assert form_app.focused.id == "actions"
+
     asyncio.run(runner())
 
 
@@ -528,11 +671,17 @@ def test_modal_buttons_use_one_default_variant_in_textual_runtime() -> None:
             super().on_mount()
             self.push_screen(MultiSelectScreen("Features", ["momentum_1"], ["momentum_1"]))
 
+    class _MenuApp(OperatorApp):
+        def on_mount(self) -> None:
+            super().on_mount()
+            self.push_screen(MenuScreen("Settings", [("runtime", "Runtime")]))
+
     async def runner() -> None:
         for app_cls, button_ids in (
             (_ConfirmApp, ("confirm", "cancel")),
             (_FormApp, ("save", "cancel")),
             (_MultiApp, ("all", "none", "save", "cancel")),
+            (_MenuApp, ("close",)),
         ):
             app = app_cls(
                 title_text="console",
@@ -695,6 +844,24 @@ def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
         def focus(self) -> None:
             self.focused = True
 
+        def action_cursor_down(self) -> None:
+            self.highlighted = 1
+
+        def action_cursor_up(self) -> None:
+            self.highlighted = 0
+
+        def action_page_down(self) -> None:
+            self.highlighted = 2
+
+        def action_page_up(self) -> None:
+            self.highlighted = 0
+
+        def action_first(self) -> None:
+            self.highlighted = 0
+
+        def action_last(self) -> None:
+            self.highlighted = 99
+
     fake_list = _FakeMenuList()
     monkeypatch.setattr(screen, "query_one", lambda _selector, _cls=None: fake_list)
 
@@ -704,10 +871,28 @@ def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
 
     screen.on_option_list_option_selected(_FakeOptionEvent(fake_list, 1))
     screen.on_option_list_option_selected(_FakeOptionEvent(_FakeOptionList("not-menu"), 0))
+    screen.action_cursor_down()
+    screen.action_cursor_up()
+    screen.action_page_down()
+    screen.action_page_up()
+    screen.action_first()
+    screen.action_last()
+    fake_list.highlighted = None
+    screen.action_select_highlighted()
+    fake_list.highlighted = 100
+    screen.action_select_highlighted()
+    screen.focused = type("Focused", (), {"id": "close"})()
+    screen.action_select_highlighted()
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "close"})()})())
     screen.action_dismiss_none()
 
-    assert dismissed == ["k2", None, None]
+    assert dismissed == ["k2", "k1", "k3", None, None, None]
+
+    empty_screen = MenuScreen("Empty", [])
+    empty_dismissed: list[object] = []
+    monkeypatch.setattr(empty_screen, "dismiss", lambda value: empty_dismissed.append(value))
+    empty_screen.action_select_highlighted()
+    assert empty_dismissed == [None]
 
 
 def test_menu_screen_compose_and_help_text_default() -> None:

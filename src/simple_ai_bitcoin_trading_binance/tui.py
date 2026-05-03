@@ -59,7 +59,10 @@ class ConfirmScreen(ModalScreen[bool]):
 
 
 class FormScreen(ModalScreen[dict[str, str] | None]):
-    BINDINGS = [Binding("escape", "dismiss_none", "Cancel", show=False)]
+    BINDINGS = [
+        Binding("escape", "dismiss_none", "Cancel", show=False, priority=True),
+        Binding("ctrl+s", "save", "Save", show=False, priority=True),
+    ]
 
     def __init__(self, title: str, fields: list[FormField]) -> None:
         super().__init__()
@@ -115,6 +118,9 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
         else:
             self.dismiss(None)
 
+    def action_save(self) -> None:
+        self.dismiss(self._values())
+
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
 
@@ -122,7 +128,17 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
 class MenuScreen(ModalScreen[str | None]):
     """Modal list-picker used for settings hubs and similar routers."""
 
-    BINDINGS = [Binding("escape", "dismiss_none", "Cancel", show=False)]
+    BINDINGS = [
+        Binding("escape", "dismiss_none", "Cancel", show=False, priority=True),
+        Binding("up", "cursor_up", "Up", show=False, priority=True),
+        Binding("down", "cursor_down", "Down", show=False, priority=True),
+        Binding("pageup", "page_up", "Page up", show=False, priority=True),
+        Binding("pagedown", "page_down", "Page down", show=False, priority=True),
+        Binding("home", "first", "First", show=False, priority=True),
+        Binding("end", "last", "Last", show=False, priority=True),
+        Binding("enter", "select_highlighted", "Open", show=False, priority=True),
+        Binding("space", "select_highlighted", "Open", show=False, priority=True),
+    ]
 
     def __init__(
         self,
@@ -166,12 +182,56 @@ class MenuScreen(ModalScreen[str | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None)
 
+    def _menu_list(self) -> OptionList:
+        return self.query_one("#menu-list", OptionList)
+
+    def action_cursor_down(self) -> None:
+        self._menu_list().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self._menu_list().action_cursor_up()
+
+    def action_page_down(self) -> None:
+        self._menu_list().action_page_down()
+
+    def action_page_up(self) -> None:
+        self._menu_list().action_page_up()
+
+    def action_first(self) -> None:
+        self._menu_list().action_first()
+
+    def action_last(self) -> None:
+        self._menu_list().action_last()
+
+    def action_select_highlighted(self) -> None:
+        if getattr(self.focused, "id", "") == "close":
+            self.dismiss(None)
+            return
+        if not self.options:
+            self.dismiss(None)
+            return
+        highlighted = self._menu_list().highlighted
+        index = 0 if highlighted is None else max(0, min(int(highlighted), len(self.options) - 1))
+        key, _label = self.options[index]
+        self.dismiss(key)
+
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
 
 
 class MultiSelectScreen(ModalScreen[list[str] | None]):
-    BINDINGS = [Binding("escape", "dismiss_none", "Cancel", show=False)]
+    BINDINGS = [
+        Binding("escape", "dismiss_none", "Cancel", show=False, priority=True),
+        Binding("up", "cursor_up", "Up", show=False, priority=True),
+        Binding("down", "cursor_down", "Down", show=False, priority=True),
+        Binding("pageup", "page_up", "Page up", show=False, priority=True),
+        Binding("pagedown", "page_down", "Page down", show=False, priority=True),
+        Binding("home", "first", "First", show=False, priority=True),
+        Binding("end", "last", "Last", show=False, priority=True),
+        Binding("space", "toggle_highlighted", "Toggle", show=False, priority=True),
+        Binding("enter", "activate_focused", "Toggle", show=False, priority=True),
+        Binding("ctrl+s", "save", "Save", show=False, priority=True),
+    ]
 
     def __init__(
         self,
@@ -224,6 +284,51 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
             self.dismiss([str(value) for value in selection_list.selected])
             return
         self.dismiss(None)
+
+    def _selection_list(self) -> SelectionList:
+        return self.query_one("#feature-list", SelectionList)
+
+    def action_cursor_down(self) -> None:
+        self._selection_list().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self._selection_list().action_cursor_up()
+
+    def action_page_down(self) -> None:
+        self._selection_list().action_page_down()
+
+    def action_page_up(self) -> None:
+        self._selection_list().action_page_up()
+
+    def action_first(self) -> None:
+        self._selection_list().action_first()
+
+    def action_last(self) -> None:
+        self._selection_list().action_last()
+
+    def action_toggle_highlighted(self) -> None:
+        self._selection_list().action_select()
+
+    def action_activate_focused(self) -> None:
+        focused_id = getattr(self.focused, "id", "")
+        selection_list = self._selection_list()
+        if focused_id == "all":
+            selection_list.select_all()
+            return
+        if focused_id == "none":
+            selection_list.deselect_all()
+            return
+        if focused_id == "save":
+            self.action_save()
+            return
+        if focused_id == "cancel":
+            self.dismiss(None)
+            return
+        selection_list.action_select()
+
+    def action_save(self) -> None:
+        selection_list = self._selection_list()
+        self.dismiss([str(value) for value in selection_list.selected])
 
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
