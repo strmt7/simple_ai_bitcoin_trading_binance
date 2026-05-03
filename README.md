@@ -42,10 +42,19 @@ If your shell does not expose the console entrypoint:
 PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli shell
 ```
 
-On Windows from this checkout, prefer the GPU-capable Python 3.11 environment:
+On Windows from this checkout, prefer Windows Terminal and the bundled `.cmd`
+launchers. They do not require opening or activating any `.ps1` file:
 
 ```powershell
 cd C:\trader\simple_ai_bitcoin_trading_binance
+.\run-shell.cmd
+.\run-gui.cmd
+```
+
+If you want to bypass the launcher, call the virtual-environment executable
+directly from the terminal:
+
+```powershell
 .\.venv311\Scripts\simple-ai-trading.exe shell
 .\.venv311\Scripts\simple-ai-trading.exe menu
 ```
