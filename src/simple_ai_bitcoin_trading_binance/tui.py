@@ -76,6 +76,7 @@ class ConfirmScreen(ModalScreen[bool]):
 class FormScreen(ModalScreen[dict[str, str] | None]):
     BINDINGS = [
         Binding("escape", "dismiss_none", "Cancel", show=False, priority=True),
+        Binding("enter", "activate_focused", "Choose", show=False, priority=True),
         Binding("ctrl+s", "save", "Save", show=False, priority=True),
     ]
 
@@ -115,8 +116,7 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
             payload[field.key] = self.query_one(f"#field-{field.key}", Input).value.strip()
         return payload
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        current_id = event.input.id or ""
+    def _submit_field_id(self, current_id: str) -> None:
         ids = [f"field-{field.key}" for field in self.fields]
         if current_id not in ids:
             self.dismiss(self._values())
@@ -127,6 +127,9 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
             return
         self.query_one(f"#{ids[index + 1]}", Input).focus()
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit_field_id(event.input.id or "")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save":
             self.dismiss(self._values())
@@ -135,6 +138,16 @@ class FormScreen(ModalScreen[dict[str, str] | None]):
 
     def action_save(self) -> None:
         self.dismiss(self._values())
+
+    def action_activate_focused(self) -> None:
+        focused_id = getattr(self.focused, "id", "")
+        if focused_id == "cancel":
+            self.dismiss(None)
+            return
+        if focused_id == "save":
+            self.action_save()
+            return
+        self._submit_field_id(focused_id)
 
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
@@ -858,6 +871,25 @@ class OperatorApp(App[int]):
     def _modal_open(self) -> bool:
         return len(self.screen_stack) > 1
 
+    def _active_modal_screen(self):
+        if not self._modal_open():
+            return None
+        try:
+            screen = self.screen_stack[-1]
+        except Exception:
+            return None
+        return None if screen is self else screen
+
+    def _call_modal_action(self, name: str) -> bool:
+        screen = self._active_modal_screen()
+        if screen is None:
+            return False
+        action = getattr(screen, f"action_{name}", None)
+        if not callable(action):
+            return False
+        action()
+        return True
+
     def _update_action_details(self) -> None:
         action = self._current_action()
         details = self.query_one("#details", Static)
@@ -932,6 +964,9 @@ class OperatorApp(App[int]):
 
     async def action_run_selected(self) -> None:
         if self._modal_open():
+            if self._call_modal_action("activate_focused"):
+                return
+            self._call_modal_action("select_highlighted")
             return
         await self._execute_action(self._current_action())
 
@@ -948,35 +983,47 @@ class OperatorApp(App[int]):
         self.set_status(action.title)
 
     def action_cursor_down(self) -> None:
+        if self._call_modal_action("cursor_down"):
+            return
         if self._modal_open():
             return
         current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
         self._set_current_action_index(current + 1)
 
     def action_cursor_up(self) -> None:
+        if self._call_modal_action("cursor_up"):
+            return
         if self._modal_open():
             return
         current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
         self._set_current_action_index(current - 1)
 
     def action_page_down(self) -> None:
+        if self._call_modal_action("page_down"):
+            return
         if self._modal_open():
             return
         current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
         self._set_current_action_index(current + 5)
 
     def action_page_up(self) -> None:
+        if self._call_modal_action("page_up"):
+            return
         if self._modal_open():
             return
         current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
         self._set_current_action_index(current - 5)
 
     def action_first_action(self) -> None:
+        if self._call_modal_action("first"):
+            return
         if self._modal_open():
             return
         self._set_current_action_index(0)
 
     def action_last_action(self) -> None:
+        if self._call_modal_action("last"):
+            return
         if self._modal_open():
             return
         self._set_current_action_index(len(self.actions_data) - 1)

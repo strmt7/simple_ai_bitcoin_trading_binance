@@ -155,12 +155,18 @@ def test_form_screen_behaviors(monkeypatch) -> None:
     screen.on_input_submitted(second_event)
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "save"})()})())
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "cancel"})()})())
+    screen.focused = type("Focused", (), {"id": "cancel"})()
+    screen.action_activate_focused()
+    screen.focused = type("Focused", (), {"id": "save"})()
+    screen.action_activate_focused()
     screen.action_dismiss_none()
 
     assert dismissed == [
         {"api_key": "typed-key", "interval": "1h"},
         {"api_key": "typed-key", "interval": "1h"},
         None,
+        None,
+        {"api_key": "typed-key", "interval": "1h"},
         None,
     ]
 
@@ -711,6 +717,85 @@ def test_modal_keyboard_fallbacks_in_textual_runtime() -> None:
             await pilot.pause()
             assert len(confirm_accept_app.screen_stack) == 1
             assert confirm_accept_app.focused.id == "actions"
+
+    asyncio.run(runner())
+
+
+def test_app_level_bindings_forward_to_open_modals_in_textual_runtime() -> None:
+    async def runner() -> None:
+        app = OperatorApp(
+            title_text="console",
+            actions=[TUIAction("1", "Sync", "sync description", lambda _ui: 0)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+
+            app.push_screen(MenuScreen("Hub", [("one", "One"), ("two", "Two")]))
+            await pilot.pause()
+            menu = app.screen.query_one("#menu-list")
+            app.action_cursor_down()
+            await pilot.pause()
+            assert menu.highlighted == 1
+            app.action_cursor_up()
+            await pilot.pause()
+            assert menu.highlighted == 0
+            app.action_page_down()
+            await pilot.pause()
+            assert menu.highlighted == 1
+            app.action_page_up()
+            await pilot.pause()
+            assert menu.highlighted == 0
+            app.action_last_action()
+            await pilot.pause()
+            assert menu.highlighted == 1
+            app.action_first_action()
+            await pilot.pause()
+            assert menu.highlighted == 0
+            app.action_cursor_down()
+            await pilot.pause()
+            assert menu.highlighted == 1
+            await app.action_run_selected()
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+
+            app.push_screen(MultiSelectScreen("Features", ["momentum_1", "rsi"], ["momentum_1"]))
+            await pilot.pause()
+            features = app.screen.query_one("#feature-list")
+            app.action_cursor_down()
+            await pilot.pause()
+            assert features.highlighted == 1
+            await app.action_run_selected()
+            await pilot.pause()
+            assert "rsi" in features.selected
+            app.screen.action_save()
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+
+            app.push_screen(
+                FormScreen(
+                    "Runtime",
+                    [
+                        FormField("api_key", "API key", "seed"),
+                        FormField("interval", "Interval", "15m"),
+                    ],
+                )
+            )
+            await pilot.pause()
+            assert app.focused.id == "field-api_key"
+            await app.action_run_selected()
+            await pilot.pause()
+            assert app.focused.id == "field-interval"
+            await app.action_run_selected()
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+
+            app.push_screen(ConfirmScreen("Confirm?"))
+            await pilot.pause()
+            assert app.focused.id == "cancel"
+            await app.action_run_selected()
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
 
     asyncio.run(runner())
 
