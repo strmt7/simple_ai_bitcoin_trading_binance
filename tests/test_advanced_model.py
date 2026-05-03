@@ -75,8 +75,8 @@ def test_safe_helper_and_extras():
     assert am._safe(1.2) == pytest.approx(1.2)
     closes = [100.0 + i for i in range(40)]
     features = am._extra_window_features(closes, (5, 10))
-    assert len(features) == 6
-    assert am._extra_window_features([], (5, 10)) == [0.0] * 6
+    assert len(features) == 14
+    assert am._extra_window_features([], (5, 10)) == [0.0] * 14
     cache = am._build_window_cache(closes)
     assert math.isnan(am._window_mean(cache.close_prefix, 2, 1))
 
@@ -104,8 +104,8 @@ def test_advanced_feature_dimension_skips_polynomial_when_disabled():
         extra_lookback_windows=(5,),
     )
     dim = am.advanced_feature_dimension(cfg)
-    # polynomial disabled → base(4) + extras(3) + transforms(4*2=8) = 15
-    assert dim == 15
+    # polynomial disabled: base(4) + extras(7) + transforms(4*2=8) = 19
+    assert dim == 19
 
 
 def test_advanced_feature_dimension_degree3_branch():
@@ -116,8 +116,8 @@ def test_advanced_feature_dimension_degree3_branch():
         extra_lookback_windows=(5,),
     )
     dim = am.advanced_feature_dimension(cfg)
-    # base(6) + extras(3) + transforms(6*2=12) + pairs (k=5 → 15) + cube bonus (4) = 40
-    assert dim == 6 + 3 + 12 + 15 + 4
+    # base(6) + extras(7) + transforms(6*2=12) + pairs (k=5 -> 15) + cube bonus (4) = 44
+    assert dim == 6 + 7 + 12 + 15 + 4
 
 
 def test_advanced_feature_dimension_matches_expand():
@@ -145,15 +145,20 @@ def test_default_config_for_branches():
     c = am.default_config_for("default", FEATURE_NAMES)
     d = am.default_config_for("nothing", ())
     assert a.polynomial_top_features == 5
+    assert a.label_lookahead == 8
     assert b.polynomial_degree == 3
+    assert b.label_threshold == pytest.approx(0.0005)
     assert c.polynomial_top_features == len(FEATURE_NAMES)
+    assert c.label_lookahead == 4
     assert d.polynomial_top_features == len(FEATURE_NAMES)
 
 
 def test_make_advanced_rows_happy_path():
     cfg = am.default_config_for("default", FEATURE_NAMES)
     rows = am.make_advanced_rows(_candles(250), cfg)
+    short_horizon_rows = am.make_advanced_rows(_candles(250), cfg, lookahead=1)
     assert rows
+    assert len(short_horizon_rows) > len(rows)
     assert len(rows[0].features) == am.advanced_feature_dimension(cfg)
 
 

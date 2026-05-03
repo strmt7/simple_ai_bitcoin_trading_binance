@@ -36,6 +36,18 @@ def test_resolve_backend_cuda_falls_back_with_reason_when_unavailable() -> None:
         assert info.device.startswith("cuda")
 
 
+def test_resolve_backend_cuda_returns_cpu_when_torch_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch",
+        lambda: (None, "torch missing in test"),
+    )
+
+    info = resolve_backend("cuda")
+
+    assert info.kind == "cpu"
+    assert info.reason == "CUDA unavailable (torch missing or no CUDA device)"
+
+
 def test_resolve_backend_rocm_falls_back_with_reason_when_unavailable() -> None:
     info = resolve_backend("rocm")
     if info.kind == "cpu":
@@ -43,6 +55,18 @@ def test_resolve_backend_rocm_falls_back_with_reason_when_unavailable() -> None:
         assert info.requested == "rocm"
     else:
         assert info.kind == "rocm"
+
+
+def test_resolve_backend_rocm_returns_cpu_when_torch_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch",
+        lambda: (None, "torch missing in test"),
+    )
+
+    info = resolve_backend("rocm")
+
+    assert info.kind == "cpu"
+    assert info.reason == "ROCm unavailable (torch missing or not a ROCm build)"
 
 
 def test_resolve_backend_directml_falls_back_with_reason_when_unavailable() -> None:
@@ -59,6 +83,22 @@ def test_resolve_backend_auto_falls_back_to_cpu_without_torch() -> None:
     if info.kind == "cpu":
         assert "GPU" in info.reason or "CPU" in info.reason
         assert info.requested == "auto"
+
+
+def test_resolve_backend_auto_returns_cpu_when_every_probe_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch",
+        lambda: (None, "torch missing in test"),
+    )
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch_directml",
+        lambda: (None, "directml missing in test"),
+    )
+
+    info = resolve_backend("auto")
+
+    assert info.kind == "cpu"
+    assert info.reason == "No GPU backend available; running on CPU"
 
 
 def test_resolve_backend_unknown_value_is_cpu_with_explanation() -> None:
@@ -300,6 +340,18 @@ def test_resolve_backend_mps_success(monkeypatch) -> None:
     assert info.device == "mps"
 
 
+def test_resolve_backend_mps_returns_cpu_when_torch_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch",
+        lambda: (None, "torch missing in test"),
+    )
+
+    info = resolve_backend("mps")
+
+    assert info.kind == "cpu"
+    assert info.reason == "MPS unavailable (torch missing or not Apple Silicon)"
+
+
 def test_resolve_backend_mps_returns_cpu_when_unavailable(monkeypatch) -> None:
     fake = _make_fake_torch(mps=_FakeMpsBackend(available=False))
     monkeypatch.setattr(
@@ -350,6 +402,10 @@ def test_resolve_backend_auto_picks_mps_when_cuda_and_rocm_missing(monkeypatch) 
     monkeypatch.setattr(
         "simple_ai_bitcoin_trading_binance.compute._probe_torch",
         lambda: (fake, ""),
+    )
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch_directml",
+        lambda: (None, "torch-directml unavailable in this test"),
     )
     info = resolve_backend("auto")
     assert info.kind == "mps"

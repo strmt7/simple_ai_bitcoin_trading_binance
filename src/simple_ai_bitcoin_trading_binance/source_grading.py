@@ -25,8 +25,8 @@ _AI_GRADING_RECOVERABLE_ERRORS = (
     TypeError,
     ValueError,
 )
-_AI_GRADE_BATCH_SIZE = 24
-_AI_SINGLE_FILL_LIMIT = 8
+_AI_GRADE_BATCH_SIZE = 12
+_AI_SINGLE_FILL_LIMIT = 24
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ def _grade_prompt(rollups: list[dict[str, object]]) -> str:
     ]
     return (
         "Grade BTCUSDC data sources 0-10. Higher=timely, replayable, actionable, consistent. "
-        "Return a compact JSON object only, no markdown and no string values: "
+        "Return every listed source|horizon key exactly once in a compact JSON object only, no markdown and no string values: "
         "{\"grades\":{\"source|horizon\":5}}.\n"
         + "\n".join(compact)
     )

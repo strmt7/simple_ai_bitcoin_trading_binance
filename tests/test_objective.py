@@ -75,6 +75,13 @@ def test_min_closed_trades_gate():
     assert obj.CONSERVATIVE.accepts(r) is False
 
 
+def test_min_realized_pnl_gate():
+    r = _result(realized_pnl=-0.01, closed_trades=10)
+    assert obj.DEFAULT.accepts(r) is False
+    ranked = obj.rank_candidates([({"id": "negative"}, r)], obj.DEFAULT)
+    assert "realized_pnl<=0.0" in ranked[0]["reject_reason"]
+
+
 def test_safe_and_return_ratio_non_finite():
     assert obj._safe(float("nan")) == 0.0
     assert obj._safe(1.2) == pytest.approx(1.2)
@@ -132,6 +139,7 @@ def test_rank_candidates_hard_gate_fallback_reason():
             self.summary = inner.summary
             self.long_description = inner.long_description
             self.min_closed_trades = inner.min_closed_trades
+            self.min_realized_pnl = inner.min_realized_pnl
             self.max_drawdown_rejection = inner.max_drawdown_rejection
             self.scorer = inner.scorer
             self.training = inner.training
@@ -151,3 +159,4 @@ def test_objective_training_dataclass_defaults_present():
     for spec in (obj.CONSERVATIVE, obj.DEFAULT, obj.RISKY):
         assert spec.training is not None
         assert spec.training.epochs > 0
+        assert spec.min_realized_pnl == pytest.approx(0.0)

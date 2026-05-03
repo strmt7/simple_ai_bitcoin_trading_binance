@@ -29,6 +29,7 @@ class ObjectiveSpec:
     long_description: str
     scorer: Callable[[BacktestResult], float]
     min_closed_trades: int = 3
+    min_realized_pnl: float | None = None
     max_drawdown_rejection: float = 1.0  # 1.0 = never reject on drawdown alone
     training: "ObjectiveTraining | None" = None
 
@@ -39,6 +40,8 @@ class ObjectiveSpec:
         """Return False when a candidate fails hard gates — used by tuning."""
 
         if result.closed_trades < max(0, int(self.min_closed_trades)):
+            return False
+        if self.min_realized_pnl is not None and result.realized_pnl <= self.min_realized_pnl:
             return False
         if self.max_drawdown_rejection < 1.0 and result.max_drawdown > self.max_drawdown_rejection:
             return False
@@ -145,6 +148,7 @@ CONSERVATIVE = ObjectiveSpec(
     ),
     scorer=_conservative_scorer,
     min_closed_trades=5,
+    min_realized_pnl=0.0,
     max_drawdown_rejection=0.15,
     training=ObjectiveTraining(
         epochs=400,
@@ -178,6 +182,7 @@ DEFAULT = ObjectiveSpec(
     ),
     scorer=_default_scorer,
     min_closed_trades=3,
+    min_realized_pnl=0.0,
     max_drawdown_rejection=0.25,
     training=ObjectiveTraining(
         epochs=600,
@@ -212,6 +217,7 @@ RISKY = ObjectiveSpec(
     ),
     scorer=_risky_scorer,
     min_closed_trades=2,
+    min_realized_pnl=0.0,
     max_drawdown_rejection=0.45,
     training=ObjectiveTraining(
         epochs=900,
@@ -297,6 +303,8 @@ def rank_candidates(
             reasons: list[str] = []
             if result.closed_trades < objective.min_closed_trades:
                 reasons.append(f"closed_trades<{objective.min_closed_trades}")
+            if objective.min_realized_pnl is not None and result.realized_pnl <= objective.min_realized_pnl:
+                reasons.append(f"realized_pnl<={objective.min_realized_pnl}")
             if objective.max_drawdown_rejection < 1.0 and result.max_drawdown > objective.max_drawdown_rejection:
                 reasons.append(f"max_drawdown>{objective.max_drawdown_rejection}")
             if result.stopped_by_drawdown and objective.max_drawdown_rejection < 0.5:

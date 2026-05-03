@@ -31,8 +31,10 @@ from simple_ai_bitcoin_trading_binance.training_suite import (
     _calibrate_candidate_threshold,
     _evaluate_candidate,
     _local_refinement_candidates,
+    _refine_threshold_on_validation_rows,
     _strategy_for_candidate,
     _threshold_guard,
+    _threshold_values,
     _walk_forward_split,
     describe_candidate_grid,
     preview_candidates,
@@ -106,7 +108,7 @@ def test_candidate_params_asdict_keys() -> None:
 def test_candidate_grid_returns_unique_deduped_list() -> None:
     training = get_objective("default").training
     grid = _candidate_grid(training)
-    assert len(grid) > 0
+    assert len(grid) == 72
     # dedupe check: no two entries share identical tuple of values
     tuples = [tuple(c.asdict().values()) for c in grid]
     assert len(tuples) == len(set(tuples))
@@ -119,10 +121,10 @@ def test_candidate_grid_returns_unique_deduped_list() -> None:
     seed_set = {c.seed for c in grid}
     assert len(epoch_set) >= 2
     assert len(lr_set) >= 2
-    assert len(l2_set) >= 3
+    assert len(l2_set) >= 2
     assert len(threshold_set) >= 2
-    assert len(confidence_set) >= 2
-    assert len(seed_set) >= 2
+    assert confidence_set == {0.85}
+    assert seed_set == {7}
 
 
 def test_candidate_grid_dedupes_colliding_entries() -> None:
@@ -130,7 +132,7 @@ def test_candidate_grid_dedupes_colliding_entries() -> None:
 
     colliding = ObjectiveTraining(
         epochs=200,
-        learning_rate=0.0,  # * 0.6 and * 1.0 both equal 0.0 -> dedup
+        learning_rate=0.0,  # both learning-rate options equal 0.0 -> dedup
         l2_penalty=1e-3,
         signal_threshold=0.5,
         stop_loss_pct=0.02,
@@ -149,9 +151,7 @@ def test_candidate_grid_dedupes_colliding_entries() -> None:
     # All candidates distinct after dedup
     tuples = [tuple(c.asdict().values()) for c in grid]
     assert len(tuples) == len(set(tuples))
-    # With lr collapsing, we expect fewer entries than the raw Cartesian product
-    # (3*1*3*3*2*3*3*2 = 972) instead of the full 1944.
-    assert len(grid) <= 972
+    assert len(grid) == 36
 
 
 # ----- calibration helpers --------------------------------------------------
@@ -180,10 +180,22 @@ def test_threshold_guard_accepts_stable_or_sharper_candidates() -> None:
     stable = Report(accuracy=0.58, f1=0.46, precision=0.20)
     sharper = Report(accuracy=0.63, f1=0.10, precision=0.44)
     rejected = Report(accuracy=0.50, f1=0.30, precision=0.20)
+    zero_hit = SimpleNamespace(accuracy=0.90, f1=0.0, precision=0.0, true_positive=0, false_negative=3)
 
     assert _threshold_guard(baseline, stable) is True
     assert _threshold_guard(baseline, sharper) is True
     assert _threshold_guard(baseline, rejected) is False
+    assert _threshold_guard(baseline, zero_hit) is False
+
+
+def test_threshold_values_clamps_single_step_and_expands_inverted_range() -> None:
+    assert _threshold_values(0.2, 0.8, 1, 1.4) == [1.0]
+
+    values = _threshold_values(0.7, 0.6, 3, 0.65)
+
+    assert values == sorted(values)
+    assert values[0] == 0.65
+    assert values[-1] == 0.71
 
 
 def test_calibrate_candidate_threshold_without_rows_uses_strategy_threshold() -> None:
@@ -303,6 +315,58 @@ def test_calibrate_candidate_threshold_accepts_safe_classification_threshold(
     assert threshold == pytest.approx(0.43)
     assert source == "classification_f1"
     assert score == pytest.approx(0.2)
+
+
+def test_refine_threshold_on_validation_rows_promotes_positive_profit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_evaluate(*_args, **kwargs):
+        threshold = float(kwargs.get("threshold", 0.5))
+        if threshold <= 0.05:
+            return SimpleNamespace(accuracy=0.60, f1=0.35, precision=0.30, true_positive=3, false_negative=2)
+        return SimpleNamespace(accuracy=0.40, f1=0.20, precision=0.20, true_positive=1, false_negative=3)
+
+    def fake_run_backtest(_rows, model, *_args, **_kwargs):
+        if float(model.decision_threshold or 0.0) <= 0.05:
+            return SimpleNamespace(realized_pnl=1.75, closed_trades=3, max_drawdown=0.01)
+        return SimpleNamespace(realized_pnl=-0.05, closed_trades=2, max_drawdown=0.02)
+
+    monkeypatch.setattr(training_suite, "evaluate_classification", fake_evaluate)
+    monkeypatch.setattr(training_suite, "run_backtest", fake_run_backtest)
+
+    refined = _refine_threshold_on_validation_rows(
+        _fake_trained_model(2),
+        _rows(40),
+        StrategyConfig(signal_threshold=0.60),
+        market_type="spot",
+        starting_cash=1000.0,
+    )
+
+    assert refined is not None
+    threshold, source, score = refined
+    assert threshold == pytest.approx(0.05)
+    assert source == "validation_profit_backtest"
+    assert score == pytest.approx(1.75)
+
+
+def test_refine_threshold_on_validation_rows_rejects_losing_profit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        training_suite,
+        "run_backtest",
+        lambda *_a, **_k: SimpleNamespace(realized_pnl=-0.01, closed_trades=2, max_drawdown=0.01),
+    )
+
+    refined = _refine_threshold_on_validation_rows(
+        _fake_trained_model(2),
+        _rows(40),
+        StrategyConfig(signal_threshold=0.60),
+        market_type="spot",
+        starting_cash=1000.0,
+    )
+
+    assert refined is None
 
 
 # ----- _walk_forward_split --------------------------------------------------
@@ -542,6 +606,56 @@ def test_evaluate_candidate_selects_full_fit_when_calibration_regresses(
     assert result["validation_score"] > 0.0
     assert result["full_sample_score"] > 0.0
     assert result["model"].strategy_overrides["signal_threshold"] == pytest.approx(0.64)
+
+
+def test_evaluate_candidate_can_skip_full_fit_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"train": 0}
+
+    def fake_train_advanced(rows, cfg, **kwargs):
+        calls["train"] += 1
+        model = _fake_trained_model(2)
+        return model, SimpleNamespace(row_count=len(rows), positive_rate=0.5)
+
+    monkeypatch.setattr(training_suite, "train_advanced", fake_train_advanced)
+    monkeypatch.setattr(
+        training_suite,
+        "calibrate_probability_temperature",
+        lambda *a, **k: SimpleNamespace(status="fail"),
+    )
+    monkeypatch.setattr(
+        training_suite,
+        "_calibrate_candidate_threshold",
+        lambda *a, **k: (0.67, "classification_f1", 2.5),
+    )
+    monkeypatch.setattr(training_suite, "run_backtest", lambda *a, **k: _make_result())
+
+    candidate = CandidateParams(
+        epochs=80,
+        learning_rate=0.01,
+        l2_penalty=0.001,
+        signal_threshold=0.64,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.03,
+        risk_per_trade=0.01,
+        seed=11,
+    )
+    result = _evaluate_candidate({
+        "candidate": candidate,
+        "rows_train": _rows(50),
+        "rows_eval": _rows(10),
+        "feature_cfg": default_config_for("default", ()),
+        "base_strategy": StrategyConfig(),
+        "objective": "default",
+        "market_type": "spot",
+        "starting_cash": 1000.0,
+        "include_full_fit_fallback": False,
+    })
+
+    assert calls["train"] == 1
+    assert result["calibration_rows"] > 0
+    assert result["threshold_source"] == "classification_f1"
 
 
 def test_train_for_objective_happy_with_fake_runner(tmp_path: Path) -> None:

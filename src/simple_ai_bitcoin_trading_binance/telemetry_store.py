@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Sequence, cast
 
+_UNATTRIBUTED_RAW_SOURCE = "unattributed_raw_payload"
+
 
 @dataclass(frozen=True)
 class RawObservation:
@@ -189,21 +191,39 @@ class TradingTelemetryStore:
                 score=float(payload.get("score")) if payload.get("score") is not None else None,
                 confidence=float(payload.get("urgency")) if payload.get("urgency") is not None else None,
             ) else 0
-        for index, payload in enumerate(raw_payloads):
+        for payload in raw_payloads:
+            raw_horizon = ""
+            raw_score: float | None = None
+            raw_confidence: float | None = None
             if isinstance(payload, Mapping):
-                source = str(payload.get("provider") or payload.get("source") or f"raw_{index}")
+                source = str(payload.get("provider") or payload.get("source") or _UNATTRIBUTED_RAW_SOURCE)
                 record_payload: Mapping[str, object] | Sequence[object] = payload
+                raw_horizon = str(payload.get("horizon") or "")
+                if payload.get("score") is not None:
+                    try:
+                        raw_score = float(payload.get("score"))
+                    except (TypeError, ValueError):
+                        raw_score = None
+                confidence_value = payload.get("urgency") if payload.get("urgency") is not None else payload.get("confidence")
+                if confidence_value is not None:
+                    try:
+                        raw_confidence = float(confidence_value)
+                    except (TypeError, ValueError):
+                        raw_confidence = None
             elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
-                source = f"raw_{index}"
+                source = _UNATTRIBUTED_RAW_SOURCE
                 record_payload = payload
             else:
-                source = f"raw_{index}"
+                source = _UNATTRIBUTED_RAW_SOURCE
                 record_payload = {"value": str(payload)}
             inserted += 1 if self.record_observation(
                 kind="raw_provider_payload",
                 source=source,
                 payload=record_payload,
                 observed_at_ms=getattr(report, "known_at_ms", self._now_ms()),
+                horizon=raw_horizon,
+                score=raw_score,
+                confidence=raw_confidence,
             ) else 0
         return inserted
 
@@ -252,10 +272,12 @@ class TradingTelemetryStore:
                    SUM(CASE WHEN kind = 'external_signal_component' THEN 1 ELSE 0 END) AS component_records
             FROM raw_observations
             WHERE observed_at_ms >= ? AND observed_at_ms <= ?
+              AND source <> ?
+              AND source NOT GLOB 'raw_[0-9]*'
             GROUP BY source, horizon
             ORDER BY sample_count DESC, source ASC
             """,
-            (int(since_ms), int(until_ms)),
+            (int(since_ms), int(until_ms), _UNATTRIBUTED_RAW_SOURCE),
         ).fetchall()
         return [
             {

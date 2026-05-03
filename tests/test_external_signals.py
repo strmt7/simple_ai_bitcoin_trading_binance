@@ -17,6 +17,53 @@ def _good_fetch(url: str, timeout: float):
         return {"data": [{"value": "25", "value_classification": "Fear", "timestamp": str(NOW_MS // 1000)}]}
     if "coingecko" in url:
         return {"bitcoin": {"usd": "100000", "usd_24h_change": "3.0", "usd_24h_vol": "123456"}}
+    if "coinpaprika" in url:
+        return {
+            "quotes": {
+                "USD": {
+                    "price": 100000,
+                    "volume_24h": 123456,
+                    "percent_change_1h": 0.5,
+                    "percent_change_24h": 3.0,
+                    "percent_change_7d": 6.0,
+                }
+            }
+        }
+    if "coinlore" in url:
+        return [
+            {
+                "price_usd": "100000",
+                "volume24": "123456",
+                "percent_change_1h": "0.5",
+                "percent_change_24h": "3.0",
+                "percent_change_7d": "6.0",
+            }
+        ]
+    if "blockchain.info/stats" in url:
+        return {"n_tx": 500000, "hash_rate": 875000000000, "minutes_between_blocks": 9.5, "mempool_size": 1000}
+    if "kraken" in url:
+        return {
+            "error": [],
+            "result": {
+                "XXBTZUSD": {
+                    "c": ["103000", "0.1"],
+                    "o": "100000",
+                    "v": ["10", "20"],
+                }
+            },
+        }
+    if "exchange.coinbase" in url:
+        return {"last": "103000", "open": "100000", "high": "104000", "low": "99000", "volume": "20"}
+    if "bitstamp" in url:
+        return {"last": "103000", "open": "100000", "percent_change_24": "3.0", "volume": "20"}
+    if "api.binance.com/api/v3/ticker/24hr" in url:
+        return {
+            "symbol": "BTCUSDC",
+            "lastPrice": "103000",
+            "priceChangePercent": "3.0",
+            "volume": "20",
+            "quoteVolume": "2000000",
+        }
     if "premiumIndex" in url:
         return {"lastFundingRate": "0.0001", "markPrice": "100.5", "indexPrice": "100", "time": NOW_MS}
     if "openInterest" in url:
@@ -85,8 +132,8 @@ def test_collect_external_signals_success_cache_and_render(tmp_path) -> None:
         now_ms=NOW_MS,
     )
     assert report.status == "ok"
-    assert report.provider_count == 7
-    assert report.fresh_count == 7
+    assert report.provider_count == 14
+    assert report.fresh_count == 14
     assert report.score_adjustment > 0
     assert report.short_term_score != 0.0
     assert report.medium_term_score != 0.0
@@ -165,8 +212,8 @@ def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
         telemetry_path=telemetry,
     )
     assert report.status == "ok"
-    assert report.provider_count == 38
-    assert report.fresh_count == 38
+    assert report.provider_count == 45
+    assert report.fresh_count == 45
     assert report.news_ai_status == "ok"
     assert report.news_ai_model == "gemma4:e4b"
     assert report.reaction_required is True
@@ -265,7 +312,7 @@ def test_rss_provider_parser_jitter_and_ollama_error(tmp_path, monkeypatch) -> N
     assert result.component.provider == "feed"
     assert result.component.status == "ok"
     assert result.raw_payload is not None and "raw_xml" in result.raw_payload
-    assert signals._extract_feed_items("<feed><entry><title>Atom Bitcoin ban</title><updated>2023-11-14T22:13:20Z</updated><link href='https://x.test'/></entry></feed>", now_ms=NOW_MS)[0]["title"] == "Atom Bitcoin ban"
+    assert signals._extract_feed_items("\ufeff<feed><entry><title>Atom Bitcoin ban</title><updated>2023-11-14T22:13:20Z</updated><link href='https://x.test'/></entry></feed>", now_ms=NOW_MS)[0]["title"] == "Atom Bitcoin ban"
 
     report = signals.collect_external_signals(
         cache_path=tmp_path / "ollama-error.json",
@@ -281,7 +328,56 @@ def test_rss_provider_parser_jitter_and_ollama_error(tmp_path, monkeypatch) -> N
     assert any(component.provider == "ollama_news_ai" and component.status == "error" for component in report.components)
 
 
+def test_rss_scheduler_paces_same_host_requests(monkeypatch) -> None:
+    sleeps: list[float] = []
+    clock = {"now": 0.0}
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(signals.time, "perf_counter", lambda: clock["now"])
+    monkeypatch.setattr(signals.time, "sleep", sleep)
+
+    results = signals._fetch_rss_news_feeds(
+        (
+            signals.NewsFeedProvider("same_one", "https://same.test/one.xml"),
+            signals.NewsFeedProvider("same_two", "https://same.test/two.xml"),
+            signals.NewsFeedProvider("other", "https://other.test/rss.xml"),
+        ),
+        lambda _url, _timeout: _feed_xml(),
+        1.0,
+        NOW_MS,
+        "cpu",
+        max_workers=3,
+        provider_jitter_seconds=0.0,
+    )
+
+    assert [result.component.provider for result in results] == ["same_one", "same_two", "other"]
+    assert any(seconds >= signals._RSS_SAME_HOST_GAP_SECONDS for seconds in sleeps)
+
+
+def test_rss_scheduler_accepts_hostless_provider_without_pacing(monkeypatch) -> None:
+    monkeypatch.setattr(signals.time, "sleep", lambda seconds: pytest.fail(f"unexpected sleep {seconds}"))
+
+    results = signals._fetch_rss_news_feeds(
+        (signals.NewsFeedProvider("hostless", "feed.xml"),),
+        lambda _url, _timeout: _feed_xml(),
+        1.0,
+        NOW_MS,
+        "cpu",
+        max_workers=1,
+        provider_jitter_seconds=0.0,
+    )
+
+    assert [result.component.provider for result in results] == ["hostless"]
+
+
 def test_news_feed_helpers_and_ollama_validation(monkeypatch) -> None:
+    assert len(signals.RSS_NEWS_FEEDS) >= 90
+    assert len(signals.RSS_NEWS_FEEDS) + 14 >= 100
+    assert len({provider.provider for provider in signals.RSS_NEWS_FEEDS}) == len(signals.RSS_NEWS_FEEDS)
+    assert all(provider.url.startswith("https://") for provider in signals.RSS_NEWS_FEEDS)
     assert signals._parse_feed_datetime_ms("", NOW_MS) == NOW_MS
     assert signals._parse_feed_datetime_ms("Tue, 14 Nov 2023 22:13:20", 0) == NOW_MS
     assert signals._parse_feed_datetime_ms("2023-11-14T22:13:20", 0) == NOW_MS
@@ -290,6 +386,13 @@ def test_news_feed_helpers_and_ollama_validation(monkeypatch) -> None:
     assert signals._strip_markup("<b>Bitcoin</b>&amp;BTC") == "Bitcoin &BTC"
     assert signals._provider_name_for_url("https://example.test/path") == "example_test"
     assert signals._provider_name_for_url(signals.COINGECKO_SIMPLE_PRICE_URL) == "coingecko_bitcoin"
+    assert signals._provider_name_for_url(signals.COINPAPRIKA_BTC_TICKER_URL) == "coinpaprika_bitcoin"
+    assert signals._provider_name_for_url(signals.COINLORE_BTC_TICKER_URL) == "coinlore_bitcoin"
+    assert signals._provider_name_for_url(signals.BLOCKCHAIN_STATS_URL) == "blockchain_network_stats"
+    assert signals._provider_name_for_url(signals.KRAKEN_BTCUSD_TICKER_URL) == "kraken_btcusd_momentum"
+    assert signals._provider_name_for_url(signals.COINBASE_BTCUSD_STATS_URL) == "coinbase_btcusd_momentum"
+    assert signals._provider_name_for_url(signals.BITSTAMP_BTCUSD_TICKER_URL) == "bitstamp_btcusd_momentum"
+    assert signals._provider_name_for_url(f"{signals.BINANCE_SPOT_BASE_URL}/api/v3/ticker/24hr?symbol=BTCUSDC") == "binance_spot_momentum"
     assert signals._provider_name_for_url(signals.MEMPOOL_FEES_URL) == "mempool_fee_pressure"
     assert signals._fetch_rss_news_feeds((), lambda _url, _timeout: "", 1.0, NOW_MS, "cpu") == []
     failures = signals._fetch_rss_news_feeds(
@@ -316,6 +419,7 @@ def test_news_feed_helpers_and_ollama_validation(monkeypatch) -> None:
     assert signals._json_mapping_from_text("prefix {\"score\": 1} suffix")["score"] == 1
     assert signals._ollama_response_text({"message": {"content": "{\"score\":1}"}}) == "{\"score\":1}"
     assert signals._ollama_response_text({"message": {"content": None}, "response": "{\"score\":0}"}) == "{\"score\":0}"
+    assert signals._ollama_response_text({"response": "{\"score\":-1}"}) == "{\"score\":-1}"
     with pytest.raises(json.JSONDecodeError):
         signals._json_mapping_from_text("no json here")
     with pytest.raises(ValueError, match="JSON object"):
@@ -433,7 +537,7 @@ def test_external_signal_failures_min_provider_gate_and_fallback(tmp_path) -> No
     )
     assert failed.status == "fail"
     assert failed.score_adjustment == 0.0
-    assert len(failed.warnings) == 8
+    assert len(failed.warnings) == 15
     assert "offline" in signals.render_external_signal_report(failed)
 
     def one_positive(url: str, _timeout: float):
@@ -613,6 +717,13 @@ def test_external_signal_bad_provider_payloads_and_no_cache_path(tmp_path) -> No
         lambda url, _timeout: [] if "alternative" in url else _good_fetch(url, _timeout),
         lambda url, _timeout: {"data": []} if "alternative" in url else _good_fetch(url, _timeout),
         lambda url, _timeout: [] if "coingecko" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "coinpaprika" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "coinlore" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "blockchain.info/stats" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "kraken" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "exchange.coinbase" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "bitstamp" in url else _good_fetch(url, _timeout),
+        lambda url, _timeout: [] if "api.binance.com/api/v3/ticker/24hr" in url else _good_fetch(url, _timeout),
         lambda url, _timeout: [] if "premiumIndex" in url else _good_fetch(url, _timeout),
         lambda url, _timeout: [] if "mempool" in url else _good_fetch(url, _timeout),
         lambda url, _timeout: [] if "cryptocompare" in url else _good_fetch(url, _timeout),
@@ -627,14 +738,14 @@ def test_external_signal_bad_provider_payloads_and_no_cache_path(tmp_path) -> No
             now_ms=NOW_MS,
         )
         assert report.status in {"ok", "warn"}
-        assert report.provider_count == 7
+        assert report.provider_count == 14
 
     fresh = signals.collect_external_signals(
         cache_path=tmp_path / "fresh.json",
         fetch_json=_good_fetch,
         force_refresh=False,
     )
-    assert fresh.fresh_count == 7
+    assert fresh.fresh_count == 14
     no_cache_text = signals.render_external_signal_report(
         signals.ExternalSignalReport(
             status="ok",
@@ -654,6 +765,37 @@ def test_external_signal_bad_provider_payloads_and_no_cache_path(tmp_path) -> No
 
 
 def test_news_provider_edge_payloads_and_backend_reason_render(tmp_path) -> None:
+    with pytest.raises(ValueError, match="missing CoinPaprika USD"):
+        signals._fetch_coinpaprika_btc(lambda _url, _timeout: {"quotes": {}}, 1.0, NOW_MS)
+    coinlore = signals._fetch_coinlore_btc(
+        lambda _url, _timeout: {
+            "value": [
+                {
+                    "price_usd": "100000",
+                    "volume24": "10",
+                    "percent_change_1h": "0",
+                    "percent_change_24h": "1",
+                    "percent_change_7d": "2",
+                }
+            ]
+        },
+        1.0,
+        NOW_MS,
+    )
+    assert coinlore.provider == "coinlore_bitcoin"
+    with pytest.raises(ValueError, match="unexpected CoinLore"):
+        signals._fetch_coinlore_btc(lambda _url, _timeout: {}, 1.0, NOW_MS)
+    with pytest.raises(ValueError, match="Kraken ticker returned an error"):
+        signals._fetch_kraken_btcusd(lambda _url, _timeout: {"error": ["bad"], "result": {}}, 1.0, NOW_MS)
+    with pytest.raises(ValueError, match="missing Kraken"):
+        signals._fetch_kraken_btcusd(lambda _url, _timeout: {"error": [], "result": {"x": []}}, 1.0, NOW_MS)
+    bitstamp = signals._fetch_bitstamp_btcusd(
+        lambda _url, _timeout: {"last": "110", "open": "100", "volume": "1"},
+        1.0,
+        NOW_MS,
+    )
+    assert bitstamp.value == pytest.approx(10.0)
+
     def crypto_empty_data(url: str, _timeout: float):
         if "cryptocompare" in url:
             return {"Data": []}

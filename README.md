@@ -107,9 +107,9 @@ simple-ai-trading doctor --online
 simple-ai-trading audit
 simple-ai-trading data-sync --rows 1000 --db data/market_data.sqlite
 simple-ai-trading data-sync --background --rows 1000 --sleep 300
-simple-ai-trading signals --refresh --news-provider-limit 40 --provider-parallelism 12
-simple-ai-trading signals --loop --sleep 15 --jitter 3 --news-provider-limit 40
-simple-ai-trading signals-benchmark --provider-limit 30 --parallelism 12 --iterations 2
+simple-ai-trading signals --refresh --news-provider-limit 93 --provider-parallelism 24
+simple-ai-trading signals --loop --sleep 15 --jitter 3 --news-provider-limit 93
+simple-ai-trading signals-benchmark --provider-limit 60 --provider-limit 90 --provider-limit 93 --parallelism 16 --parallelism 24 --iterations 2
 simple-ai-trading source-grades --window-hours 24
 python tools/run_real_data_soak.py --duration-seconds 3660 --python .venv311/Scripts/python.exe
 python tools/quality_metrics.py --compare-ref HEAD
@@ -153,12 +153,13 @@ terminal prompts to download the missing data; non-interactive runs can pass
 `--download-missing`.
 
 `signals` fetches the live external confirmation layer used by `live
---external-signals`. It blends Alternative.me Fear and Greed, CoinGecko BTC 24h
-change, Binance futures positioning, mempool.space fee pressure, GDELT, Hacker
-News attention, and a bounded parallel RSS/news tier with 30+ free crypto,
-macro, regulatory, technology, and geopolitical feeds. Positive boosts require
-the configured minimum number of fresh providers; negative signals can reduce
-score and risk sizing.
+--external-signals`. It blends Alternative.me Fear and Greed, CoinGecko,
+CoinPaprika, CoinLore, Binance spot/futures, Kraken, Coinbase Exchange,
+Bitstamp, Blockchain.com network stats, mempool.space fee pressure, CryptoCompare
+news, GDELT, Hacker News attention, and a bounded parallel RSS/news tier with
+100+ free crypto, macro, regulatory, technology, security, social-attention, and geopolitical feeds. Positive
+boosts require the configured minimum number of fresh providers; negative
+signals can reduce score and risk sizing.
 
 The external layer is replayable. When telemetry is enabled, every normalized
 component plus raw provider/model payload is appended to
@@ -172,7 +173,7 @@ Short-horizon news can be evaluated by a local Ollama model:
 
 ```bash
 simple-ai-trading signals --refresh --ollama-news --ollama-model gemma4:e4b \
-    --news-provider-limit 40 --provider-parallelism 12 --provider-jitter 0.25
+    --news-provider-limit 93 --provider-parallelism 24 --provider-jitter 0.25
 ```
 
 On Windows with AMD RX 9000 GPUs, Ollama's ROCm backend may need the HIP SDK
@@ -191,10 +192,15 @@ thinking models are called through Ollama's chat API with `think:false` so the
 news classifier gets JSON content immediately instead of spending the token
 budget on hidden reasoning.
 
-Polling supports jitter at two levels: `--provider-jitter` spreads individual
-provider requests inside a collection, and `signals --loop --sleep N --jitter M`
+Polling supports jitter and host-aware pacing: `--provider-jitter` spreads
+individual provider requests inside a collection, repeated RSS requests to the
+same host are automatically spaced out, and `signals --loop --sleep N --jitter M`
 spreads repeated collections so the host and providers are not hit on exact
-wall-clock intervals. `signals-benchmark` measures provider count, parallelism,
+wall-clock intervals. Strategy defaults poll the 93-feed RSS tier plus the
+structured API tier, yielding 100+ total active providers by default with
+24-way provider parallelism and a 60-second live cache TTL; tune those values
+with the strategy command if your host or the providers need a lighter cadence.
+`signals-benchmark` measures provider count, parallelism,
 success count, and latency on the current host before choosing an interval.
 `source-grades` reviews stored telemetry over a time window and writes integer
 0-10 grades per source/horizon; it uses Ollama when available and falls back to

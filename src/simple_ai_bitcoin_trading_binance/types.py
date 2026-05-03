@@ -121,11 +121,11 @@ class StrategyConfig:
     external_signals_enabled: bool = False
     external_signal_max_adjustment: float = 0.04
     external_signal_min_providers: int = 2
-    external_signal_ttl_seconds: int = 300
+    external_signal_ttl_seconds: int = 60
     external_signal_timeout_seconds: float = 3.0
-    external_signal_news_provider_limit: int = 40
+    external_signal_news_provider_limit: int = 93
     external_signal_news_items_per_provider: int = 4
-    external_signal_provider_parallelism: int = 12
+    external_signal_provider_parallelism: int = 24
     external_signal_provider_jitter_seconds: float = 0.25
     external_signal_poll_jitter_seconds: float = 2.0
     external_signal_short_reaction_refresh_seconds: int = 30
@@ -174,14 +174,14 @@ class StrategyConfig:
             max(0.0, _finite_float(self.external_signal_max_adjustment, 0.04)),
         )
         self.external_signal_min_providers = max(0, _coerce_int(self.external_signal_min_providers, 2))
-        self.external_signal_ttl_seconds = max(0, _coerce_int(self.external_signal_ttl_seconds, 300))
+        self.external_signal_ttl_seconds = max(0, _coerce_int(self.external_signal_ttl_seconds, 60))
         self.external_signal_timeout_seconds = min(
             30.0,
             max(0.1, _finite_float(self.external_signal_timeout_seconds, 3.0)),
         )
-        self.external_signal_news_provider_limit = max(0, _coerce_int(self.external_signal_news_provider_limit, 40))
+        self.external_signal_news_provider_limit = max(0, _coerce_int(self.external_signal_news_provider_limit, 93))
         self.external_signal_news_items_per_provider = max(1, min(10, _coerce_int(self.external_signal_news_items_per_provider, 4)))
-        self.external_signal_provider_parallelism = max(1, min(64, _coerce_int(self.external_signal_provider_parallelism, 12)))
+        self.external_signal_provider_parallelism = max(1, min(64, _coerce_int(self.external_signal_provider_parallelism, 24)))
         self.external_signal_provider_jitter_seconds = min(
             30.0,
             max(0.0, _finite_float(self.external_signal_provider_jitter_seconds, 0.25)),

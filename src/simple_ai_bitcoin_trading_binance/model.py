@@ -1025,7 +1025,7 @@ def train(rows: List[ModelRow], *, epochs: int = 200, learning_rate: float = 0.0
           early_stopping_rounds: int | None = None,
           min_delta: float = 1e-6,
           compute_backend: str | None = None,
-          batch_size: int = 512) -> TrainedModel:
+          batch_size: int = 8192) -> TrainedModel:
     feature_dim = validate_model_rows(rows)
     validation_rows = list(validation_rows or [])
     if validation_rows:

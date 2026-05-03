@@ -43,19 +43,35 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
         )
         assert store.record_signal_report(
             type("Report", (), {"known_at_ms": NOW_MS, "components": [{"provider": "dict_component", "score": 0.1}]})(),
-            raw_payloads=[["list"], "scalar"],
-        ) == 3
+            raw_payloads=[
+                {
+                    "provider": "raw_feed",
+                    "horizon": "short",
+                    "score": 0.2,
+                    "urgency": 0.4,
+                    "payload": {"headline": "Bitcoin ETF flows rise"},
+                },
+                {"provider": "raw_bad", "score": "bad", "urgency": "bad"},
+                ["list"],
+                "scalar",
+            ],
+        ) == 5
         observations = store.recent_observations(since_ms=NOW_MS - 1, limit=10)
         filtered = store.recent_observations(since_ms=NOW_MS - 1, kind="external_signal_component")
         rollups = store.source_rollups(since_ms=NOW_MS - 1, until_ms=NOW_MS + 1)
         store.close()
         store.close()
     assert duplicate == first
-    assert len(observations) == 5
+    assert len(observations) == 7
     assert observations[0].asdict()["kind"] in {"external_signal_component", "raw_provider_payload"}
     assert all(item.kind == "external_signal_component" for item in filtered)
     assert rollups[0]["source"] == "cointelegraph"
     assert rollups[0]["sample_count"] == 2
+    rollup_by_source = {str(item["source"]): item for item in rollups}
+    assert set(rollup_by_source) == {"cointelegraph", "dict_component", "raw_bad", "raw_feed"}
+    assert rollup_by_source["raw_feed"]["horizon"] == "short"
+    assert rollup_by_source["raw_feed"]["avg_score"] == pytest.approx(0.2)
+    assert rollup_by_source["raw_feed"]["avg_confidence"] == pytest.approx(0.4)
 
     def post_json(_url: str, payload: dict[str, object], _timeout: float):
         assert payload["model"] == "gemma4:e4b"
@@ -71,8 +87,8 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
                         "grades": {
                             "cointelegraph|short": 9,
                             "dict_component|medium": 5,
-                            "raw_0|medium": 5,
-                            "raw_1|medium": 5,
+                            "raw_bad|medium": 4,
+                            "raw_feed|short": 7,
                         }
                     }
                 )
@@ -90,6 +106,8 @@ def test_telemetry_store_roundtrip_and_grading_with_ai(tmp_path) -> None:
     assert run.ai_status == "ok"
     cointelegraph = [grade for grade in run.grades if grade.source == "cointelegraph"][0]
     assert cointelegraph.grade == 9
+    assert all(not (grade.source.startswith("raw_") and grade.source[4:].isdigit()) for grade in run.grades)
+    assert "unattributed_raw_payload" not in {grade.source for grade in run.grades}
     assert run.asdict()["graded_sources"] >= 1
     assert cointelegraph.asdict()["source"] == "cointelegraph"
     with TradingTelemetryStore(db) as store:
@@ -358,10 +376,12 @@ def test_source_grading_helper_edges() -> None:
     ]
     single_calls = {"count": 0}
 
-    def post_json_limited_singles(*_args, **_kwargs):
+    def post_json_limited_singles(_url, payload, *_args, **_kwargs):
         single_calls["count"] += 1
-        if single_calls["count"] == 1:
-            return {"response": json.dumps({"grades": {"source_0|medium": 8}})}
+        if payload["options"]["num_ctx"] == 4096:
+            if single_calls["count"] == 1:
+                return {"response": json.dumps({"grades": {"source_0|medium": 8}})}
+            return {"response": json.dumps({"grades": {}})}
         return {"response": json.dumps({"grade": 6, "reason": "limited fill"})}
 
     limited, _latency = source_grading._ai_grades(

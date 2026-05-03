@@ -256,7 +256,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="training backend override; default uses saved runtime compute_backend",
     )
-    parser_train.add_argument("--batch-size", type=int, default=512, help="mini-batch size for GPU training")
+    parser_train.add_argument("--batch-size", type=int, default=8192, help="mini-batch size for GPU training")
     parser_train.add_argument("--walk-forward", action="store_true", help="run walk-forward validation before final training")
     parser_train.add_argument("--walk-forward-train", type=int, default=300)
     parser_train.add_argument("--walk-forward-test", type=int, default=60)
@@ -534,7 +534,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="training backend override; GPU backends run candidates sequentially to protect VRAM",
     )
-    parser_train_suite.add_argument("--batch-size", type=int, default=512, help="mini-batch size for GPU training")
+    parser_train_suite.add_argument("--batch-size", type=int, default=8192, help="mini-batch size for GPU training")
     parser_train_suite.set_defaults(func=command_train_suite)
 
     parser_backtest_panel = subparsers.add_parser(
@@ -3278,16 +3278,24 @@ def _threshold_classification_guard(baseline: object, candidate: object) -> dict
     candidate_accuracy = float(getattr(candidate, "accuracy", 0.0))
     candidate_f1 = float(getattr(candidate, "f1", 0.0))
     candidate_precision = float(getattr(candidate, "precision", 0.0))
+    candidate_true_positive = int(getattr(candidate, "true_positive", 0))
+    candidate_false_negative = int(getattr(candidate, "false_negative", 0))
     accuracy_floor = max(0.0, baseline_accuracy - 0.03)
     f1_floor = max(0.0, baseline_f1 - 0.05)
     precision_floor = max(0.0, baseline_precision - 0.02)
-    stable_f1 = candidate_accuracy >= accuracy_floor and candidate_f1 >= f1_floor
+    detects_positive_cases = not (candidate_false_negative > 0 and candidate_true_positive <= 0)
+    stable_f1 = detects_positive_cases and candidate_accuracy >= accuracy_floor and candidate_f1 >= f1_floor
     conservative_precision = (
-        candidate_accuracy >= baseline_accuracy + 0.02
+        detects_positive_cases
+        and candidate_f1 > 0.0
+        and candidate_accuracy >= baseline_accuracy + 0.02
         and candidate_precision >= precision_floor
     )
     passed = stable_f1 or conservative_precision
-    mode = "f1_stable" if stable_f1 else ("accuracy_precision" if conservative_precision else "rejected")
+    if not detects_positive_cases:
+        mode = "zero_true_positive"
+    else:
+        mode = "f1_stable" if stable_f1 else ("accuracy_precision" if conservative_precision else "rejected")
     return {
         "passed": bool(passed),
         "mode": mode,
@@ -3297,27 +3305,34 @@ def _threshold_classification_guard(baseline: object, candidate: object) -> dict
     }
 
 
-def _threshold_capital_preservation_guard(profit_calibration: object) -> dict[str, float | int | str | bool]:
+def _threshold_capital_preservation_guard(
+    profit_calibration: object,
+    candidate_report: object | None = None,
+) -> dict[str, float | int | str | bool]:
     baseline_score = float(getattr(profit_calibration, "baseline_score", 0.0))
     best_score = float(getattr(profit_calibration, "best_score", baseline_score))
     baseline_pnl = float(getattr(profit_calibration, "baseline_realized_pnl", 0.0))
     realized_pnl = float(getattr(profit_calibration, "realized_pnl", baseline_pnl))
     closed_trades = max(0, int(getattr(profit_calibration, "closed_trades", 0)))
     baseline_closed_trades = max(0, int(getattr(profit_calibration, "baseline_closed_trades", 0)))
+    candidate_true_positive = int(getattr(candidate_report, "true_positive", 0)) if candidate_report else 1
+    candidate_false_negative = int(getattr(candidate_report, "false_negative", 0)) if candidate_report else 0
+    detects_positive_cases = not (candidate_false_negative > 0 and candidate_true_positive <= 0)
     score_delta = best_score - baseline_score
     pnl_delta = realized_pnl - baseline_pnl
     material_pnl_improvement = pnl_delta >= max(1e-9, abs(baseline_pnl) * 0.10)
     tolerated_loss = -abs(baseline_pnl) * 0.10 if baseline_pnl < 0.0 else baseline_pnl
     passed = (
         bool(getattr(profit_calibration, "accepted", False))
+        and detects_positive_cases
         and closed_trades > 0
         and score_delta >= 0.05
         and material_pnl_improvement
-        and realized_pnl >= tolerated_loss
+        and realized_pnl >= max(0.0, tolerated_loss)
     )
     return {
         "passed": bool(passed),
-        "mode": "capital_preservation" if passed else "rejected",
+        "mode": "capital_preservation" if passed else ("zero_true_positive" if not detects_positive_cases else "rejected"),
         "score_delta": float(score_delta),
         "pnl_delta": float(pnl_delta),
         "closed_trades": int(closed_trades),
@@ -3358,7 +3373,7 @@ def command_train(args: argparse.Namespace) -> int:
     if compute_backend not in _COMPUTE_BACKEND_CHOICES:
         print(f"Training settings invalid: unknown compute backend {compute_backend!r}.", file=sys.stderr)
         return 2
-    batch_size = max(1, int(getattr(args, "batch_size", 512) or 512))
+    batch_size = max(1, int(getattr(args, "batch_size", 8192) or 8192))
 
     if args.walk_forward:
         try:
@@ -3448,7 +3463,7 @@ def command_train(args: argparse.Namespace) -> int:
         profit_report = evaluate_classification(calibration_rows, model, threshold=profit_calibration.best_threshold)
         classification_guard = _threshold_classification_guard(classification_report, profit_report)
         classification_guard_passed = bool(classification_guard["passed"])
-        capital_guard = _threshold_capital_preservation_guard(profit_calibration)
+        capital_guard = _threshold_capital_preservation_guard(profit_calibration, profit_report)
         capital_guard_passed = bool(capital_guard["passed"])
         if profit_calibration.accepted and (classification_guard_passed or capital_guard_passed):
             threshold = profit_calibration.threshold
@@ -4999,7 +5014,7 @@ def command_train_suite(args: argparse.Namespace) -> int:
         }
         if getattr(args, "compute_backend", None) is not None:
             suite_kwargs["compute_backend"] = str(args.compute_backend)
-        if getattr(args, "batch_size", 512) != 512:
+        if getattr(args, "batch_size", 8192) != 8192:
             suite_kwargs["batch_size"] = max(1, int(args.batch_size))
         report = run_training_suite(candles, strategy, **suite_kwargs)
     except ValueError as err:

@@ -91,6 +91,8 @@ def test_threshold_classification_guard_modes() -> None:
 
     assert cli._threshold_classification_guard(baseline, stable)["mode"] == "f1_stable"
     assert cli._threshold_classification_guard(baseline, conservative)["mode"] == "accuracy_precision"
+    zero_hit = SimpleNamespace(accuracy=0.90, precision=0.00, f1=0.00, true_positive=0, false_negative=3)
+    assert cli._threshold_classification_guard(baseline, zero_hit)["mode"] == "zero_true_positive"
     guard = cli._threshold_classification_guard(baseline, rejected)
     assert guard["mode"] == "rejected"
     assert guard["passed"] is False
@@ -102,7 +104,7 @@ def test_threshold_capital_preservation_guard_modes() -> None:
         accepted=True,
         best_score=0.10,
         baseline_score=-0.90,
-        realized_pnl=-0.02,
+        realized_pnl=0.02,
         baseline_realized_pnl=-0.50,
         closed_trades=1,
         baseline_closed_trades=30,
@@ -124,6 +126,20 @@ def test_threshold_capital_preservation_guard_modes() -> None:
     rejected = cli._threshold_capital_preservation_guard(weak)
     assert rejected["passed"] is False
     assert rejected["mode"] == "rejected"
+
+    zero_hit = SimpleNamespace(
+        accepted=True,
+        best_score=0.20,
+        baseline_score=-0.90,
+        realized_pnl=0.20,
+        baseline_realized_pnl=-0.50,
+        closed_trades=1,
+        baseline_closed_trades=30,
+    )
+    candidate = SimpleNamespace(true_positive=0, false_negative=2)
+    zero_guard = cli._threshold_capital_preservation_guard(zero_hit, candidate)
+    assert zero_guard["passed"] is False
+    assert zero_guard["mode"] == "zero_true_positive"
 
 
 def test_parse_args_and_main_dispatch(monkeypatch) -> None:
@@ -1285,14 +1301,14 @@ def test_command_train_accepts_profit_threshold_candidate(tmp_path, monkeypatch,
         ),
         SimpleNamespace(
             accuracy=0.80,
-            precision=0.0,
+            precision=0.50,
             recall=0.20,
-            f1=0.0,
+            f1=0.29,
             threshold=0.7,
-            true_positive=0,
+            true_positive=3,
             false_positive=3,
             true_negative=15,
-            false_negative=10,
+            false_negative=12,
         ),
     ]
     monkeypatch.setattr(cli, "calibrate_threshold_for_backtest", lambda *_a, **_k: _ProfitCalibration())
@@ -2077,7 +2093,19 @@ def test_command_live_paper_path_runs_a_tick(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient())
     monkeypatch.setattr(cli.time, "sleep", lambda *_args: None)
-    assert cli.command_live(argparse.Namespace(steps=1, sleep=5, paper=False)) == 0
+    assert (
+        cli.command_live(
+            argparse.Namespace(
+                steps=1,
+                sleep=5,
+                paper=False,
+                retrain_interval=-1,
+                retrain_window=0,
+                retrain_min_rows=0,
+            )
+        )
+        == 0
+    )
 
 
 def test_command_live_artifact_is_emitted(tmp_path, monkeypatch) -> None:
@@ -4272,7 +4300,7 @@ def test_command_live_detailed_flow(tmp_path, monkeypatch) -> None:
 
     save_runtime(RuntimeConfig(testnet=True, dry_run=True, market_type="spot", max_rate_calls_per_minute=1))
     save_strategy(StrategyConfig(risk_per_trade=0.001, max_position_pct=0.2, max_trades_per_day=1, training_epochs=40, cooldown_minutes=1))
-    assert cli.command_live(argparse.Namespace(steps=3, sleep=5, paper=False)) == 0
+    assert cli.command_live(argparse.Namespace(steps=3, sleep=5, paper=False, model=str(tmp_path / "missing-model.json"))) == 0
 
     # futures path should attempt leverage and fail fast when API key missing, because live futures requires credentials
     save_runtime(RuntimeConfig(testnet=True, dry_run=False, market_type="futures", api_key="k", api_secret="s", max_rate_calls_per_minute=1))
@@ -4479,7 +4507,7 @@ def test_command_live_drawdown_limit_forces_emergency_close(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _DrawdownClient())
     monkeypatch.setattr(cli, "train", lambda *_a, **_k: _AlwaysLongModel())
 
-    assert cli.command_live(argparse.Namespace(steps=3, sleep=5, paper=False)) == 0
+    assert cli.command_live(argparse.Namespace(steps=3, sleep=5, paper=False, model=str(tmp_path / "missing-model.json"))) == 0
     output = capsys.readouterr().out
     assert "emergency close from drawdown" in output
     assert "drawdown limit reached" in output

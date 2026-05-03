@@ -32,7 +32,8 @@ from .features import (
 from .market_data import clean_candles
 from .model import TrainedModel, ensemble_member_from_model, train as train_logistic
 
-ADVANCED_FEATURE_VERSION = "v2-advanced"
+ADVANCED_FEATURE_VERSION = "v3-advanced"
+_EXTRA_FEATURES_PER_WINDOW = 7
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class AdvancedFeatureConfig:
     short_window: int = 10
     long_window: int = 40
     label_threshold: float = 0.001
+    label_lookahead: int = 4
 
 
 def _tanh(x: float) -> float:
@@ -121,22 +123,26 @@ class _AdvancedWindowCache:
     close_square_prefix: list[float]
     gain_prefix: list[float]
     loss_prefix: list[float]
+    abs_move_prefix: list[float]
 
 
 def _build_window_cache(closes: Sequence[float]) -> _AdvancedWindowCache:
     close_values = [float(value) for value in closes]
     gains = [0.0]
     losses = [0.0]
+    abs_moves = [0.0]
     for index in range(1, len(close_values)):
         delta = close_values[index] - close_values[index - 1]
         gains.append(max(0.0, delta))
         losses.append(max(0.0, -delta))
+        abs_moves.append(abs(delta))
     return _AdvancedWindowCache(
         closes=close_values,
         close_prefix=_prefix_sum(close_values),
         close_square_prefix=_prefix_sum([value * value for value in close_values]),
         gain_prefix=_prefix_sum(gains),
         loss_prefix=_prefix_sum(losses),
+        abs_move_prefix=_prefix_sum(abs_moves),
     )
 
 
@@ -171,20 +177,34 @@ def _extra_window_features_at(cache: _AdvancedWindowCache, end: int, windows: Se
     features: list[float] = []
     anchor = cache.closes[end] if cache.closes else 0.0
     for window in windows:
-        sma = _window_mean(cache.close_prefix, end + 1 - window, end) if end >= window - 1 else float("nan")
+        start = end + 1 - window
+        sma = _window_mean(cache.close_prefix, start, end) if end >= window - 1 else float("nan")
         rsi = _rsi_at(cache, end, window)
         vol = _volatility_at(cache, end, window)
+        if end >= window - 1 and start >= 0:
+            window_values = cache.closes[start:end + 1]
+            first = window_values[0]
+            high = max(window_values)
+            low = min(window_values)
+            path = _window_sum(cache.abs_move_prefix, start, end)
+            net_move = abs(anchor - first)
+        else:
+            first = high = low = path = net_move = float("nan")
         features.extend([
             _safe((anchor - sma) / sma) if math.isfinite(sma) and sma != 0 else 0.0,
             _safe((rsi / 100.0) if math.isfinite(rsi) else 0.0),
             _safe(vol / anchor) if anchor != 0 else 0.0,
+            _safe((anchor - first) / first) if math.isfinite(first) and first != 0 else 0.0,
+            _safe((anchor - high) / high) if math.isfinite(high) and high != 0 else 0.0,
+            _safe((anchor - low) / low) if math.isfinite(low) and low != 0 else 0.0,
+            _safe((net_move / path) if math.isfinite(path) and path > 0.0 else 0.0),
         ])
     return features
 
 
 def _extra_window_features(closes: Sequence[float], windows: Sequence[int]) -> list[float]:
     if not closes:
-        return [0.0 for _ in range(3 * len(windows))]
+        return [0.0 for _ in range(_EXTRA_FEATURES_PER_WINDOW * len(windows))]
     return _extra_window_features_at(_build_window_cache(closes), len(closes) - 1, windows)
 
 
@@ -224,8 +244,8 @@ def advanced_feature_dimension(cfg: AdvancedFeatureConfig) -> int:
     """Dimension of the expanded feature vector — used for model load checks."""
 
     base = len(cfg.base_features)
-    # each extra window contributes 3 derived features
-    extras = 3 * len(cfg.extra_lookback_windows)
+    # each extra window contributes trend, momentum, volatility, and regime shape features
+    extras = _EXTRA_FEATURES_PER_WINDOW * len(cfg.extra_lookback_windows)
     transforms = base * len(cfg.nonlinear_transforms)
     pairs = 0
     if cfg.polynomial_degree >= 2 and cfg.polynomial_top_features > 1:
@@ -262,16 +282,17 @@ def make_advanced_rows(
     candles: Sequence[Candle],
     cfg: AdvancedFeatureConfig,
     *,
-    lookahead: int = 1,
+    lookahead: int | None = None,
 ) -> list[ModelRow]:
     """Build expanded ``ModelRow`` objects for ``candles`` using ``cfg``."""
 
     enabled = normalize_enabled_features(cfg.base_features)
+    label_lookahead = max(1, int(cfg.label_lookahead if lookahead is None else lookahead))
     base_rows = make_base_rows(
         candles,
         cfg.short_window,
         cfg.long_window,
-        lookahead=lookahead,
+        lookahead=label_lookahead,
         label_threshold=cfg.label_threshold,
         enabled_features=enabled,
     )
@@ -321,6 +342,7 @@ def advanced_feature_signature(cfg: AdvancedFeatureConfig) -> str:
         f"polynomial_top_features={cfg.polynomial_top_features}",
         f"extra_lookback_windows={','.join(str(w) for w in cfg.extra_lookback_windows)}",
         f"nonlinear_transforms={','.join(cfg.nonlinear_transforms)}",
+        f"label_lookahead={int(cfg.label_lookahead)}",
         base,
     ])
 
@@ -351,7 +373,7 @@ def train_advanced(
     early_stopping_rounds: int | None = None,
     ensemble_seeds: Sequence[int] | None = None,
     compute_backend: str | None = None,
-    batch_size: int = 512,
+    batch_size: int = 8192,
 ) -> tuple[TrainedModel, AdvancedTrainingReport]:
     """Train a logistic regression on an expanded feature set.
 
@@ -412,6 +434,8 @@ def default_config_for(objective_name: str, strategy_feature_names: Sequence[str
             polynomial_degree=2,
             polynomial_top_features=5,
             extra_lookback_windows=(10, 30, 90),
+            label_threshold=0.0010,
+            label_lookahead=8,
         )
     if objective_name == "risky":
         return AdvancedFeatureConfig(
@@ -419,10 +443,14 @@ def default_config_for(objective_name: str, strategy_feature_names: Sequence[str
             polynomial_degree=3,
             polynomial_top_features=9,
             extra_lookback_windows=(3, 15, 45, 120),
+            label_threshold=0.0005,
+            label_lookahead=2,
         )
     return AdvancedFeatureConfig(
         base_features=names,
         polynomial_degree=2,
         polynomial_top_features=len(names),
         extra_lookback_windows=(5, 20, 60),
+        label_threshold=0.0010,
+        label_lookahead=4,
     )
