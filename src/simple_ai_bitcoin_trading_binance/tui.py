@@ -418,8 +418,7 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
         feature_list = self._feature_list()
         setattr(feature_list, "highlighted", self._highlighted if self.options else None)
         setattr(feature_list, "selected", self._selected_values())
-        for index in range(len(self.options)):
-            option = self.options[index]
+        for index, option in enumerate(self.options):
             row = self.query_one(f"#feature-row-{index}", Static)
             row.update(self._feature_row_text(index))
             row.set_class(index == self._highlighted, "feature-row-highlighted")
@@ -544,7 +543,8 @@ class TerminalUI:
     def append_log(self, text: str) -> None:
         self.app.append_log(text)
 
-    async def run_blocking(self, func, *args, **kwargs):
+    @staticmethod
+    async def run_blocking(func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
 
 
@@ -1051,7 +1051,8 @@ class OperatorApp(App[int]):
         index = _bounded_index(option_list.highlighted, len(self.actions_data))
         return self.actions_data[index]
 
-    def _action_option_label(self, action: TUIAction) -> str:
+    @staticmethod
+    def _action_option_label(action: TUIAction) -> str:
         return action.title if action.is_enabled() else f"{action.title}  (locked)"
 
     def _first_enabled_action_index(self) -> int:

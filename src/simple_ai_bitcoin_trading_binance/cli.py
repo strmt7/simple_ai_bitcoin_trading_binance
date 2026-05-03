@@ -1658,6 +1658,12 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
     def _signed_action_enabled() -> bool:
         return _credential_status() == "valid"
 
+    def _make_disabled_reason(action_title: str) -> Callable[[], str]:
+        def disabled_reason() -> str:
+            return _credential_lock_reason(action_title)
+
+        return disabled_reason
+
     def _make_action(
         key: str,
         title: str,
@@ -1676,7 +1682,7 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
             description,
             run,
             enabled=enabled,
-            disabled_reason=lambda action=title: _credential_lock_reason(action),
+            disabled_reason=_make_disabled_reason(title),
             aliases=aliases,
         )
 
@@ -2438,13 +2444,13 @@ def _filter_candles_for_time_window(  # skipcq: PY-R1000
 
     filtered = list(candles)
     if lookback_days is not None and filtered:
-        latest_close = max(int(getattr(candle, "close_time")) for candle in filtered)
+        latest_close = max(int(candle.close_time) for candle in filtered)
         start_ms = latest_close - (lookback_days * 24 * 60 * 60 * 1000)
 
     if start_ms is not None:
-        filtered = [candle for candle in filtered if int(getattr(candle, "open_time")) >= start_ms]
+        filtered = [candle for candle in filtered if int(candle.open_time) >= start_ms]
     if end_ms is not None:
-        filtered = [candle for candle in filtered if int(getattr(candle, "open_time")) <= end_ms]
+        filtered = [candle for candle in filtered if int(candle.open_time) <= end_ms]
     return filtered
 
 
@@ -2763,7 +2769,7 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
-def _detect_existing_position(runtime, client, *, leverage: float, reference_price: float | None = None) -> dict[str, float | int | str] | None:
+def _detect_existing_position(runtime, client, *, leverage: float, reference_price: float | None = None) -> dict[str, float | int | str] | None:  # skipcq: PY-R1000
     if not hasattr(client, "get_account"):
         return None
     account = client.get_account()
@@ -2897,7 +2903,7 @@ def _roundtrip_second_quantity(client, symbol: str, side: str, executed_qty: flo
     return quantity
 
 
-def command_spot_roundtrip(args: argparse.Namespace) -> int:
+def command_spot_roundtrip(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     runtime = load_runtime()
     if not getattr(args, "yes", False):
         print("Pass --yes to confirm signed spot testnet/demo order placement.", file=sys.stderr)
@@ -3102,7 +3108,7 @@ def command_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_prepare(args: argparse.Namespace) -> int:
+def command_prepare(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     try:
         runtime = load_runtime()
         max_batch_size = 1500 if runtime.market_type == "futures" else 1000
@@ -3255,7 +3261,7 @@ def command_compute(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_strategy(args: argparse.Namespace) -> int:
+def command_strategy(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     cfg = load_strategy()
     runtime = load_runtime()
     try:
@@ -3496,7 +3502,7 @@ def _threshold_classification_guard(baseline: object, candidate: object) -> dict
     accuracy_floor = max(0.0, baseline_accuracy - 0.03)
     f1_floor = max(0.0, baseline_f1 - 0.05)
     precision_floor = max(0.0, baseline_precision - 0.02)
-    detects_positive_cases = not (candidate_false_negative > 0 and candidate_true_positive <= 0)
+    detects_positive_cases = not (candidate_true_positive <= 0 < candidate_false_negative)
     stable_f1 = detects_positive_cases and candidate_accuracy >= accuracy_floor and candidate_f1 >= f1_floor
     conservative_precision = (
         detects_positive_cases
@@ -3530,7 +3536,7 @@ def _threshold_capital_preservation_guard(
     baseline_closed_trades = max(0, int(getattr(profit_calibration, "baseline_closed_trades", 0)))
     candidate_true_positive = int(getattr(candidate_report, "true_positive", 0)) if candidate_report else 1
     candidate_false_negative = int(getattr(candidate_report, "false_negative", 0)) if candidate_report else 0
-    detects_positive_cases = not (candidate_false_negative > 0 and candidate_true_positive <= 0)
+    detects_positive_cases = not (candidate_true_positive <= 0 < candidate_false_negative)
     score_delta = best_score - baseline_score
     pnl_delta = realized_pnl - baseline_pnl
     material_pnl_improvement = pnl_delta >= max(1e-9, abs(baseline_pnl) * 0.10)
@@ -3554,7 +3560,7 @@ def _threshold_capital_preservation_guard(
     }
 
 
-def command_train(args: argparse.Namespace) -> int:
+def command_train(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     from .compute import describe_backend, BackendInfo
 
     try:
@@ -3866,7 +3872,7 @@ def command_train(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_tune(args: argparse.Namespace) -> int:
+def command_tune(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     cfg = load_strategy()
     runtime = load_runtime()
     max_leverage = 125.0
@@ -4059,7 +4065,7 @@ def _tune_score(result: object, starting_cash: float = 1000.0) -> float:
     return risk_adjusted_backtest_score(result, starting_cash=starting_cash)
 
 
-def command_evaluate(args: argparse.Namespace) -> int:
+def command_evaluate(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     cfg = load_strategy()
     runtime = load_runtime()
     candles = _load_rows_for_command(args.input, label="Evaluation data load failed")
@@ -4267,7 +4273,7 @@ def _record_model_telemetry(
         return
 
 
-def command_signals(args: argparse.Namespace) -> int:
+def command_signals(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     runtime = load_runtime()
     cfg = load_strategy()
     model_path = Path(getattr(args, "model", "data/model.json"))
@@ -4309,7 +4315,7 @@ def command_signals(args: argparse.Namespace) -> int:
                     ),
                 ),
                 ollama_news_enabled=(
-                    bool(getattr(args, "ollama_news"))
+                    bool(getattr(args, "ollama_news", None))
                     if getattr(args, "ollama_news", None) is not None
                     else cfg.external_news_ai_enabled
                 ),
@@ -4325,7 +4331,7 @@ def command_signals(args: argparse.Namespace) -> int:
                     float(
                         cfg.source_grade_max_age_hours
                         if getattr(args, "source_grade_max_age_hours", None) is None
-                        else getattr(args, "source_grade_max_age_hours")
+                        else getattr(args, "source_grade_max_age_hours", None)
                     ),
                     0.0,
                     8760.0,
@@ -4373,7 +4379,7 @@ def command_source_grades(args: argparse.Namespace) -> int:
             window_hours=float(getattr(args, "window_hours", None) or cfg.source_grading_window_hours),
             model=str(getattr(args, "ollama_model", None) or cfg.external_news_ai_model),
             ollama_enabled=(
-                bool(getattr(args, "ollama"))
+                bool(getattr(args, "ollama", None))
                 if getattr(args, "ollama", None) is not None
                 else cfg.source_grading_enabled
             ),
@@ -4394,7 +4400,7 @@ def command_source_grades(args: argparse.Namespace) -> int:
     return 0 if run.status != "empty" else 2
 
 
-def command_signals_benchmark(args: argparse.Namespace) -> int:
+def command_signals_benchmark(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     runtime = load_runtime()
     cfg = load_strategy()
     provider_limits = [max(0, int(value)) for value in (getattr(args, "provider_limit", None) or [30, 60])]
@@ -4408,7 +4414,7 @@ def command_signals_benchmark(args: argparse.Namespace) -> int:
             fresh_counts: list[int] = []
             provider_counts: list[int] = []
             statuses: list[str] = []
-            for iteration in range(iterations):
+            for _iteration in range(iterations):
                 started = time.perf_counter()
                 try:
                     report = collect_external_signals(
@@ -4424,7 +4430,7 @@ def command_signals_benchmark(args: argparse.Namespace) -> int:
                         news_provider_parallelism=parallelism,
                         news_provider_jitter_seconds=max(0.0, float(getattr(args, "provider_jitter", 0.0) or 0.0)),
                         ollama_news_enabled=(
-                            bool(getattr(args, "ollama_news"))
+                            bool(getattr(args, "ollama_news", None))
                             if getattr(args, "ollama_news", None) is not None
                             else cfg.external_news_ai_enabled
                         ),
@@ -4477,7 +4483,7 @@ def command_signals_benchmark(args: argparse.Namespace) -> int:
     return worst_code
 
 
-def command_live(args: argparse.Namespace) -> int:
+def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     runtime = load_runtime()
     cfg = load_strategy()
     if getattr(args, "paper", False) and getattr(args, "live", False):
@@ -4575,8 +4581,7 @@ def command_live(args: argparse.Namespace) -> int:
     slippage = max(0.0, cfg.slippage_bps) / 10_000.0
     constraints = _resolve_symbol_constraints(runtime, client)
     max_daily_trades = int(cfg.max_trades_per_day)
-    if max_daily_trades <= 0:
-        max_daily_trades = 0
+    max_daily_trades = max(max_daily_trades, 0)
     daily_trade_count: dict[int, int] = {}
     max_open_positions = int(cfg.max_open_positions)
     live_run = build_live_run_payload(
@@ -4715,8 +4720,7 @@ def command_live(args: argparse.Namespace) -> int:
             retrain_min_rows = max(1, 240)
         if retrain_window <= 0:
             retrain_window = max(1, 300)
-        if retrain_interval < 0:
-            retrain_interval = 0
+        retrain_interval = max(retrain_interval, 0)
 
         previous_model = model
         model = _build_live_model(
@@ -5021,7 +5025,7 @@ def command_live(args: argparse.Namespace) -> int:
             pnl = position_side * (price - entry_price) * qty
             pnl_pct = ((price - entry_price) / entry_price) if position_side > 0 else ((entry_price - price) / entry_price)
 
-            opposite_signal = direction != 0 and direction != position_side if runtime.market_type == "futures" else direction == 0
+            opposite_signal = direction not in (0, position_side) if runtime.market_type == "futures" else direction == 0
             should_close = opposite_signal or pnl_pct >= cfg.take_profit_pct or pnl_pct <= -cfg.stop_loss_pct
 
             if should_close:
@@ -5187,7 +5191,7 @@ def command_objectives(_: argparse.Namespace) -> int:
     return 0
 
 
-def command_train_suite(args: argparse.Namespace) -> int:
+def command_train_suite(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     from .objective import get_objective
     from .training_suite import describe_candidate_grid, run_training_suite
 
