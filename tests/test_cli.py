@@ -566,6 +566,132 @@ def test_tui_settings_submenus_are_keyboard_navigable_in_textual_runtime(monkeyp
     assert saved_strategy
 
 
+def test_tui_settings_menu_accepts_fallback_shortcuts_in_textual_runtime(monkeypatch) -> None:
+    runtime = _runtime_config()
+    strategy = StrategyConfig()
+    captured_strategy = {}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: runtime)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_runtime", lambda cfg: cfg)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", lambda: strategy)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_strategy", lambda cfg: cfg)
+
+    def fake_strategy(args):
+        captured_strategy["args"] = args
+        return 0
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", fake_strategy)
+
+    async def runner() -> None:
+        app = OperatorApp(
+            title_text="console",
+            actions=[_action("Settings")],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            task = asyncio.create_task(app.action_run_selected())
+            for _ in range(5):
+                await pilot.pause()
+                if len(app.screen_stack) > 1 and app.focused is not None:
+                    break
+            assert type(app.screen_stack[-1]).__name__ == "MenuScreen"
+            menu = app.screen.query_one("#menu-list")
+            await pilot.press("j")
+            await pilot.pause()
+            assert menu.highlighted == 1
+            await pilot.press("k")
+            await pilot.pause()
+            assert menu.highlighted == 0
+            await pilot.press("2")
+            await pilot.pause()
+            assert type(app.screen_stack[-1]).__name__ == "MultiSelectScreen"
+            await pilot.press("2")
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert type(app.screen_stack[-1]).__name__ == "FormScreen"
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert type(app.screen_stack[-1]).__name__ == "MenuScreen"
+            await pilot.press("5")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(runner())
+    assert captured_strategy["args"].set_features
+
+
+def test_tui_all_numbered_menu_choices_are_reachable_in_textual_runtime(monkeypatch) -> None:
+    runtime = _runtime_config(managed_usdc=1000.0, managed_btc=0.0)
+    strategy = StrategyConfig()
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: runtime)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_runtime", lambda cfg: cfg)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", lambda: strategy)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.save_strategy", lambda cfg: cfg)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.command_strategy", lambda _args: 0)
+
+    async def wait_for_modal(app: OperatorApp, expected: str) -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if type(app.screen_stack[-1]).__name__ == expected:
+                return
+        raise AssertionError(f"expected {expected}, got {type(app.screen_stack[-1]).__name__}")
+
+    async def drive_menu(action_title: str, key: str, expected_screen: str, close_key: str) -> None:
+        app = OperatorApp(
+            title_text="console",
+            actions=[_action(action_title)],
+            snapshot_provider=lambda _width=70: "snapshot",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            task = asyncio.create_task(app.action_run_selected())
+            await wait_for_modal(app, "MenuScreen")
+            await pilot.press(key)
+            await pilot.pause()
+            if expected_screen == "Root":
+                assert len(app.screen_stack) == 1
+                await asyncio.wait_for(task, timeout=5)
+                return
+            await wait_for_modal(app, expected_screen)
+            if expected_screen == "MenuScreen":
+                await pilot.press(close_key)
+            elif expected_screen == "ConfirmScreen":
+                assert app.focused.id == "cancel"
+                await pilot.press("enter")
+                await wait_for_modal(app, "MenuScreen")
+                await pilot.press(close_key)
+            else:
+                await pilot.press("escape")
+                await wait_for_modal(app, "MenuScreen")
+                await pilot.press(close_key)
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            await asyncio.wait_for(task, timeout=5)
+
+    for key, expected in (
+        ("1", "FormScreen"),
+        ("2", "MultiSelectScreen"),
+        ("3", "FormScreen"),
+        ("4", "FormScreen"),
+        ("5", "Root"),
+    ):
+        asyncio.run(drive_menu("Settings", key, expected, "5"))
+
+    for key, expected in (
+        ("1", "FormScreen"),
+        ("2", "FormScreen"),
+        ("3", "FormScreen"),
+        ("4", "FormScreen"),
+        ("5", "ConfirmScreen"),
+        ("6", "MenuScreen"),
+        ("7", "Root"),
+    ):
+        asyncio.run(drive_menu("Funds", key, expected, "7"))
+
+
 def test_tui_funds_menu_is_keyboard_navigable_in_textual_runtime(monkeypatch) -> None:
     runtime = _runtime_config(managed_usdc=1000.0, managed_btc=0.0)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: runtime)

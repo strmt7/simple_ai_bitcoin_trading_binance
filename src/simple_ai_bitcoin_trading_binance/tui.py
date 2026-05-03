@@ -33,6 +33,12 @@ class FormField:
     password: bool = False
 
 
+def _bounded_index(highlighted: int | None, count: int) -> int:
+    if count <= 0 or highlighted is None:
+        return 0
+    return max(0, min(int(highlighted), count - 1))
+
+
 class ConfirmScreen(ModalScreen[bool]):
     BINDINGS = [
         Binding("escape", "dismiss_false", "Cancel", show=False, priority=True),
@@ -141,12 +147,20 @@ class MenuScreen(ModalScreen[str | None]):
         Binding("escape", "dismiss_none", "Cancel", show=False, priority=True),
         Binding("up", "cursor_up", "Up", show=False, priority=True),
         Binding("down", "cursor_down", "Down", show=False, priority=True),
+        Binding("k", "cursor_up", "Up", show=False, priority=True),
+        Binding("j", "cursor_down", "Down", show=False, priority=True),
+        Binding("ctrl+p", "cursor_up", "Up", show=False, priority=True),
+        Binding("ctrl+n", "cursor_down", "Down", show=False, priority=True),
         Binding("pageup", "page_up", "Page up", show=False, priority=True),
         Binding("pagedown", "page_down", "Page down", show=False, priority=True),
         Binding("home", "first", "First", show=False, priority=True),
         Binding("end", "last", "Last", show=False, priority=True),
         Binding("enter", "select_highlighted", "Open", show=False, priority=True),
         Binding("space", "select_highlighted", "Open", show=False, priority=True),
+        *[
+            Binding(str(index), f"select_index({index - 1})", f"Select {index}", show=False, priority=True)
+            for index in range(1, 10)
+        ],
     ]
 
     def __init__(
@@ -162,10 +176,12 @@ class MenuScreen(ModalScreen[str | None]):
         self.help_text = help_text
 
     def compose(self) -> ComposeResult:
+        help_text = self.help_text or "Select an item with Up/Down and press Enter."
+        help_text = f"{help_text}\nKeys: Up/Down or j/k move, 1-9 select, Enter open, Escape close."
         yield Vertical(
             Label(self.title_text, id="menu-title", markup=False),
             Static(
-                self.help_text or "Select an item with Up/Down and press Enter.",
+                help_text,
                 id="menu-help",
                 markup=False,
             ),
@@ -194,23 +210,39 @@ class MenuScreen(ModalScreen[str | None]):
     def _menu_list(self) -> OptionList:
         return self.query_one("#menu-list", OptionList)
 
+    def _highlighted_index(self) -> int:
+        return _bounded_index(self._menu_list().highlighted, len(self.options))
+
+    def _set_highlighted_index(self, index: int) -> None:
+        if not self.options:
+            return
+        option_list = self._menu_list()
+        option_list.highlighted = max(0, min(index, len(self.options) - 1))
+        option_list.focus()
+
     def action_cursor_down(self) -> None:
-        self._menu_list().action_cursor_down()
+        self._set_highlighted_index(self._highlighted_index() + 1)
 
     def action_cursor_up(self) -> None:
-        self._menu_list().action_cursor_up()
+        self._set_highlighted_index(self._highlighted_index() - 1)
 
     def action_page_down(self) -> None:
-        self._menu_list().action_page_down()
+        self._set_highlighted_index(self._highlighted_index() + 5)
 
     def action_page_up(self) -> None:
-        self._menu_list().action_page_up()
+        self._set_highlighted_index(self._highlighted_index() - 5)
 
     def action_first(self) -> None:
-        self._menu_list().action_first()
+        self._set_highlighted_index(0)
 
     def action_last(self) -> None:
-        self._menu_list().action_last()
+        self._set_highlighted_index(len(self.options) - 1)
+
+    def action_select_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.options):
+            return
+        key, _label = self.options[index]
+        self.dismiss(key)
 
     def action_select_highlighted(self) -> None:
         if getattr(self.focused, "id", "") == "close":
@@ -219,10 +251,7 @@ class MenuScreen(ModalScreen[str | None]):
         if not self.options:
             self.dismiss(None)
             return
-        highlighted = self._menu_list().highlighted
-        index = 0 if highlighted is None else max(0, min(int(highlighted), len(self.options) - 1))
-        key, _label = self.options[index]
-        self.dismiss(key)
+        self.action_select_index(self._highlighted_index())
 
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
@@ -233,6 +262,10 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
         Binding("escape", "dismiss_none", "Cancel", show=False, priority=True),
         Binding("up", "cursor_up", "Up", show=False, priority=True),
         Binding("down", "cursor_down", "Down", show=False, priority=True),
+        Binding("k", "cursor_up", "Up", show=False, priority=True),
+        Binding("j", "cursor_down", "Down", show=False, priority=True),
+        Binding("ctrl+p", "cursor_up", "Up", show=False, priority=True),
+        Binding("ctrl+n", "cursor_down", "Down", show=False, priority=True),
         Binding("pageup", "page_up", "Page up", show=False, priority=True),
         Binding("pagedown", "page_down", "Page down", show=False, priority=True),
         Binding("home", "first", "First", show=False, priority=True),
@@ -240,6 +273,10 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
         Binding("space", "toggle_highlighted", "Toggle", show=False, priority=True),
         Binding("enter", "activate_focused", "Toggle", show=False, priority=True),
         Binding("ctrl+s", "save", "Save", show=False, priority=True),
+        *[
+            Binding(str(index), f"toggle_index({index - 1})", f"Toggle {index}", show=False, priority=True)
+            for index in range(1, 10)
+        ],
     ]
 
     def __init__(
@@ -257,10 +294,12 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
         self.help_text = help_text
 
     def compose(self) -> ComposeResult:
+        help_text = self.help_text or "Use space to toggle an item. Save applies the current selection."
+        help_text = f"{help_text}\nKeys: Up/Down or j/k move, 1-9 toggle, Ctrl-S save, Escape cancel."
         yield Vertical(
             Label(self.title_text, id="feature-title", markup=False),
             Static(
-                self.help_text or "Use space to toggle an item. Save applies the current selection.",
+                help_text,
                 id="feature-help",
                 markup=False,
             ),
@@ -297,26 +336,46 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
     def _selection_list(self) -> SelectionList:
         return self.query_one("#feature-list", SelectionList)
 
+    def _highlighted_index(self) -> int:
+        return _bounded_index(self._selection_list().highlighted, len(self.options))
+
+    def _set_highlighted_index(self, index: int) -> None:
+        if not self.options:
+            return
+        selection_list = self._selection_list()
+        selection_list.highlighted = max(0, min(index, len(self.options) - 1))
+        selection_list.focus()
+
     def action_cursor_down(self) -> None:
-        self._selection_list().action_cursor_down()
+        self._set_highlighted_index(self._highlighted_index() + 1)
 
     def action_cursor_up(self) -> None:
-        self._selection_list().action_cursor_up()
+        self._set_highlighted_index(self._highlighted_index() - 1)
 
     def action_page_down(self) -> None:
-        self._selection_list().action_page_down()
+        self._set_highlighted_index(self._highlighted_index() + 5)
 
     def action_page_up(self) -> None:
-        self._selection_list().action_page_up()
+        self._set_highlighted_index(self._highlighted_index() - 5)
 
     def action_first(self) -> None:
-        self._selection_list().action_first()
+        self._set_highlighted_index(0)
 
     def action_last(self) -> None:
-        self._selection_list().action_last()
+        self._set_highlighted_index(len(self.options) - 1)
 
     def action_toggle_highlighted(self) -> None:
+        if not self.options:
+            return
         self._selection_list().action_select()
+
+    def action_toggle_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.options):
+            return
+        selection_list = self._selection_list()
+        selection_list.highlighted = index
+        selection_list.focus()
+        selection_list.action_select()
 
     def action_activate_focused(self) -> None:
         focused_id = getattr(self.focused, "id", "")
@@ -690,6 +749,16 @@ class OperatorApp(App[int]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh_preview", "Refresh"),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("ctrl+p", "cursor_up", "Up", show=False),
+        Binding("ctrl+n", "cursor_down", "Down", show=False),
+        Binding("pageup", "page_up", "Page up", show=False),
+        Binding("pagedown", "page_down", "Page down", show=False),
+        Binding("home", "first_action", "First", show=False),
+        Binding("end", "last_action", "Last", show=False),
         Binding("enter", "run_selected", "Run"),
         Binding("greater_than_sign", "grow_nav", "Wider nav", show=False),
         Binding("less_than_sign", "shrink_nav", "Narrower nav", show=False),
@@ -751,7 +820,7 @@ class OperatorApp(App[int]):
         with Horizontal(id="bottombar"):
             yield Static("Connection: not checked", id="connectionbar", markup=False)
             yield Static(
-                "Tab cycle panels  ↑/↓ move  Enter run  r refresh  < > resize nav  - + resize log  Ctrl-L clear  q quit",
+                "Tab panels  Up/Down or j/k move  Enter run  r refresh  < > nav  - + log  Ctrl-L clear  q quit",
                 id="keybar",
                 markup=False,
             )
@@ -830,7 +899,7 @@ class OperatorApp(App[int]):
 
     def _current_action(self) -> TUIAction:
         option_list = self.query_one("#actions", OptionList)
-        index = option_list.highlighted or 0
+        index = _bounded_index(option_list.highlighted, len(self.actions_data))
         return self.actions_data[index]
 
     def _select_action(self, index: int) -> TUIAction:
@@ -873,21 +942,44 @@ class OperatorApp(App[int]):
         self.set_status("Snapshot refreshed")
         self.set_timer(0.1, self.refresh_connection_status, name="connection-status-manual")
 
+    def _set_current_action_index(self, index: int) -> None:
+        action = self._select_action(index)
+        self._update_action_details()
+        self.set_status(action.title)
+
     def action_cursor_down(self) -> None:
         if self._modal_open():
             return
-        option_list = self.query_one("#actions", OptionList)
-        option_list.action_cursor_down()
-        self._update_action_details()
-        self.set_status(self._current_action().title)
+        current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
+        self._set_current_action_index(current + 1)
 
     def action_cursor_up(self) -> None:
         if self._modal_open():
             return
-        option_list = self.query_one("#actions", OptionList)
-        option_list.action_cursor_up()
-        self._update_action_details()
-        self.set_status(self._current_action().title)
+        current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
+        self._set_current_action_index(current - 1)
+
+    def action_page_down(self) -> None:
+        if self._modal_open():
+            return
+        current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
+        self._set_current_action_index(current + 5)
+
+    def action_page_up(self) -> None:
+        if self._modal_open():
+            return
+        current = _bounded_index(self.query_one("#actions", OptionList).highlighted, len(self.actions_data))
+        self._set_current_action_index(current - 5)
+
+    def action_first_action(self) -> None:
+        if self._modal_open():
+            return
+        self._set_current_action_index(0)
+
+    def action_last_action(self) -> None:
+        if self._modal_open():
+            return
+        self._set_current_action_index(len(self.actions_data) - 1)
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id != "actions" or self._modal_open():

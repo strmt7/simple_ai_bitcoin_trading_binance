@@ -244,6 +244,8 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
     screen.action_first()
     screen.action_last()
     screen.action_toggle_highlighted()
+    screen.action_toggle_index(0)
+    screen.action_toggle_index(99)
     screen.focused = type("Focused", (), {"id": "all"})()
     screen.action_activate_focused()
     screen.focused = type("Focused", (), {"id": "none"})()
@@ -258,8 +260,16 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
 
     assert selection_list.selected_all is True
     assert selection_list.cleared is True
-    assert selection_list.selected_calls == 2
+    assert selection_list.selected_calls == 3
     assert dismissed == [[], None, None, ["rsi"], None, ["rsi"]]
+
+    empty_screen = MultiSelectScreen("Empty", [], [])
+    empty_list = _FakeSelectionList()
+    monkeypatch.setattr(empty_screen, "query_one", lambda _selector, _cls=None: empty_list)
+    empty_screen.action_cursor_down()
+    empty_screen.action_toggle_highlighted()
+    empty_screen.action_toggle_index(0)
+    assert empty_list.selected_calls == 0
 
 
 def test_terminal_ui_methods() -> None:
@@ -347,6 +357,14 @@ def test_operator_app_methods(monkeypatch) -> None:
     assert widgets["#status"].value == "Async"
     app.action_cursor_up()
     assert widgets["#status"].value == "Sync"
+    app.action_page_down()
+    assert widgets["#status"].value == "Async"
+    app.action_page_up()
+    assert widgets["#status"].value == "Sync"
+    app.action_last_action()
+    assert widgets["#status"].value == "Async"
+    app.action_first_action()
+    assert widgets["#status"].value == "Sync"
 
     app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 0))
     assert widgets["#status"].value == "Sync"
@@ -384,6 +402,10 @@ def test_operator_app_global_actions_are_blocked_while_modal_is_open(monkeypatch
     app.action_refresh_preview()
     app.action_cursor_down()
     app.action_cursor_up()
+    app.action_page_down()
+    app.action_page_up()
+    app.action_first_action()
+    app.action_last_action()
     app.on_option_list_option_highlighted(_FakeOptionEvent(widgets["#actions"], 0))
     asyncio.run(app.on_option_list_option_selected(_FakeOptionEvent(widgets["#actions"], 0)))
 
@@ -603,10 +625,13 @@ def test_modal_keyboard_fallbacks_in_textual_runtime() -> None:
             await pilot.pause()
             menu = menu_app.screen.query_one("#menu-list")
             assert menu_app.focused.id == "menu-list"
-            await pilot.press("down")
+            await pilot.press("j")
             await pilot.pause()
             assert menu.highlighted == 1
-            await pilot.press("enter")
+            await pilot.press("k")
+            await pilot.pause()
+            assert menu.highlighted == 0
+            await pilot.press("2")
             await pilot.pause()
             assert len(menu_app.screen_stack) == 1
             assert menu_app.focused.id == "actions"
@@ -625,10 +650,10 @@ def test_modal_keyboard_fallbacks_in_textual_runtime() -> None:
             await pilot.pause()
             features = multi_app.screen.query_one("#feature-list")
             assert multi_app.focused.id == "feature-list"
-            await pilot.press("down")
+            await pilot.press("j")
             await pilot.pause()
             assert features.highlighted == 1
-            await pilot.press("space")
+            await pilot.press("2")
             await pilot.pause()
             assert "rsi" in features.selected
             await pilot.press("ctrl+s")
@@ -775,7 +800,7 @@ def test_operator_app_live_keyboard_navigation_keeps_context_visible() -> None:
             assert str(app.query_one("#preview").content) == "snapshot"
             assert app.query_one("#log") is not None
 
-            await pilot.press("down")
+            await pilot.press("j")
             await pilot.pause()
             assert app.query_one("#actions").highlighted == 1
             assert "Two" in str(app.query_one("#details").content)
@@ -785,7 +810,15 @@ def test_operator_app_live_keyboard_navigation_keeps_context_visible() -> None:
             assert str(app.query_one("#status").content) == "Two complete (1)"
             assert calls[-1:] == ["two"]
 
-            await pilot.press("up")
+            await pilot.press("k")
+            await pilot.pause()
+            assert app.query_one("#actions").highlighted == 0
+            assert "One" in str(app.query_one("#details").content)
+            await pilot.press("end")
+            await pilot.pause()
+            assert app.query_one("#actions").highlighted == 2
+            assert "Three" in str(app.query_one("#details").content)
+            await pilot.press("home")
             await pilot.pause()
             assert app.query_one("#actions").highlighted == 0
             assert "One" in str(app.query_one("#details").content)
@@ -929,6 +962,9 @@ def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
     screen.action_page_up()
     screen.action_first()
     screen.action_last()
+    assert fake_list.highlighted == 2
+    screen.action_select_index(1)
+    screen.action_select_index(99)
     fake_list.highlighted = None
     screen.action_select_highlighted()
     fake_list.highlighted = 100
@@ -938,11 +974,14 @@ def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
     screen.on_button_pressed(type("Evt", (), {"button": type("Btn", (), {"id": "close"})()})())
     screen.action_dismiss_none()
 
-    assert dismissed == ["k2", "k1", "k3", None, None, None]
+    assert dismissed == ["k2", "k2", "k1", "k3", None, None, None]
 
     empty_screen = MenuScreen("Empty", [])
     empty_dismissed: list[object] = []
+    empty_list = _FakeMenuList()
+    monkeypatch.setattr(empty_screen, "query_one", lambda _selector, _cls=None: empty_list)
     monkeypatch.setattr(empty_screen, "dismiss", lambda value: empty_dismissed.append(value))
+    empty_screen.action_cursor_down()
     empty_screen.action_select_highlighted()
     assert empty_dismissed == [None]
 
