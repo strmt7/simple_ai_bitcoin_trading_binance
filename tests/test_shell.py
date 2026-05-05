@@ -380,12 +380,41 @@ def test_split_command_line_platform_branches(monkeypatch):
     import ctypes
 
     monkeypatch.setattr(shell_mod.os, "name", "nt", raising=False)
+    with pytest.raises(ValueError, match="No closing quotation"):
+        shell_mod._split_command_line(r'backtest --input "C:\data\history.json')
+
     monkeypatch.delattr(ctypes, "windll", raising=False)
     assert shell_mod._split_command_line(r"backtest --input C:\data\history.json") == [
         "backtest",
         "--input",
         r"C:\data\history.json",
     ]
+
+    freed: list[object] = []
+
+    def command_line_to_argv_success(_line, argc_ref):
+        argc_ref._obj.value = 3
+        return ["backtest", "--input", r"C:\quoted path\history.json"]
+
+    def local_free_success(argv):
+        freed.append(argv)
+        return None
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(
+            shell32=SimpleNamespace(CommandLineToArgvW=command_line_to_argv_success),
+            kernel32=SimpleNamespace(LocalFree=local_free_success),
+        ),
+        raising=False,
+    )
+    assert shell_mod._split_command_line(r'backtest --input "C:\quoted path\history.json"') == [
+        "backtest",
+        "--input",
+        r"C:\quoted path\history.json",
+    ]
+    assert freed == [["backtest", "--input", r"C:\quoted path\history.json"]]
 
     def command_line_to_argv(_line, _argc):
         return None
