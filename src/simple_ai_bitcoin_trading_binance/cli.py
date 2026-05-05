@@ -20,6 +20,7 @@ from .advanced_model import (
     AdvancedFeatureConfig,
     advanced_feature_signature,
     default_config_for,
+    make_advanced_inference_rows,
     make_advanced_rows,
 )
 from .backtest import calibrate_threshold_for_backtest, risk_adjusted_backtest_score, run_backtest
@@ -27,7 +28,7 @@ from .config import config_paths, load_runtime, load_strategy, prompt_runtime, s
 from .dashboard import DashboardSnapshot, load_artifact_preview, render_dashboard
 from . import data_workflows
 from .data_downloader import MarketDataSyncConfig, render_sync_result, sync_market_data
-from .features import FEATURE_NAMES, ModelRow, feature_signature, make_rows, normalize_enabled_features
+from .features import FEATURE_NAMES, ModelRow, feature_signature, make_inference_rows, make_rows, normalize_enabled_features
 from .api import SymbolConstraints
 from .external_signals import ExternalSignalReport, collect_external_signals, render_external_signal_report
 from .live_artifacts import build_live_run_payload
@@ -57,7 +58,7 @@ from . import risk_workflows
 from .strategy_overrides import apply_model_strategy_overrides
 from .storage import write_json_atomic
 from .source_grading import grade_sources, render_source_grade_run
-from .style import supports_color
+from .style import supports_ansi_terminal
 from .types import RuntimeConfig, StrategyConfig
 
 _JITTER_RANDOM = random.SystemRandom()
@@ -561,6 +562,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="autonomous action to perform",
     )
     parser_autonomous.add_argument("--objective", default="default")
+    parser_autonomous.add_argument("--model", default="data/model.json", help="model artifact used for autonomous decisions")
+    parser_autonomous.add_argument("--poll-seconds", type=float, default=30.0, help="seconds between autonomous iterations")
+    parser_autonomous.add_argument("--iterations", type=int, default=None, help="stop after N iterations; default runs until stopped")
+    parser_autonomous.add_argument("--heartbeat-every", type=int, default=1, help="write heartbeat every N iterations")
+    parser_autonomous.add_argument("--starting-cash", type=float, default=1000.0, help="reference cash for local autonomous risk stats")
+    parser_autonomous.add_argument("--paper", action="store_true", default=False, help="force autonomous paper mode")
+    parser_autonomous.add_argument("--live", action="store_true", default=False, help="force authenticated non-mainnet autonomous mode")
     parser_autonomous.set_defaults(func=command_autonomous)
 
     parser_positions = subparsers.add_parser(
@@ -1113,8 +1121,8 @@ def _render_operator_report(
 def _account_overview_lines(runtime) -> list[str]:  # skipcq: PY-R1000
     if not _has_api_credentials(runtime):
         return [_credential_required_message("Account balances")]
-    client = _build_client(runtime)
     try:
+        client = _build_client(runtime)
         account = client.get_account()
     except BinanceAPIError as exc:
         return [f"Account balances failed: {exc}"]
@@ -1198,8 +1206,8 @@ def _connection_status_line() -> str:
     market = f"{runtime.market_type}/{environment}"
     mode = "paper-default" if runtime.dry_run else f"{environment}-live-default"
     checked_at = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
-    client = _build_client(runtime)
     try:
+        client = _build_client(runtime)
         client.ping()
         server_time = client.get_exchange_time()
     except BinanceAPIError as exc:
@@ -1207,6 +1215,13 @@ def _connection_status_line() -> str:
     server_label = "server-time ok" if server_time is not None else "server-time response ok"
     if not _has_api_credentials(runtime):
         return f"Connection {checked_at}: public endpoint reachable {market} {mode}; credentials missing"
+    if not _allows_signed_execution(runtime):
+        return (
+            f"Connection {checked_at}: public endpoint reachable {market} {mode}; "
+            "credentials saved, signed validation locked until testnet or demo is enabled"
+        )
+    if not bool(getattr(runtime, "validate_account", True)):
+        return f"Connection {checked_at}: public endpoint reachable {market} {mode}; credentials saved, not validated"
     try:
         account = client.get_account()
     except BinanceAPIError as exc:
@@ -1312,12 +1327,8 @@ def _readiness_report(*, input_path: str, model_path: str, online: bool = False)
 
     if online:
         line = _connection_status_line()
-        reachable = (
-            "public endpoint reachable" in line
-            or "authenticated" in line
-            or "auth response ok" in line
-        )
-        add(reachable and "failed" not in line and "unreachable" not in line, "exchange connectivity", line)
+        authenticated = "authenticated" in line or "auth response ok" in line
+        add(authenticated and "failed" not in line and "unreachable" not in line, "exchange connectivity", line)
 
     lines = [f"[{'ok' if ok else 'fix'}] {label}: {detail}" for ok, label, detail in checks]
     return all(ok for ok, _label, _detail in checks), lines
@@ -1496,17 +1507,17 @@ async def _ui_edit_execution(ui) -> int:
         [
             FormField(
                 "order_type",
-                "Order type [MARKET / LIMIT / LIMIT_MAKER]",
+                "Order type [MARKET]",
                 str(getattr(cfg, "order_type", "MARKET")),
             ),
             FormField(
                 "time_in_force",
-                "Time in force [GTC / IOC / FOK]",
+                "Time in force [GTC; market orders ignore this]",
                 str(getattr(cfg, "time_in_force", "GTC")),
             ),
             FormField(
                 "post_only",
-                "Post-only (LIMIT_MAKER) [yes/no]",
+                "Post-only [no; unsupported for market orders]",
                 "yes" if getattr(cfg, "post_only", False) else "no",
             ),
             FormField(
@@ -1520,14 +1531,17 @@ async def _ui_edit_execution(ui) -> int:
         ui.append_log("Order settings cancelled.")
         return 0
     order_type = payload["order_type"].strip().upper() or "MARKET"
-    if order_type not in {"MARKET", "LIMIT", "LIMIT_MAKER"}:
-        ui.append_log(f"Unsupported order type {order_type!r}; keeping {cfg.order_type!r}.")
-        order_type = cfg.order_type
+    if order_type != "MARKET":
+        ui.append_log(f"Unsupported order type {order_type!r}; using MARKET.")
+        order_type = "MARKET"
     tif = payload["time_in_force"].strip().upper() or "GTC"
     if tif not in {"GTC", "IOC", "FOK"}:
         ui.append_log(f"Unsupported timeInForce {tif!r}; keeping {cfg.time_in_force!r}.")
         tif = cfg.time_in_force
     post_only = _parse_form_bool(payload["post_only"], getattr(cfg, "post_only", False))
+    if post_only:
+        ui.append_log("Post-only is not compatible with live market execution; using no.")
+        post_only = False
     reduce_only = _parse_form_bool(
         payload["reduce_only_on_close"],
         getattr(cfg, "reduce_only_on_close", True),
@@ -1576,7 +1590,7 @@ async def _ui_edit_compute(ui) -> int:
     return 0
 
 
-async def _ui_settings_menu(ui) -> int:
+async def _ui_settings_menu(ui, mark_credentials: Callable[[str], None] | None = None) -> int:
     while True:
         choice = await ui.menu(
             "All settings",
@@ -1598,8 +1612,25 @@ async def _ui_settings_menu(ui) -> int:
             except ValueError as exc:
                 ui.append_log(f"Connection settings invalid: {exc}")
                 continue
+            if next_runtime == current:
+                ui.append_log("Connection settings cancelled.")
+                continue
             save_runtime(next_runtime)
+            if mark_credentials is not None:
+                mark_credentials("unchecked" if _has_api_credentials(next_runtime) else "missing")
             ui.append_log("Connection settings saved.")
+            if next_runtime.validate_account and _has_api_credentials(next_runtime):
+                try:
+                    client = _build_client(next_runtime)
+                    await ui.run_blocking(_validate_runtime_connection, next_runtime, client)
+                except BinanceAPIError as exc:
+                    if mark_credentials is not None:
+                        mark_credentials("invalid")
+                    ui.append_log(f"Connection validation failed: {exc}")
+                    continue
+                if mark_credentials is not None:
+                    mark_credentials("valid")
+                ui.append_log("Connection credentials validated.")
             continue
         if choice == "strategy":
             try:
@@ -1642,6 +1673,9 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
         credential_state["status"] = "missing" if not _has_api_credentials(runtime) else status
 
     def _credential_lock_reason(action: str) -> str:
+        runtime = load_runtime()
+        if not _allows_signed_execution(runtime):
+            return f"{action} is locked. Signed actions require testnet=true or demo=true."
         status = _credential_status()
         if status == "missing":
             return f"{action} is locked. Add Binance API key and secret in Connection settings first."
@@ -1653,10 +1687,10 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
 
     def _connect_enabled() -> bool:
         status = _credential_status()
-        return status in {"unchecked", "valid", "unavailable"}
+        return status in {"unchecked", "valid", "invalid", "unavailable"}
 
     def _signed_action_enabled() -> bool:
-        return _credential_status() == "valid"
+        return _credential_status() == "valid" and _allows_signed_execution(load_runtime())
 
     def _make_disabled_reason(action_title: str) -> Callable[[], str]:
         def disabled_reason() -> str:
@@ -1690,13 +1724,17 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
         if not _has_api_credentials(load_runtime()):
             ui.append_log(_credential_required_message(action))
             return False
+        if action != "Connect" and not _allows_signed_execution(load_runtime()):
+            ui.append_log(_credential_lock_reason(action))
+            return False
         if credential_state is not None and action != "Connect" and _credential_status() != "valid":
             ui.append_log(_credential_lock_reason(action))
             return False
         return True
 
     async def _overview(ui):
-        ui.append_log(await ui.run_blocking(lambda: render_dashboard(_dashboard_snapshot(with_account=True))))
+        include_account = credential_state is None or _credential_status() == "valid"
+        ui.append_log(await ui.run_blocking(lambda: render_dashboard(_dashboard_snapshot(with_account=include_account))))
         return 0
 
     async def _help(ui):
@@ -1766,6 +1804,9 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
         except ValueError as exc:
             print(f"Connection settings invalid: {exc}", file=sys.stderr)
             return 2
+        if next_runtime == current:
+            print("Connection settings cancelled.")
+            return 0
         save_runtime(next_runtime)
         _mark_credentials("unchecked")
         if next_runtime.validate_account and _has_api_credentials(next_runtime):
@@ -2281,12 +2322,7 @@ def _tui_actions(credential_state: dict[str, str] | None = None):  # skipcq: PY-
         return await _ui_funds_menu(ui)
 
     async def _settings(ui):
-        result = await _ui_settings_menu(ui)
-        if _has_api_credentials(load_runtime()):
-            _mark_credentials("unchecked")
-        else:
-            _mark_credentials("missing")
-        return result
+        return await _ui_settings_menu(ui, mark_credentials=_mark_credentials)
 
     return [
         _make_action("1", "Connect", "Validate the saved Binance testnet credentials and unlock account-only actions.", _connect, credentials=True),
@@ -2317,7 +2353,7 @@ def command_menu(_: argparse.Namespace) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("Interactive console requires a real terminal (TTY).", file=sys.stderr)
         return 2
-    if not supports_color(sys.stdout):
+    if not supports_ansi_terminal(sys.stdout):
         print(
             "Interactive console needs ANSI/virtual-terminal support. "
             "Use Windows Terminal, or run `simple-ai-trading shell` for the plain fallback.",
@@ -2339,10 +2375,10 @@ def command_menu(_: argparse.Namespace) -> int:
         credential_state["fingerprint"] = _credential_fingerprint(runtime)
         if not _has_api_credentials(runtime):
             credential_state["status"] = "missing"
-        elif "authenticated" in line or "auth response ok" in line:
-            credential_state["status"] = "valid"
         elif "authentication failed" in line:
             credential_state["status"] = "invalid"
+        elif "authenticated" in line or "auth response ok" in line:
+            credential_state["status"] = "valid"
         else:
             credential_state["status"] = "unavailable"
         return line
@@ -2566,14 +2602,50 @@ def _readiness_model_rows(
     return _build_model_rows(candles, strategy)
 
 
+def _backtest_rows_for_model(
+    candles: Sequence[Candle],
+    strategy: StrategyConfig,
+    model: TrainedModel,
+) -> list[ModelRow]:
+    advanced = _advanced_objective_for_model(model, strategy)
+    if advanced is not None:
+        _objective_name, feature_cfg = advanced
+        rows = make_advanced_inference_rows(candles, feature_cfg)
+        return rows if rows else _readiness_model_rows(candles, strategy, model)
+    rows = make_inference_rows(
+        candles,
+        strategy.feature_windows[0],
+        strategy.feature_windows[1],
+        enabled_features=strategy.enabled_features,
+    )
+    return rows if rows else _readiness_model_rows(candles, strategy, model)
+
+
 def _live_rows_for_model(
     candles: Sequence[Candle],
     strategy: StrategyConfig,
     model: TrainedModel | None,
 ) -> list[ModelRow]:
     if model is None:
-        return _build_model_rows(candles, strategy)
-    return _readiness_model_rows(candles, strategy, model)
+        rows = make_inference_rows(
+            candles,
+            strategy.feature_windows[0],
+            strategy.feature_windows[1],
+            enabled_features=strategy.enabled_features,
+        )
+        return rows if rows else _build_model_rows(candles, strategy)
+    advanced = _advanced_objective_for_model(model, strategy)
+    if advanced is not None:
+        _objective_name, feature_cfg = advanced
+        rows = make_advanced_inference_rows(candles, feature_cfg)
+        return rows if rows else _readiness_model_rows(candles, strategy, model)
+    rows = make_inference_rows(
+        candles,
+        strategy.feature_windows[0],
+        strategy.feature_windows[1],
+        enabled_features=strategy.enabled_features,
+    )
+    return rows if rows else _readiness_model_rows(candles, strategy, model)
 
 
 def _live_model_feature_signature(model: TrainedModel | None, strategy: StrategyConfig) -> str:
@@ -2729,6 +2801,7 @@ def _build_live_model(
 def _score_to_direction(score: float, cfg: StrategyConfig, market_type: str, threshold: float | None = None) -> int:
     threshold = cfg.signal_threshold if threshold is None else _clamp(float(threshold), 0.0, 1.0)
     if market_type == "futures":
+        threshold = max(0.5, threshold)
         if score >= threshold:
             return 1
         if score <= (1.0 - threshold):
@@ -2769,10 +2842,18 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
-def _detect_existing_position(runtime, client, *, leverage: float, reference_price: float | None = None) -> dict[str, float | int | str] | None:  # skipcq: PY-R1000
-    if not hasattr(client, "get_account"):
-        return None
-    account = client.get_account()
+def _detect_existing_position(
+    runtime,
+    client,
+    *,
+    leverage: float,
+    reference_price: float | None = None,
+    account: object | None = None,
+) -> dict[str, float | int | str] | None:  # skipcq: PY-R1000
+    if account is None:
+        if not hasattr(client, "get_account"):
+            return None
+        account = client.get_account()
     if not isinstance(account, dict):
         return None
     if runtime.market_type == "futures":
@@ -2819,6 +2900,7 @@ def _detect_existing_position(runtime, client, *, leverage: float, reference_pri
             "side": 1,
             "qty": qty,
             "entry_price": float(price),
+            "entry_price_basis": "current_mark_price_not_cost_basis",
             "notional": qty * float(price),
             "margin": qty * float(price),
         }
@@ -2835,7 +2917,7 @@ def _paper_or_live_order(
     dry_run: bool,
     leverage: float | None = None,
     reduce_only: bool = False,
-) -> None:
+) -> dict[str, object]:
     if leverage is None:
         leverage = _effective_leverage(strategy, runtime.market_type)
     kwargs = {"dry_run": dry_run, "leverage": leverage}
@@ -2844,9 +2926,48 @@ def _paper_or_live_order(
     response = client.place_order(runtime.symbol, side, size, **kwargs)
     if dry_run:
         print("paper order:", json.dumps(response, indent=2))
-        return
+        return response
     print(f"live order: {side} {size:.8f} {runtime.symbol}")
     print(json.dumps(response, indent=2))
+    return response
+
+
+def _order_fill_details(
+    order: object,
+    *,
+    fallback_qty: float,
+    fallback_price: float,
+) -> tuple[float, float, float]:
+    qty = 0.0
+    quote = 0.0
+    average = 0.0
+    if isinstance(order, dict):
+        fills = order.get("fills")
+        if isinstance(fills, list):
+            for fill in fills:
+                if not isinstance(fill, dict):
+                    continue
+                fill_qty = _safe_float(fill.get("qty"))
+                fill_price = _safe_float(fill.get("price"))
+                if fill_qty <= 0.0 or fill_price <= 0.0:
+                    continue
+                qty += fill_qty
+                quote += fill_qty * fill_price
+        if qty <= 0.0:
+            qty = _safe_float(order.get("executedQty") or order.get("origQty"))
+        quote = quote or _safe_float(
+            order.get("cummulativeQuoteQty")
+            or order.get("cumQuote")
+            or order.get("cumBase")
+            or order.get("notional")
+        )
+        average = _safe_float(order.get("avgPrice") or order.get("price"))
+    if qty <= 0.0:
+        qty = max(0.0, float(fallback_qty))
+    if average <= 0.0:
+        average = quote / qty if qty > 0.0 and quote > 0.0 else max(0.0, float(fallback_price))
+    notional = quote if quote > 0.0 else qty * average
+    return float(qty), float(average), float(notional)
 
 
 def _asset_free_balance(account: object, asset: str) -> float:
@@ -2921,6 +3042,15 @@ def command_spot_roundtrip(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     mode = str(getattr(args, "mode", "auto"))
     quantity_requested = float(getattr(args, "quantity", 0.0))
     client = _build_client(runtime)
+    price = 0.0
+    quantity = 0.0
+    second_quantity = 0.0
+    notional = 0.0
+    before: object | None = None
+    mid: object | None = None
+    first: object | None = None
+    first_side = ""
+    second_side = ""
     try:
         client.ensure_btcusdc()
         price, _timestamp = client.get_symbol_price(runtime.symbol)
@@ -2955,6 +3085,49 @@ def command_spot_roundtrip(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
         second = client.place_order(runtime.symbol, second_side, second_quantity, dry_run=False)
         after = client.get_account()
     except (BinanceAPIError, ValueError) as exc:
+        if first is not None:
+            partial_payload = {
+                "command": "spot-roundtrip",
+                "status": "partial_failed",
+                "timestamp": int(time.time()),
+                "runtime": _public_runtime_payload(runtime),
+                "symbol": runtime.symbol,
+                "mode": mode,
+                "error": str(exc),
+                "price_reference": float(price),
+                "quantity_requested": float(quantity_requested),
+                "quantity_first": float(quantity),
+                "quantity_second_attempted": float(second_quantity),
+                "notional_reference": float(notional),
+                "balances_before": (
+                    {
+                        "BTC": _asset_free_balance(before, "BTC"),
+                        "USDC": _asset_free_balance(before, "USDC"),
+                    }
+                    if before is not None
+                    else None
+                ),
+                "balances_after_first": (
+                    {
+                        "BTC": _asset_free_balance(mid, "BTC"),
+                        "USDC": _asset_free_balance(mid, "USDC"),
+                    }
+                    if mid is not None
+                    else None
+                ),
+                "first_order": {
+                    "side": first_side,
+                    "status": first.get("status") if isinstance(first, dict) else None,
+                    "orderId": first.get("orderId") if isinstance(first, dict) else None,
+                    "executedQty": first.get("executedQty") if isinstance(first, dict) else None,
+                },
+                "second_order": {"side": second_side, "status": "not_completed"},
+            }
+            try:
+                artifact_path = _persist_run_artifact("spot_roundtrip_partial", Path("data"), partial_payload)
+                print(f"Partial spot roundtrip recorded at {artifact_path}", file=sys.stderr)
+            except (OSError, RuntimeError, TypeError, ValueError) as persist_exc:
+                print(f"Partial spot roundtrip could not be recorded: {persist_exc}", file=sys.stderr)
         print(_credential_failure_message("Test order", exc), file=sys.stderr)
         return 2
 
@@ -3024,8 +3197,15 @@ def command_connect(_: argparse.Namespace) -> int:
     if not _has_api_credentials(runtime):
         print(_credential_required_message("Connect"), file=sys.stderr)
         return 2
-    client = _build_client(runtime)
+    if not _allows_signed_execution(runtime):
+        print(
+            "Connect validates signed credentials only on Binance testnet or demo. "
+            "Enable testnet=true or demo=true before authenticating.",
+            file=sys.stderr,
+        )
+        return 2
     try:
+        client = _build_client(runtime)
         server_time = client.get_exchange_time()
         client.ensure_btcusdc()
     except BinanceAPIError as exc:
@@ -3096,15 +3276,16 @@ def command_report(args: argparse.Namespace) -> int:
     if bool(args.account) and not _has_api_credentials(load_runtime()):
         print(_credential_required_message("Full report account section"), file=sys.stderr)
         return 2
-    print(
-        _render_operator_report(
-            with_account=bool(args.account),
-            doctor=bool(args.doctor),
-            online=bool(args.online),
-            input_path=args.input,
-            model_path=args.model,
-        )
+    report = _render_operator_report(
+        with_account=bool(args.account),
+        doctor=bool(args.doctor),
+        online=bool(args.online),
+        input_path=args.input,
+        model_path=args.model,
     )
+    print(report)
+    if bool(args.account) and "Account balances failed:" in report:
+        return 2
     return 0
 
 
@@ -3664,9 +3845,8 @@ def command_train(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     threshold_source = "strategy"
     threshold_calibration: dict[str, object] | None = None
     if args.calibrate_threshold and calibration_rows:
+        strategy_report = evaluate_classification(calibration_rows, model, threshold=cfg.signal_threshold)
         classification_threshold = calibrate_threshold(calibration_rows, model, start=0.05, end=0.95, steps=31)
-        threshold = classification_threshold
-        threshold_source = "classification_f1"
         classification_report = evaluate_classification(calibration_rows, model, threshold=classification_threshold)
         profit_calibration = calibrate_threshold_for_backtest(
             calibration_rows,
@@ -3674,13 +3854,15 @@ def command_train(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             cfg,
             starting_cash=1000.0,
             market_type=runtime.market_type,
-            baseline_threshold=classification_threshold,
+            baseline_threshold=cfg.signal_threshold,
             start=0.05,
             end=0.95,
             steps=181,
+            compute_backend=compute_backend,
+            score_batch_size=batch_size,
         )
         profit_report = evaluate_classification(calibration_rows, model, threshold=profit_calibration.best_threshold)
-        classification_guard = _threshold_classification_guard(classification_report, profit_report)
+        classification_guard = _threshold_classification_guard(strategy_report, profit_report)
         classification_guard_passed = bool(classification_guard["passed"])
         capital_guard = _threshold_capital_preservation_guard(profit_calibration, profit_report)
         capital_guard_passed = bool(capital_guard["passed"])
@@ -3689,6 +3871,7 @@ def command_train(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             threshold_source = "profit_backtest"
         threshold_calibration = {
             "source": threshold_source,
+            "strategy_baseline": _classification_payload(strategy_report),
             "classification": _classification_payload(classification_report),
             "profit_candidate": _classification_payload(profit_report),
             "profit_backtest": profit_calibration.asdict(),
@@ -3992,7 +4175,7 @@ def command_backtest(args: argparse.Namespace) -> int:
         print(f"Model load failed: {exc}", file=sys.stderr)
         return 2
     cfg = apply_model_strategy_overrides(cfg, model)
-    rows = _readiness_model_rows(candles, cfg, model)
+    rows = _backtest_rows_for_model(candles, cfg, model)
     decision_threshold = model_decision_threshold(model, cfg.signal_threshold)
     compute_backend = str(getattr(args, "compute_backend", None) or runtime.compute_backend or "cpu")
     score_batch_size = max(1, int(getattr(args, "score_batch_size", 8192) or 8192))
@@ -4507,7 +4690,11 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     if not effective_dry_run and not _has_api_credentials(runtime):
         print(_credential_required_message("Authenticated live mode"), file=sys.stderr)
         return 2
-    client = _build_client(runtime)
+    try:
+        client = _build_client(runtime)
+    except BinanceAPIError as exc:
+        print(f"Live startup blocked: {exc}", file=sys.stderr)
+        return 2
     sleep_seconds = max(0, int(getattr(args, "sleep", 0)))
     if not effective_dry_run and sleep_seconds < 1:
         print("Authenticated live mode uses minimum sleep=1s.")
@@ -4532,17 +4719,25 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
         print(model_notice, file=sys.stderr)
 
     leverage = _resolve_futures_leverage(runtime, cfg)
-    if runtime.market_type == "futures" and not effective_dry_run:
-        try:
-            set_response = client.set_leverage(runtime.symbol, int(leverage))
-            leverage_value = set_response.get("leverage") if isinstance(set_response, dict) else None
-            if leverage_value is not None:
-                leverage = _safe_float(leverage_value) or leverage
-        except BinanceAPIError as exc:
-            print(f"Failed to set leverage: {exc}", file=sys.stderr)
-            return 2
-
     cash = max(0.0, _safe_float(getattr(runtime, "managed_usdc", 0.0)))
+    exchange_account_snapshot: object | None = None
+    if not effective_dry_run:
+        try:
+            exchange_account_snapshot = client.get_account()
+        except BinanceAPIError as exc:
+            print(f"Account balance check failed: {exc}", file=sys.stderr)
+            return 2
+        balances = _account_free_balances(exchange_account_snapshot)
+        available_usdc = max(0.0, _safe_float(balances.get("USDC", 0.0)))
+        if cash <= 0.0:
+            print("Authenticated live mode requires a positive USDC trading cap from Funds.", file=sys.stderr)
+            return 2
+        if available_usdc <= 0.0:
+            print("Authenticated live mode requires available USDC on the exchange account.", file=sys.stderr)
+            return 2
+        if cash > available_usdc:
+            cash = available_usdc
+            print(f"Authenticated live cash capped to exchange free USDC={cash:.2f}.")
     position_notional = 0.0
     position_side = 0
     entry_price = 0.0
@@ -4565,6 +4760,24 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     if not risk_policy.allowed:
         print(render_risk_policy_report(risk_policy), file=sys.stderr)
         return 2
+    if runtime.market_type == "futures" and not effective_dry_run:
+        try:
+            set_response = client.set_leverage(runtime.symbol, int(leverage))
+            leverage_value = set_response.get("leverage") if isinstance(set_response, dict) else None
+            if leverage_value is not None:
+                leverage = _safe_float(leverage_value) or leverage
+                post_set_risk_policy = build_risk_policy_report(
+                    runtime,
+                    cfg,
+                    effective_dry_run=effective_dry_run,
+                    leverage=leverage,
+                )
+                if not post_set_risk_policy.allowed:
+                    print(render_risk_policy_report(post_set_risk_policy), file=sys.stderr)
+                    return 2
+        except BinanceAPIError as exc:
+            print(f"Failed to set leverage: {exc}", file=sys.stderr)
+            return 2
 
     mode_label = "paper" if effective_dry_run else "live"
     print(f"Starting {mode_label} loop for {args.steps} steps on {runtime.symbol} {runtime.interval} [{runtime.market_type}]")
@@ -4580,6 +4793,9 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
     fee_rate = max(0.0, cfg.taker_fee_bps) / 10_000.0
     slippage = max(0.0, cfg.slippage_bps) / 10_000.0
     constraints = _resolve_symbol_constraints(runtime, client)
+    if constraints is None and not effective_dry_run:
+        print("Authenticated live mode requires BTCUSDC exchange filters before any order is allowed.", file=sys.stderr)
+        return 2
     max_daily_trades = int(cfg.max_trades_per_day)
     max_daily_trades = max(max_daily_trades, 0)
     daily_trade_count: dict[int, int] = {}
@@ -4601,7 +4817,12 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
         print(f"risk policy warnings: {risk_policy.warning_count}")
     if not effective_dry_run:
         try:
-            detected_position = _detect_existing_position(runtime, client, leverage=leverage)
+            detected_position = _detect_existing_position(
+                runtime,
+                client,
+                leverage=leverage,
+                account=exchange_account_snapshot,
+            )
         except BinanceAPIError as exc:
             print(f"Existing position check failed: {exc}", file=sys.stderr)
             return 2
@@ -4612,9 +4833,11 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             position_notional = position_side * float(detected_position["notional"])
             margin_used = max(0.0, float(detected_position["margin"]))
             cash = max(0.0, cash - margin_used)
+            entry_basis = str(detected_position.get("entry_price_basis") or "exchange_entry_price")
+            basis_note = " (mark-price basis; PnL estimate only)" if entry_basis != "exchange_entry_price" else ""
             print(
                 "Detected existing exchange position: "
-                f"{'long' if position_side > 0 else 'short'} qty={qty:.8f} entry={entry_price:.2f}"
+                f"{'long' if position_side > 0 else 'short'} qty={qty:.8f} entry={entry_price:.2f}{basis_note}"
             )
             live_events.append(
                 {
@@ -4624,6 +4847,7 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                     "direction": int(position_side),
                     "qty": float(qty),
                     "entry_price": float(entry_price),
+                    "entry_price_basis": entry_basis,
                     "notional": float(position_notional),
                     "margin": float(margin_used),
                     "cash_after_resume": float(cash),
@@ -4654,7 +4878,7 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                 db_path=cfg.telemetry_db_path,
                 window_hours=cfg.source_grading_window_hours,
                 model=cfg.external_news_ai_model,
-                ollama_enabled=True,
+                ollama_enabled=bool(cfg.source_grading_enabled),
                 ollama_url=cfg.external_news_ai_url,
                 ollama_timeout_seconds=cfg.external_news_ai_timeout_seconds,
             )
@@ -4705,6 +4929,7 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
         steps_executed += 1
 
         rows = _live_rows_for_model(candles, cfg, model)
+        training_rows = _readiness_model_rows(candles, cfg, model) if model is not None else _build_model_rows(candles, cfg)
         if not rows:
             print("not enough historical data for live signal")
             live_events.append({"step": i + 1, "status": "no_rows"})
@@ -4724,7 +4949,7 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
 
         previous_model = model
         model = _build_live_model(
-            rows,
+            training_rows,
             model=model,
             retrain_every=retrain_interval,
             step=i + 1,
@@ -4746,7 +4971,12 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             live_run["model_signature"] = str(model_signature) if model_signature else None
 
         if model is None:
-            model = train(rows, epochs=40, feature_signature=_live_model_feature_signature(model, cfg))
+            if not training_rows:
+                print("not enough labeled historical data to train a live model")
+                live_events.append({"step": i + 1, "status": "no_training_rows"})
+                live_sleep()
+                continue
+            model = train(training_rows, epochs=40, feature_signature=_live_model_feature_signature(model, cfg))
             model_loads += 1
         latest = rows[-1]
         if hasattr(model, "feature_means") and hasattr(model, "feature_stds"):
@@ -4795,7 +5025,13 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                 live_events.append({"step": i + 1, "status": "model_incompatible", "error": str(exc)})
                 break
             print(f"paper model incompatible; retraining: {exc}", file=sys.stderr)
-            model = train(rows, epochs=40, feature_signature=_live_model_feature_signature(model, cfg))
+            if not training_rows:
+                print("not enough labeled historical data to retrain a live model", file=sys.stderr)
+                halt_reason = "model_incompatible"
+                exit_code = 2
+                live_events.append({"step": i + 1, "status": "model_incompatible", "error": "no labeled training rows"})
+                break
+            model = train(training_rows, epochs=40, feature_signature=_live_model_feature_signature(model, cfg))
             model_loads += 1
             raw_score = model.predict_proba(latest.features)
             threshold = model_decision_threshold(model, cfg.signal_threshold)
@@ -4877,7 +5113,6 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             model=model,
             runtime=runtime,
         )
-        maybe_grade_sources(i + 1)
         direction = _score_to_direction(score, decision_cfg, runtime.market_type, threshold)
 
         # cooldown reduces immediate flip-flopping in choppy conditions
@@ -4984,7 +5219,7 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
 
             side = "BUY" if side_sign > 0 else "SELL"
             try:
-                _paper_or_live_order(
+                order_response = _paper_or_live_order(
                     client,
                     runtime,
                     decision_cfg,
@@ -4997,7 +5232,21 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                 record_order_error(i + 1, side, qty, exc)
                 break
 
-            cash -= total
+            filled_qty, fill, filled_notional = _order_fill_details(
+                order_response,
+                fallback_qty=qty,
+                fallback_price=fill,
+            )
+            if filled_qty <= 0.0 or fill <= 0.0:
+                record_order_error(i + 1, side, qty, BinanceAPIError("Order response did not include executed quantity"))
+                break
+            qty = abs(filled_qty)
+            notional = filled_notional if filled_notional > 0.0 else qty * fill
+            fee = abs(notional) * fee_rate
+            margin = min(cash, abs(notional)) if runtime.market_type == "spot" else min(cash, abs(notional) / leverage)
+            total = margin + fee
+
+            cash = max(0.0, cash - total)
             position_side = direction
             position_notional = direction * notional
             qty = abs(qty)
@@ -5030,12 +5279,10 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
 
             if should_close:
                 fill = price * (1.0 - position_side * slippage)
-                realized = position_side * (fill - entry_price) * qty
-                exit_fee = abs(fill * qty) * fee_rate
 
                 side_to_close = "SELL" if position_side > 0 else "BUY"
                 try:
-                    _paper_or_live_order(
+                    order_response = _paper_or_live_order(
                         client,
                         runtime,
                         cfg,
@@ -5048,10 +5295,22 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                 except BinanceAPIError as exc:
                     record_order_error(i + 1, side_to_close, abs(qty), exc)
                     break
-                cash += margin_used + realized - exit_fee
+                closed_qty, fill, closed_notional = _order_fill_details(
+                    order_response,
+                    fallback_qty=abs(qty),
+                    fallback_price=fill,
+                )
+                if closed_qty <= 0.0 or fill <= 0.0:
+                    record_order_error(i + 1, side_to_close, abs(qty), BinanceAPIError("Close order response did not include executed quantity"))
+                    break
+                closed_qty = min(abs(qty), abs(closed_qty))
+                realized = position_side * (fill - entry_price) * closed_qty
+                exit_fee = abs(closed_notional if closed_notional > 0.0 else fill * closed_qty) * fee_rate
+                close_ratio = min(1.0, closed_qty / abs(qty)) if qty else 1.0
+                cash += margin_used * close_ratio + realized - exit_fee
                 print(
                     f"step {i + 1:>2}: close {'long' if position_side > 0 else 'short'} "
-                    f"pnl={pnl:.2f} cash={cash:.2f}"
+                    f"pnl={realized:.2f} cash={cash:.2f}"
                 )
                 closes += 1
                 live_events.append(
@@ -5060,19 +5319,25 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                         "status": "close",
                         "direction": int(position_side),
                         "score": float(score),
-                        "price": float(price),
+                        "price": float(fill),
                         "pnl": float(realized),
+                        "qty_closed": float(closed_qty),
                         "cash_after": float(cash),
                     }
                 )
                 if realized > 0:
                     print("result: win")
-                position_notional = 0.0
-                position_side = 0
-                qty = 0.0
-                margin_used = 0.0
-                entry_price = 0.0
-                cooldown_left = max(0, wait_ticks)
+                if close_ratio >= 0.999:
+                    position_notional = 0.0
+                    position_side = 0
+                    qty = 0.0
+                    margin_used = 0.0
+                    entry_price = 0.0
+                    cooldown_left = max(0, wait_ticks)
+                else:
+                    qty = max(0.0, abs(qty) - closed_qty)
+                    margin_used = max(0.0, margin_used * (1.0 - close_ratio))
+                    position_notional = position_side * qty * entry_price
             else:
                 unrealized = margin_used + pnl
                 print(f"step {i + 1:>2}: hold {'long' if position_side > 0 else 'short'} pnl={pnl_pct:.2%} cash={cash:.2f}")
@@ -5104,12 +5369,10 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             if cfg.max_drawdown_limit > 0.0 and drawdown >= cfg.max_drawdown_limit:
                 if position_side != 0:
                     fill = price * (1.0 - position_side * slippage)
-                    realized = position_side * (fill - entry_price) * qty
-                    exit_fee = abs(fill * qty) * fee_rate
 
                     side_to_close = "SELL" if position_side > 0 else "BUY"
                     try:
-                        _paper_or_live_order(
+                        order_response = _paper_or_live_order(
                             client,
                             runtime,
                             cfg,
@@ -5122,16 +5385,33 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                     except BinanceAPIError as exc:
                         record_order_error(i + 1, side_to_close, abs(qty), exc)
                         break
-                    cash += margin_used + realized - exit_fee
+                    closed_qty, fill, closed_notional = _order_fill_details(
+                        order_response,
+                        fallback_qty=abs(qty),
+                        fallback_price=fill,
+                    )
+                    if closed_qty <= 0.0 or fill <= 0.0:
+                        record_order_error(i + 1, side_to_close, abs(qty), BinanceAPIError("Emergency close order response did not include executed quantity"))
+                        break
+                    closed_qty = min(abs(qty), abs(closed_qty))
+                    realized = position_side * (fill - entry_price) * closed_qty
+                    exit_fee = abs(closed_notional if closed_notional > 0.0 else fill * closed_qty) * fee_rate
+                    close_ratio = min(1.0, closed_qty / abs(qty)) if qty else 1.0
+                    cash += margin_used * close_ratio + realized - exit_fee
                     print(
                         f"step {i + 1:>2}: emergency close from drawdown "
                         f"{drawdown:.2%}; cash={cash:.2f}"
                     )
-                    position_notional = 0.0
-                    position_side = 0
-                    qty = 0.0
-                    margin_used = 0.0
-                    entry_price = 0.0
+                    if close_ratio >= 0.999:
+                        position_notional = 0.0
+                        position_side = 0
+                        qty = 0.0
+                        margin_used = 0.0
+                        entry_price = 0.0
+                    else:
+                        qty = max(0.0, abs(qty) - closed_qty)
+                        margin_used = max(0.0, margin_used * (1.0 - close_ratio))
+                        position_notional = position_side * qty * entry_price
                 live_events.append(
                     {
                         "step": i + 1,
@@ -5155,6 +5435,7 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
                 }
             )
 
+        maybe_grade_sources(i + 1)
         live_sleep()
     live_run["result"] = {
         "status": halt_reason,
@@ -5165,13 +5446,15 @@ def command_live(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
         "model_loads": model_loads,
         "drawdown_seen": float(max_drawdown_seen),
         "ending_cash": float(cash),
+        "ending_cash_is_estimate": bool(not effective_dry_run),
         "equity_peak": float(equity_peak),
         "drawdown_limit": drawdown_limit,
     }
     _persist_run_artifact("live", model_path.parent, live_run)
     if max_drawdown_seen > 0.0:
         print(f"max_drawdown observed: {max_drawdown_seen:.2%}")
-    print(f"finished loop market={runtime.market_type} cash={cash:.2f}")
+    cash_label = "cash_estimate" if not effective_dry_run else "cash"
+    print(f"finished loop market={runtime.market_type} {cash_label}={cash:.2f}")
     return exit_code
 
 
@@ -5237,9 +5520,8 @@ def command_train_suite(args: argparse.Namespace) -> int:  # skipcq: PY-R1000
             "starting_cash": args.starting_cash,
             "output_dir": Path(args.output_dir),
             "max_workers": args.max_workers,
+            "compute_backend": backend_label,
         }
-        if getattr(args, "compute_backend", None) is not None:
-            suite_kwargs["compute_backend"] = str(args.compute_backend)
         if getattr(args, "batch_size", 8192) != 8192:
             suite_kwargs["batch_size"] = max(1, int(args.batch_size))
         report = run_training_suite(candles, strategy, **suite_kwargs)
@@ -5298,12 +5580,103 @@ def command_backtest_panel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_autonomous_decision_fn(
+    *,
+    model_path: Path,
+    strategy: StrategyConfig,
+    effective_dry_run: bool,
+):
+    from .autonomous import Decision
+
+    model, model_error, model_notice = _load_live_start_model(model_path, strategy, effective_dry_run=effective_dry_run)
+    if model_error is not None:
+        return None, model_error, model_notice
+    if model is None and not effective_dry_run:
+        return None, f"Autonomous live mode requires a compatible model: {model_path}", model_notice
+    state: dict[str, object] = {"model": model, "step": 0}
+
+    def decide(client, runtime: RuntimeConfig, current_strategy: StrategyConfig, _objective) -> Decision:
+        state["step"] = int(state["step"]) + 1
+        current_model = cast(TrainedModel | None, state["model"])
+        candles = client.get_klines(runtime.symbol, runtime.interval, limit=max(current_strategy.model_lookback, 300))
+        rows = _live_rows_for_model(candles, current_strategy, current_model)
+        training_rows = (
+            _readiness_model_rows(candles, current_strategy, current_model)
+            if current_model is not None
+            else _build_model_rows(candles, current_strategy)
+        )
+        if not rows:
+            price, _ts = client.get_symbol_price(runtime.symbol)
+            return Decision(side="FLAT", confidence=0.0, mark_price=float(price))
+        if current_model is None:
+            if not effective_dry_run:  # pragma: no cover - rejected before the decision function is returned
+                raise RuntimeError(f"Autonomous live mode requires a compatible model: {model_path}")
+            if not training_rows:
+                price, _ts = client.get_symbol_price(runtime.symbol)
+                return Decision(side="FLAT", confidence=0.0, mark_price=float(price))
+            current_model = train(
+                training_rows,
+                epochs=40,
+                feature_signature=_live_model_feature_signature(None, current_strategy),
+            )
+            state["model"] = current_model
+        latest = rows[-1]
+        raw_score = current_model.predict_proba(latest.features)
+        threshold = model_decision_threshold(current_model, current_strategy.signal_threshold)
+        score = confidence_adjusted_probability(raw_score, current_strategy.confidence_beta)
+        decision_strategy = current_strategy
+        if current_strategy.external_signals_enabled:
+            external_report = collect_external_signals(
+                symbol=runtime.symbol,
+                cache_path=_external_signal_cache_path(model_path),
+                ttl_seconds=current_strategy.external_signal_ttl_seconds,
+                timeout_seconds=current_strategy.external_signal_timeout_seconds,
+                max_adjustment=current_strategy.external_signal_max_adjustment,
+                min_providers=current_strategy.external_signal_min_providers,
+                compute_backend=runtime.compute_backend,
+                short_reaction_refresh_seconds=current_strategy.external_signal_short_reaction_refresh_seconds,
+                news_provider_limit=current_strategy.external_signal_news_provider_limit,
+                news_items_per_provider=current_strategy.external_signal_news_items_per_provider,
+                news_provider_parallelism=current_strategy.external_signal_provider_parallelism,
+                news_provider_jitter_seconds=current_strategy.external_signal_provider_jitter_seconds,
+                ollama_news_enabled=current_strategy.external_news_ai_enabled,
+                ollama_model=current_strategy.external_news_ai_model,
+                ollama_url=current_strategy.external_news_ai_url,
+                ollama_timeout_seconds=current_strategy.external_news_ai_timeout_seconds,
+                telemetry_path=current_strategy.telemetry_db_path if current_strategy.telemetry_enabled else None,
+                source_grade_max_age_hours=current_strategy.source_grade_max_age_hours,
+            )
+            score, decision_strategy, _applied_adjustment = _apply_external_signal_to_score(score, current_strategy, external_report)
+        _record_model_telemetry(
+            current_strategy,
+            step=int(state["step"]),
+            row=latest,
+            raw_score=raw_score,
+            adjusted_score=score,
+            threshold=threshold,
+            model=current_model,
+            runtime=runtime,
+        )
+        direction = _score_to_direction(score, decision_strategy, runtime.market_type, threshold)
+        if direction > 0:
+            side = "LONG"
+        elif direction < 0:
+            side = "SHORT"
+        else:
+            side = "FLAT"
+        return Decision(side=side, confidence=float(score), mark_price=float(latest.close))
+
+    return decide, None, model_notice
+
+
 def command_autonomous(args: argparse.Namespace) -> int:
     from .autonomous import (
+        AutonomousConfig,
         STATE_PAUSED,
         STATE_RUNNING,
         STATE_STOPPING,
         AutonomousControl,
+        run_loop,
     )
     from .objective import get_objective
 
@@ -5315,8 +5688,63 @@ def command_autonomous(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        control.write(STATE_RUNNING, note=f"CLI start objective={objective.name}")
-        print(f"autonomous: RUNNING (objective={objective.name})")
+        runtime = load_runtime()
+        strategy = load_strategy()
+        if getattr(args, "live", False):
+            effective_dry_run = False
+        elif getattr(args, "paper", False):
+            effective_dry_run = True
+        else:
+            effective_dry_run = bool(runtime.dry_run)
+        if not _allows_signed_execution(runtime):
+            print("Autonomous mode requires testnet=true or demo=true.", file=sys.stderr)
+            return 2
+        if not effective_dry_run and not _has_api_credentials(runtime):
+            print(_credential_required_message("Autonomous live mode"), file=sys.stderr)
+            return 2
+        if not effective_dry_run:
+            print(
+                "Autonomous authenticated mode is disabled until exchange-order execution is wired into the autonomous loop. "
+                "Use live --live for signed testnet/demo orders.",
+                file=sys.stderr,
+            )
+            return 2
+        model_path = Path(getattr(args, "model", "data/model.json"))
+        decision_fn, model_error, model_notice = _build_autonomous_decision_fn(
+            model_path=model_path,
+            strategy=strategy,
+            effective_dry_run=effective_dry_run,
+        )
+        if model_error is not None or decision_fn is None:
+            print(model_error or f"Autonomous mode requires a readable model: {model_path}", file=sys.stderr)
+            return 2
+        if model_notice is not None:
+            print(model_notice, file=sys.stderr)
+        cfg = AutonomousConfig(
+            objective=objective.name,
+            poll_seconds=max(0.0, float(getattr(args, "poll_seconds", 30.0))),
+            stop_after_iterations=getattr(args, "iterations", None),
+            heartbeat_every=max(1, int(getattr(args, "heartbeat_every", 1))),
+            dry_run=effective_dry_run,
+            starting_reference_cash=max(0.0, float(getattr(args, "starting_cash", 1000.0))),
+        )
+        try:
+            client = _build_client(runtime)
+        except BinanceAPIError as exc:
+            print(f"Autonomous startup blocked: {exc}", file=sys.stderr)
+            return 2
+        result = run_loop(
+            client,
+            runtime,
+            strategy,
+            cfg,
+            decision_fn=decision_fn,
+        )
+        print(
+            "autonomous: "
+            f"{result.exit_reason} iterations={result.iterations} "
+            f"opened={result.opened_trades} closed={result.closed_trades} skipped={result.skipped_entries}"
+        )
         return 0
     if action == "pause":
         control.write(STATE_PAUSED, note="CLI pause")

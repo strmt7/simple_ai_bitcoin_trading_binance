@@ -76,6 +76,23 @@ def _action(title: str):
     raise AssertionError(f"missing action: {title}")
 
 
+def _runtime_form(**overrides: str) -> dict[str, str]:
+    payload = {
+        "market_type": "spot",
+        "interval": "15m",
+        "testnet": "yes",
+        "demo": "no",
+        "api_key": "",
+        "api_secret": "",
+        "dry_run": "yes",
+        "validate_account": "yes",
+        "max_rate_calls_per_minute": "1200",
+        "recv_window_ms": "5000",
+    }
+    payload.update(overrides)
+    return payload
+
+
 class _FundsClient:
     def __init__(self, account: dict[str, object] | Exception) -> None:
         self.account = account
@@ -326,9 +343,9 @@ def test_settings_menu_execution_form_persists_choices(isolated_home) -> None:
     from simple_ai_bitcoin_trading_binance.config import load_strategy
 
     cfg = load_strategy()
-    assert cfg.order_type == "LIMIT"
+    assert cfg.order_type == "MARKET"
     assert cfg.time_in_force == "IOC"
-    assert cfg.post_only is True
+    assert cfg.post_only is False
     assert cfg.reduce_only_on_close is False
 
 
@@ -381,7 +398,7 @@ def test_tui_credential_gated_actions_reflect_credential_state(isolated_home) ->
     assert next(action for action in unchecked if action.title == "Trading caps").is_enabled() is False
 
     invalid = _tui_actions({"fingerprint": fingerprint, "status": "invalid"})
-    assert invalid[0].is_enabled() is False
+    assert invalid[0].is_enabled() is True
     assert "failed validation" in invalid[0].lock_reason()
 
     valid = _tui_actions({"fingerprint": fingerprint, "status": "valid"})
@@ -391,17 +408,35 @@ def test_tui_credential_gated_actions_reflect_credential_state(isolated_home) ->
 def test_tui_settings_action_marks_credentials_after_settings_close(isolated_home) -> None:
     runtime = RuntimeConfig(api_key="fake-api-key", api_secret="fake-secret")
     save_runtime(runtime)
-    state = {"fingerprint": "stale", "status": "valid"}
+    state = {"fingerprint": _credential_fingerprint(runtime), "status": "valid"}
     settings = next(action for action in _tui_actions(state) if action.title == "All settings")
 
     assert asyncio.run(settings.run(_ScriptedUI(menu_choices=["close"]))) == 0
     assert state["fingerprint"] == _credential_fingerprint(runtime)
-    assert state["status"] == "unchecked"
+    assert state["status"] == "valid"
+
+
+def test_connection_settings_escape_does_not_save_or_validate(isolated_home, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    runtime = RuntimeConfig(api_key="fake-api-key", api_secret="fake-secret", validate_account=True)
+    save_runtime(runtime)
+    state = {"fingerprint": _credential_fingerprint(runtime), "status": "valid"}
+    monkeypatch.setattr(
+        cli_mod,
+        "_build_client",
+        lambda _runtime: pytest.fail("cancelled connection settings must not validate"),
+    )
+
+    settings = next(action for action in _tui_actions(state) if action.title == "Connection settings")
+    assert asyncio.run(settings.run(_ScriptedUI(forms=[None]))) == 0
+    assert load_runtime() == runtime
+    assert state == {"fingerprint": _credential_fingerprint(runtime), "status": "valid"}
 
     save_runtime(RuntimeConfig())
     assert asyncio.run(settings.run(_ScriptedUI(menu_choices=["close"]))) == 0
-    assert state["fingerprint"] == "missing"
-    assert state["status"] == "missing"
+    assert state["fingerprint"] == _credential_fingerprint(runtime)
+    assert state["status"] == "valid"
 
 
 def test_funds_action_requires_credentials_before_menu(isolated_home) -> None:
@@ -446,6 +481,34 @@ def test_signed_tui_actions_stop_before_forms_without_credentials(isolated_home)
     assert "Full report account section requires Binance API key" in ui.logs[0]
 
 
+def test_direct_connection_settings_updates_credential_state(isolated_home, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    state = {"fingerprint": "", "status": "missing"}
+    save_runtime(RuntimeConfig(validate_account=True))
+    monkeypatch.setattr(cli_mod, "_build_client", lambda _runtime: object())
+    monkeypatch.setattr(cli_mod, "_validate_runtime_connection", lambda _runtime, _client: None)
+
+    action = next(item for item in _tui_actions(state) if item.title == "Connection settings")
+    ui = _ScriptedUI(forms=[_runtime_form(api_key="fake-api-key", api_secret="fake-secret", validate_account="yes")])
+
+    assert asyncio.run(action.run(ui)) == 0
+    assert state["fingerprint"] == _credential_fingerprint(load_runtime())
+    assert state["status"] == "valid"
+
+
+def test_signed_actions_lock_out_non_testnet_runtime_even_with_valid_credentials(isolated_home) -> None:
+    runtime = RuntimeConfig(testnet=False, demo=False, api_key="fake-api-key", api_secret="fake-secret")
+    save_runtime(runtime)
+    state = {"fingerprint": _credential_fingerprint(runtime), "status": "valid"}
+    action = next(item for item in _tui_actions(state) if item.title == "Trading caps")
+    ui = _ScriptedUI(menu_choices=["close"])
+
+    assert asyncio.run(action.run(ui)) == 2
+    assert ui.menu_calls == []
+    assert ui.logs == ["Trading caps is locked. Signed actions require testnet=true or demo=true."]
+
+
 def test_settings_menu_execution_form_cancellation(isolated_home) -> None:
     ui = _ScriptedUI(menu_choices=["execution", "close"], forms=[None])
     asyncio.run(_ui_settings_menu(ui))
@@ -462,19 +525,7 @@ def test_settings_menu_runtime_saves_when_form_valid(isolated_home) -> None:
     save_runtime(RuntimeConfig(managed_usdc=42.0, managed_btc=0.5, compute_backend="auto"))
     ui = _ScriptedUI(
         menu_choices=["runtime", "close"],
-        forms=[
-            {
-                "market_type": "spot",
-                "interval": "1h",
-                "testnet": "yes",
-                "api_key": "",
-                "api_secret": "",
-                "dry_run": "yes",
-                "validate_account": "no",
-                "max_rate_calls_per_minute": "200",
-                "recv_window_ms": "8000",
-            }
-        ],
+        forms=[_runtime_form(interval="1h", validate_account="no", max_rate_calls_per_minute="200", recv_window_ms="8000")],
     )
     asyncio.run(_ui_settings_menu(ui))
     runtime = load_runtime()
@@ -484,6 +535,77 @@ def test_settings_menu_runtime_saves_when_form_valid(isolated_home) -> None:
     assert runtime.managed_usdc == 42.0
     assert runtime.managed_btc == 0.5
     assert any("Connection settings saved" in line for line in ui.logs)
+
+
+def test_settings_menu_runtime_marks_missing_and_valid_credentials(isolated_home, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    marks: list[str] = []
+    save_runtime(RuntimeConfig(interval="15m", validate_account=True))
+    ui = _ScriptedUI(
+        menu_choices=["runtime", "runtime", "close"],
+        forms=[
+            _runtime_form(interval="1h", validate_account="yes"),
+            _runtime_form(interval="4h", api_key="fake-api-key", api_secret="fake-secret", validate_account="yes"),
+        ],
+    )
+    monkeypatch.setattr(cli_mod, "_build_client", lambda _runtime: object())
+    monkeypatch.setattr(cli_mod, "_validate_runtime_connection", lambda _runtime, _client: None)
+
+    asyncio.run(_ui_settings_menu(ui, mark_credentials=marks.append))
+
+    assert marks == ["missing", "unchecked", "valid"]
+    assert load_runtime().api_key == "fake-api-key"
+    assert any("Connection credentials validated" in line for line in ui.logs)
+
+
+def test_settings_menu_runtime_marks_invalid_credentials(isolated_home, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    marks: list[str] = []
+    save_runtime(RuntimeConfig(validate_account=True))
+    ui = _ScriptedUI(
+        menu_choices=["runtime", "close"],
+        forms=[_runtime_form(api_key="fake-api-key", api_secret="fake-secret", validate_account="yes")],
+    )
+    monkeypatch.setattr(cli_mod, "_build_client", lambda _runtime: object())
+    monkeypatch.setattr(
+        cli_mod,
+        "_validate_runtime_connection",
+        lambda _runtime, _client: (_ for _ in ()).throw(BinanceAPIError("bad key")),
+    )
+
+    asyncio.run(_ui_settings_menu(ui, mark_credentials=marks.append))
+
+    assert marks == ["unchecked", "invalid"]
+    assert any("Connection validation failed: bad key" in line for line in ui.logs)
+
+
+def test_settings_menu_runtime_validation_without_credential_callback(isolated_home, monkeypatch) -> None:
+    from simple_ai_bitcoin_trading_binance import cli as cli_mod
+
+    save_runtime(RuntimeConfig(validate_account=True))
+    ui = _ScriptedUI(
+        menu_choices=["runtime", "runtime", "close"],
+        forms=[
+            _runtime_form(interval="1h", api_key="fake-api-key", api_secret="fake-secret", validate_account="yes"),
+            _runtime_form(interval="4h", api_key="fake-api-key", api_secret="fake-secret", validate_account="yes"),
+        ],
+    )
+    calls = {"count": 0}
+
+    def validate(_runtime, _client):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise BinanceAPIError("bad key")
+
+    monkeypatch.setattr(cli_mod, "_build_client", lambda _runtime: object())
+    monkeypatch.setattr(cli_mod, "_validate_runtime_connection", validate)
+
+    asyncio.run(_ui_settings_menu(ui))
+
+    assert any("Connection credentials validated" in line for line in ui.logs)
+    assert any("Connection validation failed: bad key" in line for line in ui.logs)
 
 
 def test_settings_menu_runtime_invalid_value_logs_error(isolated_home, monkeypatch) -> None:

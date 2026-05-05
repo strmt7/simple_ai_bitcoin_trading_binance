@@ -352,7 +352,13 @@ def test_source_grades_and_signal_benchmark_commands(tmp_path, monkeypatch, caps
         def asdict(self):
             return {"status": self.status, "graded_sources": self.graded_sources, "grades": []}
 
-    monkeypatch.setattr(cli, "grade_sources", lambda **_kwargs: _GradeRun())
+    grade_kwargs: list[dict[str, object]] = []
+
+    def fake_grade_sources(**kwargs):
+        grade_kwargs.append(kwargs)
+        return _GradeRun()
+
+    monkeypatch.setattr(cli, "grade_sources", fake_grade_sources)
     monkeypatch.setattr(cli, "render_source_grade_run", lambda run: f"graded={run.graded_sources}")
     assert cli.command_source_grades(
         argparse.Namespace(
@@ -366,6 +372,7 @@ def test_source_grades_and_signal_benchmark_commands(tmp_path, monkeypatch, caps
         )
     ) == 0
     assert "graded=1" in capsys.readouterr().out
+    assert grade_kwargs[-1]["ollama_enabled"] is True
 
     args = argparse.Namespace(
         provider_limit=[30],

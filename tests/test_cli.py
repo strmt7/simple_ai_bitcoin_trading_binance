@@ -306,7 +306,7 @@ def test_main_without_args_routes_to_menu(monkeypatch) -> None:
 def test_command_menu_routes_to_tui_when_tty(monkeypatch) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_color", lambda _stream: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_ansi_terminal", lambda _stream: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: _runtime_config())
 
     def fake_launch_tui(**kwargs):
@@ -329,7 +329,7 @@ def test_command_menu_connection_provider_updates_credential_gate(monkeypatch) -
 
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_color", lambda _stream: True)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_ansi_terminal", lambda _stream: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: current["runtime"])
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._connection_status_line", lambda: connection["line"])
 
@@ -343,9 +343,9 @@ def test_command_menu_connection_provider_updates_credential_gate(monkeypatch) -
         assert kwargs["connection_provider"]() == "Connection: authenticated"
         assert caps.is_enabled() is True
 
-        connection["line"] = "Connection: authentication failed"
-        assert kwargs["connection_provider"]() == "Connection: authentication failed"
-        assert connect.is_enabled() is False
+        connection["line"] = "Connection: authentication failed; not authenticated"
+        assert kwargs["connection_provider"]() == "Connection: authentication failed; not authenticated"
+        assert connect.is_enabled() is True
         assert "failed validation" in connect.lock_reason()
 
         connection["line"] = "Connection: public online"
@@ -359,7 +359,14 @@ def test_command_menu_connection_provider_updates_credential_gate(monkeypatch) -
         current["runtime"] = _runtime_config(api_key="key-b", api_secret="secret-b")
         assert "Run Connect" in caps.lock_reason()
 
+        current["runtime"] = _runtime_config(testnet=False, demo=False, api_key="key-b", api_secret="secret-b")
+        connection["line"] = "Connection: authenticated"
+        assert kwargs["connection_provider"]() == "Connection: authenticated"
+        assert caps.is_enabled() is False
+        assert "testnet=true or demo=true" in caps.lock_reason()
+
         current["runtime"] = _runtime_config()
+        connection["line"] = "Connection: public online"
         assert kwargs["connection_provider"]() == "Connection: public online"
         assert "Connection settings first" in connect.lock_reason()
         return 0
@@ -368,6 +375,35 @@ def test_command_menu_connection_provider_updates_credential_gate(monkeypatch) -
     from simple_ai_bitcoin_trading_binance.cli import command_menu
 
     assert command_menu(argparse.Namespace()) == 0
+
+
+def test_connection_status_respects_validate_account_false(monkeypatch) -> None:
+    calls: list[str] = []
+    runtime = _runtime_config(
+        api_key="fake-api-key",
+        api_secret="fake-secret",
+        validate_account=False,
+    )
+
+    class _Client:
+        def ping(self):
+            calls.append("ping")
+
+        def get_exchange_time(self):
+            calls.append("time")
+            return 123
+
+        def get_account(self):
+            calls.append("account")
+            return {}
+
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_runtime", lambda: runtime)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli._build_client", lambda _runtime: _Client())
+    from simple_ai_bitcoin_trading_binance.cli import _connection_status_line
+
+    line = _connection_status_line()
+    assert "credentials saved, not validated" in line
+    assert calls == ["ping", "time"]
 
 
 def test_command_menu_rejects_without_tty(monkeypatch, capsys) -> None:
@@ -382,7 +418,7 @@ def test_command_menu_rejects_without_tty(monkeypatch, capsys) -> None:
 def test_command_menu_rejects_without_ansi_terminal(monkeypatch, capsys) -> None:
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_color", lambda _stream: False)
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.supports_ansi_terminal", lambda _stream: False)
     from simple_ai_bitcoin_trading_binance.cli import command_menu
 
     assert command_menu(argparse.Namespace()) == 2
@@ -1114,6 +1150,35 @@ def test_command_live_rejects_conflicting_force_modes(capsys) -> None:
     )
     assert command_live(args) == 2
     assert "Choose either --paper or --live" in capsys.readouterr().out
+
+
+def test_command_live_blocks_unsafe_testnet_base_url(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("BINANCE_BASE_URL", "https://api.binance.com")
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.cli.load_runtime",
+        lambda: _runtime_config(
+            testnet=True,
+            dry_run=False,
+            api_key="fake-api-key",
+            api_secret="fake-secret",
+        ),
+    )
+    monkeypatch.setattr("simple_ai_bitcoin_trading_binance.cli.load_strategy", StrategyConfig)
+    args = argparse.Namespace(
+        paper=False,
+        live=True,
+        leverage=None,
+        external_signals=None,
+        model="data/model.json",
+        steps=1,
+        sleep=0,
+        retrain_interval=0,
+        retrain_window=10,
+        retrain_min_rows=5,
+    )
+
+    assert command_live(args) == 2
+    assert "unsafe Binance base URL" in capsys.readouterr().err
 
 
 def test_filter_candles_for_time_window_handles_lookback_and_ranges() -> None:

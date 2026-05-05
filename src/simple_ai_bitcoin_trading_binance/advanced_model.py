@@ -26,6 +26,7 @@ from .features import (
     FEATURE_VERSION,
     ModelRow,
     feature_signature as base_feature_signature,
+    make_inference_rows as make_base_inference_rows,
     make_rows as make_base_rows,
     normalize_enabled_features,
 )
@@ -317,6 +318,44 @@ def make_advanced_rows(
                 close=row.close,
                 features=tuple(_safe(value) for value in base + extras + transforms + pairs),
                 label=row.label,
+            )
+        )
+    return expanded
+
+
+def make_advanced_inference_rows(
+    candles: Sequence[Candle],
+    cfg: AdvancedFeatureConfig,
+) -> list[ModelRow]:
+    """Build expanded rows for live inference without future-label lookahead."""
+
+    enabled = normalize_enabled_features(cfg.base_features)
+    base_rows = make_base_inference_rows(
+        candles,
+        cfg.short_window,
+        cfg.long_window,
+        enabled_features=enabled,
+    )
+    if not base_rows:
+        return []
+    valid_candles = _filter_valid(candles)
+    index_by_time = {candle.close_time: idx for idx, candle in enumerate(valid_candles)}
+    window_cache = _build_window_cache([candle.close for candle in valid_candles])
+    expanded: list[ModelRow] = []
+    for row in base_rows:
+        idx = index_by_time.get(row.timestamp)
+        if idx is None:
+            continue
+        base = list(row.features)
+        extras = _extra_window_features_at(window_cache, idx, cfg.extra_lookback_windows)
+        transforms = _nonlinear_expand(base, cfg.nonlinear_transforms)
+        pairs = _polynomial_pairs(base, cfg.polynomial_top_features, cfg.polynomial_degree)
+        expanded.append(
+            ModelRow(
+                timestamp=row.timestamp,
+                close=row.close,
+                features=tuple(_safe(value) for value in base + extras + transforms + pairs),
+                label=0,
             )
         )
     return expanded

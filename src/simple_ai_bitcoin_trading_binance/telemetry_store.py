@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Mapping, Sequence, cast
 
 _UNATTRIBUTED_RAW_SOURCE = "unattributed_raw_payload"
+_DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024
+_MAX_FUTURE_TIMESTAMP_SKEW_MS = 5 * 60_000
+_OUTCOME_KINDS = ("external_signal_outcome", "signal_outcome", "source_outcome")
 
 
 @dataclass(frozen=True)
@@ -50,8 +53,14 @@ class SourceGrade:
 class TradingTelemetryStore:
     """SQLite WAL store for replayable provider/model observations."""
 
-    def __init__(self, path: str | Path = "data/trading_telemetry.sqlite") -> None:
+    def __init__(
+        self,
+        path: str | Path = "data/trading_telemetry.sqlite",
+        *,
+        max_payload_bytes: int = _DEFAULT_MAX_PAYLOAD_BYTES,
+    ) -> None:
         self.path = Path(path)
+        self.max_payload_bytes = max(256, int(max_payload_bytes))
         self._conn: sqlite3.Connection | None = None
 
     def connect(self) -> sqlite3.Connection:
@@ -102,6 +111,12 @@ class TradingTelemetryStore:
                 ON raw_observations(kind, source, observed_at_ms);
             CREATE INDEX IF NOT EXISTS idx_raw_observations_symbol
                 ON raw_observations(symbol, horizon, observed_at_ms);
+            CREATE TABLE IF NOT EXISTS raw_payload_blobs (
+                payload_hash TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                payload_bytes INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS source_grades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,10 +137,87 @@ class TradingTelemetryStore:
             """
         )
         conn.commit()
+        try:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(raw_payload_blobs)").fetchall()
+            }
+            if columns and "payload_bytes" not in columns:
+                conn.execute("ALTER TABLE raw_payload_blobs ADD COLUMN payload_bytes INTEGER NOT NULL DEFAULT 0")
+                conn.commit()
+        except sqlite3.Error:  # pragma: no cover - legacy migration best effort
+            conn.rollback()
 
     @staticmethod
     def _payload_json(payload: Mapping[str, object] | Sequence[object]) -> str:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _bounded_payload_json(self, payload: Mapping[str, object] | Sequence[object]) -> tuple[str, str]:
+        payload_json = self._payload_json(payload)
+        payload_size = len(payload_json.encode("utf-8"))
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        blob_path = self._blob_path(payload_hash)
+        try:
+            blob_path.parent.mkdir(parents=True, exist_ok=True)
+            if not blob_path.exists():
+                blob_path.write_text(payload_json, encoding="utf-8")
+        except OSError:  # pragma: no cover - blob files are a replay enhancement, not a trading blocker
+            pass
+        try:
+            self.connect().execute(
+                """
+                INSERT OR IGNORE INTO raw_payload_blobs (
+                    payload_hash, payload_json, payload_bytes, created_at_ms
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (payload_hash, payload_json, payload_size, self._now_ms()),
+            )
+            self.connect().commit()
+        except sqlite3.Error:  # pragma: no cover - telemetry blobs must never block observations
+            self.connect().rollback()
+        if payload_size <= self.max_payload_bytes:
+            return payload_json, payload_hash
+        base_payload: dict[str, object] = {
+            "payload_truncated": True,
+            "payload_bytes": payload_size,
+            "payload_sha256": payload_hash,
+            "payload_preview": "",
+        }
+        base_json = self._payload_json(base_payload)
+        preview_budget = max(0, self.max_payload_bytes - len(base_json.encode("utf-8")) - 16)
+        preview = payload_json[:preview_budget]
+        bounded_payload = {**base_payload, "payload_preview": preview}
+        bounded_json = self._payload_json(bounded_payload)
+        while len(bounded_json.encode("utf-8")) > self.max_payload_bytes and preview:
+            preview = preview[: max(0, len(preview) - 128)]
+            bounded_payload["payload_preview"] = preview
+            bounded_json = self._payload_json(bounded_payload)
+        return bounded_json, payload_hash
+
+    def load_payload_blob(self, payload_hash: str) -> Mapping[str, object] | Sequence[object] | None:
+        row = self.connect().execute(
+            "SELECT payload_json FROM raw_payload_blobs WHERE payload_hash = ?",
+            (str(payload_hash),),
+        ).fetchone()
+        if row is None:
+            blob_path = self._blob_path(str(payload_hash))
+            if blob_path.exists():
+                try:
+                    return cast(Mapping[str, object] | Sequence[object], json.loads(blob_path.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    return None
+            return None
+        try:
+            return cast(Mapping[str, object] | Sequence[object], json.loads(str(row["payload_json"])))
+        except json.JSONDecodeError:
+            return None
+
+    def _blob_path(self, payload_hash: str) -> Path:
+        safe_hash = "".join(ch for ch in str(payload_hash).lower() if ch in "0123456789abcdef")
+        if len(safe_hash) < 8:
+            safe_hash = hashlib.sha256(str(payload_hash).encode("utf-8")).hexdigest()
+        return self.path.parent / f"{self.path.stem}_raw_payloads" / safe_hash[:2] / f"{safe_hash}.json"
 
     def record_observation(
         self,
@@ -139,8 +231,7 @@ class TradingTelemetryStore:
         score: float | None = None,
         confidence: float | None = None,
     ) -> int:
-        payload_json = self._payload_json(payload)
-        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        payload_json, payload_hash = self._bounded_payload_json(payload)
         observed = self._now_ms() if observed_at_ms is None else int(observed_at_ms)
         created = self._now_ms()
         cursor = self.connect().execute(
@@ -195,10 +286,17 @@ class TradingTelemetryStore:
             raw_horizon = ""
             raw_score: float | None = None
             raw_confidence: float | None = None
+            observed_at_ms = int(getattr(report, "known_at_ms", self._now_ms()))
             if isinstance(payload, Mapping):
                 source = str(payload.get("provider") or payload.get("source") or _UNATTRIBUTED_RAW_SOURCE)
                 record_payload: Mapping[str, object] | Sequence[object] = payload
                 raw_horizon = str(payload.get("horizon") or "")
+                observed_value = payload.get("known_at_ms") or payload.get("observed_at_ms")
+                if observed_value is not None:
+                    try:
+                        observed_at_ms = int(float(observed_value))
+                    except (TypeError, ValueError):
+                        observed_at_ms = int(getattr(report, "known_at_ms", self._now_ms()))
                 if payload.get("score") is not None:
                     try:
                         raw_score = float(payload.get("score"))
@@ -220,7 +318,7 @@ class TradingTelemetryStore:
                 kind="raw_provider_payload",
                 source=source,
                 payload=record_payload,
-                observed_at_ms=getattr(report, "known_at_ms", self._now_ms()),
+                observed_at_ms=observed_at_ms,
                 horizon=raw_horizon,
                 score=raw_score,
                 confidence=raw_confidence,
@@ -261,9 +359,39 @@ class TradingTelemetryStore:
             for row in rows
         ]
 
+    def prune_raw_observations(
+        self,
+        *,
+        before_ms: int | None = None,
+        keep_latest: int | None = None,
+    ) -> int:
+        """Delete old raw observations by timestamp and/or keep only the newest rows."""
+        deleted = 0
+        conn = self.connect()
+        if before_ms is not None:
+            cursor = conn.execute("DELETE FROM raw_observations WHERE observed_at_ms < ?", (int(before_ms),))
+            deleted += max(0, int(cursor.rowcount))
+        if keep_latest is not None:
+            keep = max(0, int(keep_latest))
+            cursor = conn.execute(
+                """
+                DELETE FROM raw_observations
+                WHERE id NOT IN (
+                    SELECT id FROM raw_observations
+                    ORDER BY observed_at_ms DESC, id DESC
+                    LIMIT ?
+                )
+                """,
+                (keep,),
+            )
+            deleted += max(0, int(cursor.rowcount))
+        conn.commit()
+        return deleted
+
     def source_rollups(self, *, since_ms: int, until_ms: int) -> list[dict[str, object]]:
+        outcome_placeholders = ",".join("?" for _kind in _OUTCOME_KINDS)
         rows = self.connect().execute(
-            """
+            f"""
             SELECT source, horizon, COUNT(*) AS sample_count,
                    AVG(COALESCE(score, 0.0)) AS avg_score,
                    AVG(ABS(COALESCE(score, 0.0))) AS avg_abs_score,
@@ -274,11 +402,52 @@ class TradingTelemetryStore:
             WHERE observed_at_ms >= ? AND observed_at_ms <= ?
               AND source <> ?
               AND source NOT GLOB 'raw_[0-9]*'
+              AND kind NOT IN ({outcome_placeholders})
             GROUP BY source, horizon
             ORDER BY sample_count DESC, source ASC
             """,
-            (int(since_ms), int(until_ms), _UNATTRIBUTED_RAW_SOURCE),
+            (int(since_ms), int(until_ms), _UNATTRIBUTED_RAW_SOURCE, *_OUTCOME_KINDS),
         ).fetchall()
+        outcome_rows = self.connect().execute(
+            f"""
+            SELECT source, horizon, score, payload_json
+            FROM raw_observations
+            WHERE observed_at_ms >= ? AND observed_at_ms <= ?
+              AND source <> ?
+              AND source NOT GLOB 'raw_[0-9]*'
+              AND kind IN ({outcome_placeholders})
+            """,
+            (int(since_ms), int(until_ms), _UNATTRIBUTED_RAW_SOURCE, *_OUTCOME_KINDS),
+        ).fetchall()
+        outcomes: dict[tuple[str, str], dict[str, float]] = {}
+        for row in outcome_rows:
+            key = (str(row["source"]), str(row["horizon"] or "medium"))
+            payload: object
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                payload = {}
+            correct: bool | None = None
+            if isinstance(payload, Mapping):
+                for field in ("direction_correct", "correct", "hit"):
+                    if isinstance(payload.get(field), bool):
+                        correct = bool(payload[field])
+                        break
+                if correct is None:
+                    prediction = payload.get("prediction_score", payload.get("score", row["score"]))
+                    realized = payload.get("realized_return", payload.get("future_return"))
+                    try:
+                        prediction_value = float(prediction)
+                        realized_value = float(realized)
+                        if prediction_value != 0.0 and realized_value != 0.0:
+                            correct = (prediction_value > 0.0) == (realized_value > 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        correct = None
+            if correct is None:
+                continue
+            bucket = outcomes.setdefault(key, {"total": 0.0, "hits": 0.0})
+            bucket["total"] += 1.0
+            bucket["hits"] += 1.0 if correct else 0.0
         return [
             {
                 "source": str(row["source"]),
@@ -289,6 +458,13 @@ class TradingTelemetryStore:
                 "avg_confidence": float(row["avg_confidence"] or 0.0),
                 "raw_records": int(row["raw_records"] or 0),
                 "component_records": int(row["component_records"] or 0),
+                "outcome_records": int(outcomes.get((str(row["source"]), str(row["horizon"] or "medium")), {}).get("total", 0.0)),
+                "directional_accuracy": (
+                    None
+                    if not outcomes.get((str(row["source"]), str(row["horizon"] or "medium")), {}).get("total", 0.0)
+                    else outcomes[(str(row["source"]), str(row["horizon"] or "medium"))]["hits"]
+                    / outcomes[(str(row["source"]), str(row["horizon"] or "medium"))]["total"]
+                ),
             }
             for row in rows
         ]
@@ -381,15 +557,23 @@ class TradingTelemetryStore:
     ) -> dict[tuple[str, str], SourceGrade]:
         """Return the newest grade per source/horizon, optionally age-limited."""
         params: list[object] = []
+        clauses: list[str] = []
         query = """
             SELECT id, created_at_ms, source, horizon, window_start_ms, window_end_ms,
                    grade, sample_count, model, reason, evidence_json
             FROM source_grades
             """
-        if max_age_ms is not None:
+        if max_age_ms is not None or now_ms is not None:
             reference_ms = self._now_ms() if now_ms is None else int(now_ms)
-            query += " WHERE created_at_ms >= ?"
-            params.append(reference_ms - max(0, int(max_age_ms)))
+            upper_ms = reference_ms + _MAX_FUTURE_TIMESTAMP_SKEW_MS
+            clauses.extend(["created_at_ms <= ?", "window_end_ms <= ?"])
+            params.extend([upper_ms, upper_ms])
+            if max_age_ms is not None:
+                lower_ms = reference_ms - max(0, int(max_age_ms))
+                clauses.extend(["created_at_ms >= ?", "window_end_ms >= ?"])
+                params.extend([lower_ms, lower_ms])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at_ms DESC, window_end_ms DESC, id DESC"
         rows = self.connect().execute(query, params).fetchall()
         latest: dict[tuple[str, str], SourceGrade] = {}

@@ -180,6 +180,17 @@ def test_make_advanced_rows_empty_input():
     assert am.make_advanced_rows([], cfg) == []
 
 
+def test_make_advanced_inference_rows_empty_and_missing_index(monkeypatch):
+    cfg = am.default_config_for("default", FEATURE_NAMES)
+    assert am.make_advanced_inference_rows([], cfg) == []
+
+    def fake_base(*_args, **_kwargs):
+        return [ModelRow(timestamp=-999, close=100.0, features=(0.0,) * len(FEATURE_NAMES), label=0)]
+
+    monkeypatch.setattr(am, "make_base_inference_rows", fake_base)
+    assert am.make_advanced_inference_rows(_candles(60), cfg) == []
+
+
 def test_filter_valid_rejects_bad_candles():
     bad = [
         Candle(open_time=0, open=float("nan"), high=1, low=1, close=1, volume=1, close_time=1),

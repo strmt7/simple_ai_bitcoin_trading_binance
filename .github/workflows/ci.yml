@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -25,7 +24,6 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -49,6 +47,11 @@ jobs:
           python3 -m coverage report --fail-under=100
           python3 -m coverage html
 
+      - name: Smoke POSIX launchers
+        run: |
+          sh ./run-shell.sh --help
+          sh ./run-gui.sh --help
+
       - name: Upload HTML coverage artifact
         if: always()
         uses: actions/upload-artifact@v7
@@ -63,3 +66,43 @@ jobs:
           files: ./coverage.xml
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
+
+  windows-python311-smoke:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project
+        run: |
+          python -m pip install -q -e .
+          python -m pip install -q pytest
+
+      - name: Smoke CLI and Windows launchers
+        shell: pwsh
+        run: |
+          python -m simple_ai_bitcoin_trading_binance --help
+          python -m simple_ai_bitcoin_trading_binance objectives
+          .\run-shell.cmd --help
+          .\run-gui.cmd --help
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            py -3.11 -m simple_ai_bitcoin_trading_binance --help
+          }
+
+      - name: Run Windows terminal regression tests
+        shell: pwsh
+        run: |
+          $env:TEMP = Join-Path $pwd ".pytest-tmp"
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+          python -m pytest -q tests/test_tui.py tests/test_style.py tests/test_shell.py tests/test_cli.py -p no:cacheprovider --basetemp .pytest-tmp/windows-ci

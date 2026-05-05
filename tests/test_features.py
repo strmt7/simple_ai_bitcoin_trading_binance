@@ -6,6 +6,7 @@ from simple_ai_bitcoin_trading_binance.api import Candle
 from simple_ai_bitcoin_trading_binance.features import (
     FEATURE_NAMES,
     feature_signature,
+    make_inference_rows,
     make_rows,
     make_rows_legacy,
     normalize_enabled_features,
@@ -19,6 +20,7 @@ from simple_ai_bitcoin_trading_binance.features import (
     _true_range,
     _valid_ohlcv,
 )
+from simple_ai_bitcoin_trading_binance import features as features_mod
 from simple_ai_bitcoin_trading_binance.features import _safe_features
 
 
@@ -117,6 +119,17 @@ def test_make_rows_rejects_invalid_windows() -> None:
         make_rows([candle], short_window=0, long_window=10)
     with pytest.raises(ValueError, match="long_window"):
         make_rows([candle], short_window=20, long_window=10)
+
+
+def test_make_inference_rows_rejects_invalid_windows_and_skips_missing_features(monkeypatch) -> None:
+    candle = Candle(open_time=0, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0, close_time=60_000)
+    with pytest.raises(ValueError, match="short_window"):
+        make_inference_rows([candle], short_window=0, long_window=10)
+    with pytest.raises(ValueError, match="long_window"):
+        make_inference_rows([candle], short_window=20, long_window=10)
+
+    monkeypatch.setattr(features_mod, "_build_full_features", lambda *_args, **_kwargs: None)
+    assert make_inference_rows(_fake_candles(), short_window=10, long_window=30) == []
 
 
 def test_true_range_with_non_positive_prev_close() -> None:

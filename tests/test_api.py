@@ -146,7 +146,7 @@ def test_get_symbol_constraints_supports_market_lot_and_notional_fallbacks(monke
                         "filters": [
                             {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "5", "stepSize": "0.001"},
                             {"filterType": "MARKET_LOT_SIZE", "minQty": "0.002", "maxQty": "3", "stepSize": "0.005"},
-                            {"filterType": "MIN_NOTIONAL", "notional": "15"},
+                            {"filterType": "MIN_NOTIONAL", "minNotional": "15"},
                         ]
                     }
                 ]

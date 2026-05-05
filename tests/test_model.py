@@ -448,3 +448,33 @@ def test_temperature_calibration_softens_overconfident_probabilities() -> None:
     assert report.temperature > 1.0
     assert report.log_loss_after < report.log_loss_before
     assert abs(after - 0.5) < abs(before - 0.5)
+
+
+def test_temperature_calibration_uses_ensemble_predictions() -> None:
+    rows = [
+        ModelRow(timestamp=index, close=1.0, features=(1.0,), label=index % 2)
+        for index in range(40)
+    ]
+    model = TrainedModel(
+        weights=[0.0],
+        bias=0.0,
+        feature_dim=1,
+        epochs=1,
+        feature_means=[0.0],
+        feature_stds=[1.0],
+        ensemble_members=[
+            EnsembleMember(weights=[0.0], bias=8.0, feature_means=[0.0], feature_stds=[1.0]),
+            EnsembleMember(weights=[0.0], bias=8.0, feature_means=[0.0], feature_stds=[1.0]),
+        ],
+    )
+
+    before = model.predict_proba((1.0,))
+    report = calibrate_probability_temperature(rows, model, min_temperature=1.0, max_temperature=8.0, steps=29)
+    model.probability_temperature = report.temperature
+    after = model.predict_proba((1.0,))
+
+    assert report.improved is True
+    assert report.temperature > 1.0
+    assert report.log_loss_before > 1.0
+    assert report.log_loss_after < report.log_loss_before
+    assert abs(after - 0.5) < abs(before - 0.5)

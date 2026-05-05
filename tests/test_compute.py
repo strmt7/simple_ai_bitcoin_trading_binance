@@ -212,6 +212,16 @@ def test_resolve_backend_cuda_returns_cpu_when_zero_devices(monkeypatch) -> None
     assert info.kind == "cpu"
 
 
+def test_resolve_backend_cuda_returns_cpu_for_rocm_torch_build(monkeypatch) -> None:
+    fake = _make_fake_torch(cuda=_FakeCuda(name="AMD Via CUDA Namespace"), hip="6.0")
+    monkeypatch.setattr(
+        "simple_ai_bitcoin_trading_binance.compute._probe_torch",
+        lambda: (fake, ""),
+    )
+    info = resolve_backend("cuda")
+    assert info.kind == "cpu"
+
+
 def test_resolve_backend_cuda_swallows_torch_exceptions(monkeypatch) -> None:
     class _ExplodingCuda:
         def is_available(self):
@@ -260,7 +270,7 @@ def test_resolve_backend_rocm_returns_cpu_when_cuda_namespace_missing(monkeypatc
     assert info.kind == "cpu"
 
 
-def test_resolve_backend_rocm_uses_fallback_vendor_when_no_devices(monkeypatch) -> None:
+def test_resolve_backend_rocm_returns_cpu_when_no_devices(monkeypatch) -> None:
     cuda = _FakeCuda()
     cuda._count = 0  # is_available=True, but no device count
     fake = _make_fake_torch(cuda=cuda, hip="6.0")
@@ -269,8 +279,7 @@ def test_resolve_backend_rocm_uses_fallback_vendor_when_no_devices(monkeypatch) 
         lambda: (fake, ""),
     )
     info = resolve_backend("rocm")
-    assert info.kind == "rocm"
-    assert info.vendor == "AMD ROCm"
+    assert info.kind == "cpu"
 
 
 class _FakeDirectML:
@@ -395,6 +404,7 @@ def test_resolve_backend_auto_picks_first_available(monkeypatch) -> None:
     )
     info = resolve_backend("auto")
     assert info.kind == "cuda"
+    assert info.requested == "auto"
 
 
 def test_resolve_backend_auto_picks_mps_when_cuda_and_rocm_missing(monkeypatch) -> None:
@@ -409,6 +419,7 @@ def test_resolve_backend_auto_picks_mps_when_cuda_and_rocm_missing(monkeypatch) 
     )
     info = resolve_backend("auto")
     assert info.kind == "mps"
+    assert info.requested == "auto"
 
 
 def test_resolve_backend_auto_picks_directml_before_mps(monkeypatch) -> None:
@@ -423,6 +434,7 @@ def test_resolve_backend_auto_picks_directml_before_mps(monkeypatch) -> None:
     )
     info = resolve_backend("auto")
     assert info.kind == "directml"
+    assert info.requested == "auto"
 
 
 def test_probe_torch_returns_tuple_when_torch_missing(monkeypatch) -> None:

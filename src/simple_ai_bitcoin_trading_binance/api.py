@@ -88,6 +88,30 @@ def _default_base_url(testnet: bool, market_type: str, *, demo: bool = False) ->
     return (BINANCE_SPOT_TESTNET if testnet else BINANCE_SPOT_LIVE, "api")
 
 
+def _normalized_host(url: str) -> str:
+    return urlsplit(url).netloc.lower()
+
+
+def classify_base_url(url: str) -> str:
+    host = _normalized_host(url)
+    if host in {_normalized_host(BINANCE_SPOT_TESTNET), _normalized_host(BINANCE_FUTURES_TESTNET)}:
+        return "testnet"
+    if host in {_normalized_host(BINANCE_SPOT_DEMO), _normalized_host(BINANCE_FUTURES_DEMO)}:
+        return "demo"
+    if host in {_normalized_host(BINANCE_SPOT_LIVE), _normalized_host(BINANCE_FUTURES_LIVE)}:
+        return "live"
+    return "custom"
+
+
+def ensure_non_mainnet_base_url(url: str, *, testnet: bool, demo: bool) -> None:
+    classification = classify_base_url(url)
+    if classification == "live" or ((testnet or demo) and classification == "custom"):
+        raise BinanceAPIError(
+            f"Refusing non-mainnet runtime with unsafe Binance base URL {url!r}. "
+            "Remove BINANCE_*_BASE_URL overrides or use an official testnet/demo endpoint."
+        )
+
+
 class BinanceAPIError(RuntimeError):
     """Raised for non-2xx responses from Binance endpoints."""
 
@@ -139,8 +163,11 @@ class BinanceClient:
         self.api_key = api_key
         self.api_secret = api_secret.encode("utf-8")
         self.market_type = market_type
+        self.testnet = bool(testnet)
         self.demo = bool(demo)
-        self.base_url, self.api_prefix = _default_base_url(testnet, market_type, demo=self.demo)
+        self.base_url, self.api_prefix = _default_base_url(self.testnet, market_type, demo=self.demo)
+        if self.testnet or self.demo:
+            ensure_non_mainnet_base_url(self.base_url, testnet=self.testnet, demo=self.demo)
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": api_key})
         self.session.headers.update({"User-Agent": "simple-ai-btcusdc-cli"})
@@ -206,6 +233,13 @@ class BinanceClient:
         base = 0.5
         return min(30.0, base * (2 ** max(0, attempt)))
 
+    def _ensure_signed_endpoint_allowed(self) -> None:
+        if classify_base_url(self.base_url) not in {"testnet", "demo"}:
+            raise BinanceAPIError(
+                "Signed Binance calls are disabled for mainnet/custom endpoints. "
+                "Use the official testnet or demo endpoint."
+            )
+
     def _request(
         self,
         method: str,
@@ -229,6 +263,7 @@ class BinanceClient:
             if signed:
                 if not self.api_key or not self.api_secret:
                     raise BinanceAPIError("signed endpoint requires api_key/api_secret")
+                self._ensure_signed_endpoint_allowed()
                 request_params = dict(params)
                 request_params["timestamp"] = int(time.time() * 1000)
                 request_params.setdefault("recvWindow", self.recv_window_ms)
@@ -445,7 +480,10 @@ class BinanceClient:
         max_notional = self._parse_float(notional_filter.get("maxNotional")) if notional_filter else 0.0
 
         if min_notional <= 0:
-            min_notional = self._parse_float(self._parse_filter(filters, "MIN_NOTIONAL").get("notional"))
+            min_notional_filter = self._parse_filter(filters, "MIN_NOTIONAL")
+            min_notional = self._parse_float(min_notional_filter.get("minNotional"))
+            if min_notional <= 0:
+                min_notional = self._parse_float(min_notional_filter.get("notional"))
 
         if min_notional <= 0:
             min_notional = 0.0
@@ -622,11 +660,23 @@ class BinanceClient:
 
     def place_order(self, symbol: str, side: str, quantity: float, *, dry_run: bool,
                    leverage: float = 1.0, reduce_only: bool = False) -> Dict[str, object]:
+        symbol = str(symbol or "").upper()
+        side = str(side or "").upper()
+        try:
+            quantity_value = float(quantity)
+        except (TypeError, ValueError):
+            quantity_value = float("nan")
+        if symbol != "BTCUSDC":
+            raise BinanceAPIError("Authenticated order helper supports BTCUSDC only")
+        if side not in {"BUY", "SELL"}:
+            raise BinanceAPIError("Order side must be BUY or SELL")
+        if not math.isfinite(quantity_value) or quantity_value <= 0.0:
+            raise BinanceAPIError("Order quantity must be a positive finite value")
         payload = {
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
-            "quantity": f"{quantity:.8f}",
+            "quantity": f"{quantity_value:.8f}",
         }
 
         if dry_run:
@@ -639,6 +689,8 @@ class BinanceClient:
                 "leverage": leverage,
                 "reduceOnly": bool(reduce_only),
             }
+
+        self._ensure_signed_endpoint_allowed()
 
         if self.market_type == "spot":
             return self._request_dict("POST", "/api/v3/order", payload, signed=True, label="order")

@@ -243,8 +243,17 @@ class _LiveClient:
     def get_klines(self, *_args, **_kwargs):
         return self.candles
 
-    def place_order(self, symbol, side, size, *, dry_run, leverage):
+    def get_account(self):
+        return {
+            "positions": [],
+            "balances": [{"asset": "USDC", "free": "1000", "locked": "0"}],
+            "assets": [{"asset": "USDC", "availableBalance": "1000"}],
+        }
+
+    def place_order(self, symbol, side, size, *, dry_run, leverage, reduce_only=False):
         payload = {"symbol": symbol, "side": side, "size": size, "dry_run": dry_run, "leverage": leverage}
+        if reduce_only:
+            payload["reduce_only"] = True
         self.orders.append(payload)
         return {"status": "FILLED", **payload}
 
@@ -363,7 +372,12 @@ def test_feature_model_dashboard_and_backtest_edges(tmp_path, monkeypatch) -> No
     always_buy = _flat_model(0.99, feature_dim=1)
     cfg = StrategyConfig(leverage=0.5, risk_per_trade=0.5, max_position_pct=0.5)
     cfg.leverage = 0.5
-    result = run_backtest([ModelRow(1, 100.0, (0.0,), 1)], always_buy, cfg, market_type="futures")
+    result = run_backtest(
+        [ModelRow(1, 100.0, (0.0,), 1), ModelRow(2, 101.0, (0.0,), 1)],
+        always_buy,
+        cfg,
+        market_type="futures",
+    )
     assert result.trades == 1
 
     result = run_backtest([ModelRow(1, -1.0, (0.0,), 1)], always_buy, StrategyConfig(), market_type="spot")
@@ -1024,8 +1038,23 @@ def test_cli_live_guards_leverage_clamps_and_no_rows(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: _flat_model(0.5))
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: client)
     monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 200.0)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_symbol_constraints",
+        lambda *_args, **_kwargs: SymbolConstraints("BTCUSDC", 0.00001, 1.0, 0.00001, 5.0, 1000.0),
+    )
+    monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 200.0)
+    assert cli.command_live(_live_args(steps=0, paper=False, live=True)) == 2
+    assert "leverage=125.0x" in capsys.readouterr().err
+
+    monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 25.0)
+    assert cli.command_live(_live_args(steps=0, paper=False, live=True)) == 2
+    assert "allowed=False" in capsys.readouterr().err
+
+    client = _LiveClient(set_response={"leverage": "50"})
+    monkeypatch.setattr(cli, "_build_client", lambda _runtime: client)
     assert cli.command_live(_live_args(steps=0, paper=False, live=True)) == 0
-    assert "effective leverage: 125.0x" in capsys.readouterr().out
+    assert "effective leverage: 50.0x" in capsys.readouterr().out
 
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: _LiveClient(set_response={}))
     monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, _cfg: 0.2)
@@ -1039,6 +1068,7 @@ def test_cli_live_guards_leverage_clamps_and_no_rows(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cli, "_resolve_futures_leverage", lambda _runtime, cfg: cli._effective_leverage(cfg, _runtime.market_type))
     monkeypatch.setattr(cli, "_load_runtime_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("corrupt")))
     monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: [])
     assert cli.command_live(_live_args(steps=1, paper=True, live=False, retrain_interval=-1, retrain_window=0, retrain_min_rows=0)) == 0
     assert "not enough historical data" in capsys.readouterr().out
 
@@ -1071,7 +1101,8 @@ def test_cli_live_spot_close_cooldown_trade_cap_and_signal_artifact(tmp_path, mo
         [ModelRow(4, 112.0, (0.0,), 1)],
     ]
     monkeypatch.setattr(cli, "_build_client", lambda _runtime: client)
-    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: row_sequences.pop(0))
+    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [ModelRow(0, 100.0, (0.0,), 1)])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: row_sequences.pop(0))
     monkeypatch.setattr(cli, "_build_live_model", lambda _rows, **kwargs: kwargs.get("model") or model)
 
     assert cli.command_live(_live_args(steps=4)) == 0
@@ -1093,6 +1124,7 @@ def test_cli_live_entry_rejection_and_drawdown_paths(tmp_path, monkeypatch, caps
     save_runtime(RuntimeConfig(market_type="futures", testnet=True, dry_run=True, managed_usdc=1000.0))
     save_strategy(StrategyConfig(slippage_bps=20_000, enabled_features=("momentum_1",)))
     monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [ModelRow(1, 100.0, (0.0,), 0)])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: [ModelRow(1, 100.0, (0.0,), 0)])
     monkeypatch.setattr(cli, "_build_live_model", lambda _rows, **kwargs: kwargs.get("model") or _SequenceModel([0.01]))
     assert cli.command_live(_live_args(steps=1)) == 0
 
@@ -1107,6 +1139,7 @@ def test_cli_live_entry_rejection_and_drawdown_paths(tmp_path, monkeypatch, caps
         )
     )
     monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [ModelRow(2, 100.0, (0.0,), 1)])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: [ModelRow(2, 100.0, (0.0,), 1)])
     monkeypatch.setattr(cli, "_build_live_model", lambda _rows, **kwargs: kwargs.get("model") or _SequenceModel([0.99]))
     assert cli.command_live(_live_args(steps=1)) == 0
     assert "insufficient cash after fill adjustment" in capsys.readouterr().out
@@ -1132,7 +1165,8 @@ def test_cli_live_entry_rejection_and_drawdown_paths(tmp_path, monkeypatch, caps
         [ModelRow(2, 120.0, (0.0,), 1)],
         [ModelRow(3, 110.0, (0.0,), 1)],
     ]
-    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: hold_rows.pop(0))
+    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [ModelRow(0, 100.0, (0.0,), 1)])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: hold_rows.pop(0))
     monkeypatch.setattr(cli, "_build_live_model", lambda _rows, **kwargs: kwargs.get("model") or hold_model)
     assert cli.command_live(_live_args(steps=3)) == 0
     assert "max_drawdown observed" in capsys.readouterr().out
@@ -1155,7 +1189,8 @@ def test_cli_live_entry_rejection_and_drawdown_paths(tmp_path, monkeypatch, caps
         [ModelRow(1, 100.0, (0.0,), 1)],
         [ModelRow(2, 50.0, (0.0,), 1)],
     ]
-    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: emergency_rows.pop(0))
+    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [ModelRow(0, 100.0, (0.0,), 1)])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: emergency_rows.pop(0))
     monkeypatch.setattr(cli, "_build_live_model", lambda _rows, **kwargs: kwargs.get("model") or emergency_model)
     assert cli.command_live(_live_args(steps=2)) == 0
     assert "drawdown limit reached" in capsys.readouterr().out
@@ -1178,7 +1213,8 @@ def test_cli_live_entry_rejection_and_drawdown_paths(tmp_path, monkeypatch, caps
         [ModelRow(1, 100.0, (0.0,), 1)],
         [ModelRow(2, 50.0, (0.0,), 1)],
     ]
-    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: spot_loss_rows.pop(0))
+    monkeypatch.setattr(cli, "_build_model_rows", lambda _candles, _cfg: [ModelRow(0, 100.0, (0.0,), 1)])
+    monkeypatch.setattr(cli, "make_inference_rows", lambda *_args, **_kwargs: spot_loss_rows.pop(0))
     monkeypatch.setattr(cli, "_build_live_model", lambda _rows, **kwargs: kwargs.get("model") or spot_loss_model)
     assert cli.command_live(_live_args(steps=2)) == 0
     output = capsys.readouterr().out

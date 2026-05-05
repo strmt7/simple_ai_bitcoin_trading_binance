@@ -10,8 +10,8 @@ opt-in, tests that prove redaction still holds, and an update to this file.
 - Accidental credential disclosure via logs, artifacts, stdout/stderr, or git
   history.
 - Accidental live-mode execution from a misconfigured strategy.
-- Supply-chain drift from unexpected dependencies (we ship pure stdlib + the
-  two listed deps — anything else is a red flag).
+- Supply-chain drift from unexpected dependencies (runtime deps are intentionally
+  small and listed in `pyproject.toml`; anything else needs review).
 - Exchange API rate-limit abuse or order replay from loose loops.
 
 ## Out of scope

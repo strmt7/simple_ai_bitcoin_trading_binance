@@ -389,8 +389,32 @@ def _temperature_scaled_score(score: float, temperature: object) -> float:
     return max(-50.0, min(50.0, score / value))
 
 
+def _member_probability_with_temperature(
+    model: TrainedModel,
+    member: EnsembleMember,
+    features: Tuple[float, ...],
+    *,
+    temperature: float,
+) -> float:
+    score = _linear_score_with_stats(
+        weights=member.weights,
+        bias=member.bias,
+        means=member.feature_means,
+        stds=member.feature_stds,
+        features=features,
+        feature_dim=model.feature_dim,
+    )
+    return _sigmoid(_temperature_scaled_score(score, temperature))
+
+
 def _model_probability(model: TrainedModel, features: Tuple[float, ...], *, temperature: float | None = None) -> float:
     chosen_temperature = model.probability_temperature if temperature is None else temperature
+    if model.ensemble_members:
+        probabilities = [
+            _member_probability_with_temperature(model, member, features, temperature=chosen_temperature)
+            for member in model.ensemble_members
+        ]
+        return sum(probabilities) / len(probabilities)
     return _sigmoid(_temperature_scaled_score(model._linear_score(features), chosen_temperature))
 
 

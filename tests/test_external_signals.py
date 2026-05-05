@@ -16,7 +16,14 @@ def _good_fetch(url: str, timeout: float):
     if "alternative.me" in url:
         return {"data": [{"value": "25", "value_classification": "Fear", "timestamp": str(NOW_MS // 1000)}]}
     if "coingecko" in url:
-        return {"bitcoin": {"usd": "100000", "usd_24h_change": "3.0", "usd_24h_vol": "123456"}}
+        return {
+            "bitcoin": {
+                "usd": "100000",
+                "usd_24h_change": "3.0",
+                "usd_24h_vol": "123456",
+                "last_updated_at": NOW_MS // 1000,
+            }
+        }
     if "coinpaprika" in url:
         return {
             "quotes": {
@@ -27,7 +34,8 @@ def _good_fetch(url: str, timeout: float):
                     "percent_change_24h": 3.0,
                     "percent_change_7d": 6.0,
                 }
-            }
+            },
+            "last_updated": "2023-11-14T22:13:20Z",
         }
     if "coinlore" in url:
         return [
@@ -63,6 +71,7 @@ def _good_fetch(url: str, timeout: float):
             "priceChangePercent": "3.0",
             "volume": "20",
             "quoteVolume": "2000000",
+            "closeTime": NOW_MS,
         }
     if "premiumIndex" in url:
         return {"lastFundingRate": "0.0001", "markPrice": "100.5", "indexPrice": "100", "time": NOW_MS}
@@ -166,6 +175,23 @@ def test_collect_external_signals_success_cache_and_render(tmp_path) -> None:
     assert refreshed.status == "ok"
 
 
+def test_collect_external_signals_returns_report_when_cache_write_fails(tmp_path, monkeypatch) -> None:
+    def fail_write(*_args, **_kwargs) -> None:
+        raise OSError("read-only cache")
+
+    monkeypatch.setattr(signals, "write_json_atomic", fail_write)
+    report = signals.collect_external_signals(
+        cache_path=tmp_path / "missing" / "signals.json",
+        fetch_json=_good_fetch,
+        force_refresh=True,
+        now_ms=NOW_MS,
+    )
+
+    assert report.fresh_count == 14
+    assert report.status == "warn"
+    assert any("cache write unavailable" in warning for warning in report.warnings)
+
+
 def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
     def fetch_text(url: str, timeout: float) -> str:
         assert url.startswith("https://")
@@ -177,9 +203,12 @@ def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
         assert payload["model"] == "gemma4:e4b"
         assert payload["keep_alive"] == "30m"
         assert payload["think"] is False
-        assert payload["options"]["num_ctx"] == 1024
-        assert payload["options"]["num_predict"] == 64
-        assert str(payload["messages"]).count("- ") <= 12
+        assert payload["options"]["num_ctx"] == 512
+        assert payload["options"]["num_predict"] == 48
+        messages = str(payload["messages"])
+        assert messages.count("- ") <= 6
+        assert "Bitcoin ETF inflow sparks institutional adoption rally" in messages
+        assert "coingecko_bitcoin" not in messages
         assert timeout == 2.0
         return {
             "message": {
@@ -226,10 +255,27 @@ def test_collect_external_signals_rss_ollama_and_telemetry(tmp_path) -> None:
     assert any(item.kind == "raw_provider_payload" for item in observations)
     assert any(
         item.kind == "raw_provider_payload"
+        and item.source == "cryptocompare_btc_news"
+        and item.horizon == "short"
+        and item.observed_at_ms == NOW_MS
+        for item in observations
+    )
+    assert any(
+        item.kind == "raw_provider_payload"
         and isinstance(item.payload, dict)
         and item.payload.get("classifications")
         for item in observations
     )
+    ollama_payloads = [
+        item.payload
+        for item in observations
+        if item.kind == "raw_provider_payload"
+        and isinstance(item.payload, dict)
+        and item.payload.get("request", {}).get("model") == "gemma4:e4b"
+    ]
+    assert ollama_payloads
+    assert "prompt" in ollama_payloads[0]["request"]
+    assert "selected_news_texts" in ollama_payloads[0]["request"]
     assert any(isinstance(item.payload, dict) and "parsed" in item.payload for item in observations)
 
 
@@ -284,6 +330,30 @@ def test_collect_external_signals_uses_source_grades_for_live_weights(tmp_path) 
     assert cryptocompare.source_grade == 0
     assert cryptocompare.source_grade_weight_multiplier == pytest.approx(0.25)
     assert cryptocompare.weight == pytest.approx(0.1375)
+    cached = signals.collect_external_signals(
+        cache_path=tmp_path / "graded-signals.json",
+        fetch_json=lambda _url, _timeout: (_ for _ in ()).throw(AssertionError("cache not used")),
+        ttl_seconds=300,
+        short_reaction_refresh_seconds=30,
+        now_ms=NOW_MS + 1_000,
+        telemetry_path=telemetry,
+        source_grade_max_age_hours=1.0,
+    )
+    cached_coingecko = [component for component in cached.components if component.provider == "coingecko_bitcoin"][0]
+    assert cached.status == "cached"
+    assert cached_coingecko.cached is True
+    assert cached_coingecko.source_grade == 10
+    assert cached_coingecko.source_grade_weight_multiplier == pytest.approx(1.25)
+    with TradingTelemetryStore(telemetry) as store:
+        cached_observations = store.recent_observations(since_ms=NOW_MS, limit=500)
+    assert any(
+        item.kind == "external_signal_component"
+        and item.source == "coingecko_bitcoin"
+        and isinstance(item.payload, dict)
+        and item.payload.get("cached") is True
+        for item in cached_observations
+    )
+    assert any(item.kind == "raw_provider_payload" and item.source == "external_signal_cache" for item in cached_observations)
 
     unbounded = signals.collect_external_signals(
         cache_path=tmp_path / "graded-signals-unbounded.json",
@@ -312,6 +382,27 @@ def test_rss_provider_parser_jitter_and_ollama_error(tmp_path, monkeypatch) -> N
     assert result.component.provider == "feed"
     assert result.component.status == "ok"
     assert result.raw_payload is not None and "raw_xml" in result.raw_payload
+    failed_feed = signals._fetch_rss_news_feeds(
+        (signals.NewsFeedProvider("bad_feed", "https://example.test/bad.xml"),),
+        lambda _url, _timeout: "<rss><channel><item><title>broken",
+        1.0,
+        NOW_MS,
+        "cpu",
+        max_workers=1,
+    )[0]
+    assert failed_feed.component.status == "error"
+    assert isinstance(failed_feed.raw_payload, dict)
+    assert failed_feed.raw_payload["raw_xml"].startswith("<rss>")
+    fetch_failed = signals._fetch_rss_news_feeds(
+        (signals.NewsFeedProvider("offline_feed", "https://example.test/offline.xml"),),
+        lambda _url, _timeout: (_ for _ in ()).throw(RuntimeError("offline")),
+        1.0,
+        NOW_MS,
+        "cpu",
+        max_workers=1,
+    )[0]
+    assert isinstance(fetch_failed.raw_payload, dict)
+    assert "raw_xml" not in fetch_failed.raw_payload
     assert signals._extract_feed_items("\ufeff<feed><entry><title>Atom Bitcoin ban</title><updated>2023-11-14T22:13:20Z</updated><link href='https://x.test'/></entry></feed>", now_ms=NOW_MS)[0]["title"] == "Atom Bitcoin ban"
 
     report = signals.collect_external_signals(
@@ -328,16 +419,41 @@ def test_rss_provider_parser_jitter_and_ollama_error(tmp_path, monkeypatch) -> N
     assert any(component.provider == "ollama_news_ai" and component.status == "error" for component in report.components)
 
 
+def test_structured_providers_apply_jitter(tmp_path, monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(signals._JITTER_RANDOM, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(signals.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    report = signals.collect_external_signals(
+        cache_path=tmp_path / "structured-jitter.json",
+        fetch_json=_good_fetch,
+        force_refresh=True,
+        now_ms=NOW_MS,
+        news_provider_limit=0,
+        news_provider_jitter_seconds=0.25,
+    )
+
+    assert report.provider_count == 14
+    assert len(sleeps) == 14
+    assert set(sleeps) == {0.25}
+
+
 def test_rss_scheduler_paces_same_host_requests(monkeypatch) -> None:
     sleeps: list[float] = []
+    fetch_times: dict[str, float] = {}
     clock = {"now": 0.0}
 
     def sleep(seconds: float) -> None:
         sleeps.append(seconds)
         clock["now"] += seconds
 
+    monkeypatch.setattr(signals._JITTER_RANDOM, "uniform", lambda _low, high: high / 2.0)
     monkeypatch.setattr(signals.time, "perf_counter", lambda: clock["now"])
     monkeypatch.setattr(signals.time, "sleep", sleep)
+
+    def fetch_text(url: str, _timeout: float) -> str:
+        fetch_times[url] = clock["now"]
+        return _feed_xml()
 
     results = signals._fetch_rss_news_feeds(
         (
@@ -345,16 +461,17 @@ def test_rss_scheduler_paces_same_host_requests(monkeypatch) -> None:
             signals.NewsFeedProvider("same_two", "https://same.test/two.xml"),
             signals.NewsFeedProvider("other", "https://other.test/rss.xml"),
         ),
-        lambda _url, _timeout: _feed_xml(),
+        fetch_text,
         1.0,
         NOW_MS,
         "cpu",
-        max_workers=3,
-        provider_jitter_seconds=0.0,
+        max_workers=1,
+        provider_jitter_seconds=0.4,
     )
 
     assert [result.component.provider for result in results] == ["same_one", "same_two", "other"]
-    assert any(seconds >= signals._RSS_SAME_HOST_GAP_SECONDS for seconds in sleeps)
+    assert len(sleeps) >= 3
+    assert fetch_times["https://same.test/two.xml"] - fetch_times["https://same.test/one.xml"] >= 0.4
 
 
 def test_rss_scheduler_accepts_hostless_provider_without_pacing(monkeypatch) -> None:
@@ -373,7 +490,7 @@ def test_rss_scheduler_accepts_hostless_provider_without_pacing(monkeypatch) -> 
     assert [result.component.provider for result in results] == ["hostless"]
 
 
-def test_news_feed_helpers_and_ollama_validation(monkeypatch) -> None:
+def test_news_feed_helpers_and_ollama_validation(tmp_path, monkeypatch) -> None:
     assert len(signals.RSS_NEWS_FEEDS) >= 90
     assert len(signals.RSS_NEWS_FEEDS) + 14 >= 100
     assert len({provider.provider for provider in signals.RSS_NEWS_FEEDS}) == len(signals.RSS_NEWS_FEEDS)
@@ -446,7 +563,67 @@ def test_news_feed_helpers_and_ollama_validation(monkeypatch) -> None:
     )
     assert bounded == ["Bitcoin hack crackdown emergency", "BTC adoption approval"]
     prompt = signals._ollama_prompt([f"Bitcoin headline {index}" for index in range(20)])
-    assert prompt.count("- ") == 12
+    assert prompt.count("- ") == 6
+    malformed = signals._evaluate_news_with_ollama(
+        ["Breaking Bitcoin exchange breach drains reserves"],
+        post_json=lambda *_args, **_kwargs: {"message": {"content": "not-json"}},
+        now_ms=NOW_MS,
+    )
+    assert malformed.component.score < -0.9
+    assert malformed.component.horizon == "short"
+    assert malformed.component.urgency == pytest.approx(1.0)
+    assert malformed.status == "warn"
+    assert malformed.reason.startswith("schema_guarded security")
+    assert malformed.raw_payload["provider"] == "ollama_news_ai"
+    assert malformed.raw_payload["status"] == "warn"
+    assert malformed.raw_payload["request"]["parse_error"]
+    assert malformed.raw_payload["request"]["schema_guarded"] is True
+    contradictory = signals._evaluate_news_with_ollama(
+        ["Breaking Bitcoin exchange hack confirmed"],
+        post_json=lambda *_args, **_kwargs: {
+            "message": {
+                "content": json.dumps(
+                    {"score": 0.9, "horizon": "medium", "reaction_required": False, "reason": "bullish"}
+                )
+            }
+        },
+        now_ms=NOW_MS,
+    )
+    assert contradictory.component.score < -0.9
+    assert contradictory.component.horizon == "short"
+    assert contradictory.status == "warn"
+    assert contradictory.reason == "guarded security signal"
+    stale = signals._evaluate_news_with_ollama(
+        ["Breaking Bitcoin exchange hack confirmed"],
+        news_known_at_ms=[NOW_MS - 8 * 24 * 3_600_000],
+        post_json=lambda *_args, **_kwargs: {
+            "message": {
+                "content": json.dumps(
+                    {"score": -0.9, "horizon": "short", "reaction_required": True, "reason": "urgent"}
+                )
+            }
+        },
+        now_ms=NOW_MS,
+    )
+    assert stale.component.known_at_ms == NOW_MS - 8 * 24 * 3_600_000
+    stale_report = signals._combine_components(
+        [stale.component],
+        max_adjustment=0.04,
+        min_providers=0,
+        now_ms=NOW_MS,
+        cache_path=tmp_path / "stale-ollama.json",
+        news_backend=signals.resolve_backend("cpu"),
+    )
+    assert stale_report.fresh_count == 0
+    assert stale_report.reaction_required is False
+    neutral = signals._evaluate_news_with_ollama(
+        ["Bitcoin market structure update"],
+        post_json=lambda *_args, **_kwargs: {
+            "message": {"content": json.dumps({"score": 0.1, "horizon": "medium", "reaction_required": False})}
+        },
+        now_ms=NOW_MS,
+    )
+    assert neutral.reason == "news impact evaluated"
 
     class _Response:
         text = "hello"
@@ -471,7 +648,7 @@ def test_news_feed_helpers_and_ollama_validation(monkeypatch) -> None:
     monkeypatch.setattr(signals.requests, "get", fake_get)
     assert signals._post_json("https://example.test", {"x": 1}, 0.0) == {"ok": True}
     assert signals._get_text("https://example.test", 0.0) == "hello"
-    assert observed["post"][2] == 0.1
+    assert observed["post"][2] == pytest.approx(0.1, abs=0.01)
     assert observed["get"][1] == 0.1
 
 
@@ -542,7 +719,7 @@ def test_external_signal_failures_min_provider_gate_and_fallback(tmp_path) -> No
 
     def one_positive(url: str, _timeout: float):
         if "coingecko" in url:
-            return {"bitcoin": {"usd": "100", "usd_24h_change": "5", "usd_24h_vol": "1"}}
+            return {"bitcoin": {"usd": "100", "usd_24h_change": "5", "usd_24h_vol": "1", "last_updated_at": NOW_MS // 1000}}
         raise RuntimeError("offline")
 
     gated = signals.collect_external_signals(
@@ -636,11 +813,54 @@ def test_external_signal_payload_cache_and_helpers(tmp_path, monkeypatch) -> Non
     )[0]
     assert fallback_adjusted.source_grade == 5
     assert fallback_adjusted.source_grade_model == ""
+    telemetry_only_grade = type("Grade", (), {"grade": 0, "model": "scheduler", "evidence": {"outcome_records": 0}})()
+    telemetry_only_adjusted = signals._apply_source_grade_weights(
+        [fallback_component],
+        {("graded_provider", "medium"): telemetry_only_grade},
+    )[0]
+    assert telemetry_only_adjusted.source_grade_weight_multiplier == pytest.approx(0.70)
+    assert telemetry_only_adjusted.weight == pytest.approx(0.70)
+    assert "telemetry_only_bounded_no_outcomes" in telemetry_only_adjusted.detail
+    high_telemetry_grade = type("Grade", (), {"grade": 10, "model": "scheduler", "evidence": {"outcome_records": 0}})()
+    high_telemetry_adjusted = signals._apply_source_grade_weights(
+        [fallback_component],
+        {("graded_provider", "medium"): high_telemetry_grade},
+    )[0]
+    assert high_telemetry_adjusted.source_grade_weight_multiplier == pytest.approx(1.15)
+    zero_multiplier_component = signals.ExternalSignalComponent(
+        provider="graded_provider",
+        status="ok",
+        score=0.0,
+        weight=2.0,
+        value=None,
+        detail="base source_grade=9/10 source_grade_weight=0.00",
+        known_at_ms=NOW_MS,
+        horizon="short",
+        source_grade=9,
+        source_grade_model="old",
+        source_grade_weight_multiplier=0.0,
+    )
+    reset_component = signals._base_component_for_regrading(zero_multiplier_component)
+    assert reset_component.weight == 2.0
+    assert reset_component.source_grade is None
+    assert reset_component.detail == "base"
     assert signals._parse_epoch_ms(NOW_MS, 0) == NOW_MS
     assert signals._parse_gdelt_seen_ms("", NOW_MS) == NOW_MS
     assert signals._parse_gdelt_seen_ms("bad", NOW_MS) == NOW_MS
     assert signals._binance_symbol_candidates("btcusdt") == ["BTCUSDT"]
     assert signals._binance_symbol_candidates("btcusdc") == ["BTCUSDC", "BTCUSDT"]
+    assert signals._structured_news_texts_from_payload("cryptocompare_btc_news", {"Data": "bad"}, limit=2) == []
+    assert signals._structured_news_texts_from_payload("cryptocompare_btc_news", {"Data": ["bad"]}, limit=2) == []
+    hn_items = signals._structured_news_items_from_payload(
+        "hackernews_bitcoin_attention",
+        {"hits": [{"title": "Bitcoin breach", "created_at": "not-a-dateZ"}, {"title": "Bitcoin ETF", "created_at": "not-a-date"}]},
+        limit=2,
+        now_ms=NOW_MS,
+    )
+    assert hn_items == [("hackernews_bitcoin_attention: Bitcoin breach", NOW_MS), ("hackernews_bitcoin_attention: Bitcoin ETF", NOW_MS)]
+    assert signals._source_grade_has_outcome_evidence(type("Grade", (), {"evidence": "bad"})()) is False
+    assert signals._source_grade_has_outcome_evidence(type("Grade", (), {"evidence": {"outcome_records": 1}})()) is True
+    assert signals._source_grade_has_outcome_evidence(type("Grade", (), {"evidence": {"directional_accuracy": 0.5}})()) is True
     assert signals.report_from_payload({"components": "bad"}) is None
     assert signals.report_from_payload({"components": [{"provider": ""}, {"provider": "x", "score": "bad"}]}) is not None
     graded_payload = signals._component_from_payload(
@@ -691,6 +911,77 @@ def test_external_signal_payload_cache_and_helpers(tmp_path, monkeypatch) -> Non
         ttl_seconds=300,
         short_reaction_refresh_seconds=1,
     ) is None
+    payload["reaction_required"] = False
+    payload["known_at_ms"] = NOW_MS + 1
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    assert signals.load_external_signal_cache(cache, now_ms=NOW_MS, ttl_seconds=300) is None
+    payload["known_at_ms"] = NOW_MS - 1_000
+    payload["components"] = [
+        {"provider": "x", "status": "ok", "score": 0.1, "weight": 1.0, "known_at_ms": NOW_MS + 1}
+    ]
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    assert signals.load_external_signal_cache(cache, now_ms=NOW_MS, ttl_seconds=300) is None
+    payload["components"] = [
+        {
+            "provider": "old_short",
+            "status": "ok",
+            "score": 0.1,
+            "weight": 1.0,
+            "known_at_ms": NOW_MS - 8 * 24 * 3_600_000,
+            "horizon": "short",
+        }
+    ]
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    assert signals.load_external_signal_cache(cache, now_ms=NOW_MS, ttl_seconds=300) is None
+    payload["components"].append(
+        {
+            "provider": "fresh_medium",
+            "status": "ok",
+            "score": 0.1,
+            "weight": 1.0,
+            "known_at_ms": NOW_MS - 1_000,
+            "horizon": "medium",
+        }
+    )
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    cached = signals.load_external_signal_cache(cache, now_ms=NOW_MS, ttl_seconds=300)
+    assert cached is not None
+    assert cached.status == "cached"
+    assert cached.fresh_count == 1
+    assert cached.stale_count == 1
+
+
+def test_combine_components_counts_and_ignores_stale_successes(tmp_path, monkeypatch) -> None:
+    fresh = signals._component(
+        "fresh_short",
+        score=0.8,
+        weight=1.0,
+        value=None,
+        detail="fresh",
+        known_at_ms=NOW_MS - 1_000,
+        horizon="short",
+    )
+    stale = signals._component(
+        "stale_short",
+        score=-0.8,
+        weight=1.0,
+        value=None,
+        detail="stale",
+        known_at_ms=NOW_MS - 8 * 24 * 3_600_000,
+        horizon="short",
+    )
+    report = signals._combine_components(
+        [fresh, stale],
+        max_adjustment=0.04,
+        min_providers=1,
+        now_ms=NOW_MS,
+        cache_path=tmp_path / "signals.json",
+        news_backend=signals.resolve_backend("cpu"),
+    )
+    assert report.fresh_count == 1
+    assert report.stale_count == 1
+    assert report.raw_score == pytest.approx(0.8)
+    assert any("stale external signal" in warning for warning in report.warnings)
 
     class _Response:
         def raise_for_status(self) -> None:
@@ -710,6 +1001,249 @@ def test_external_signal_payload_cache_and_helpers(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(signals.requests, "get", fake_get)
     assert signals._get_json("https://example.test", 0.0) == {"ok": True}
     assert observed["timeout"] == 0.1
+
+
+def test_external_http_get_retries_rate_limits(monkeypatch) -> None:
+    sleeps: list[float] = []
+    calls = {"count": 0}
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.headers = {"Retry-After": "0.01"} if status_code == 429 else {}
+            self.text = "ok"
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise signals.requests.HTTPError(f"status {self.status_code}")
+
+        def json(self):
+            return {"ok": self.status_code}
+
+    def fake_get(_url: str, *, timeout: float, headers: dict[str, str]):
+        calls["count"] += 1
+        return _Response(429 if calls["count"] == 1 else 200)
+
+    monkeypatch.setattr(signals.requests, "get", fake_get)
+    monkeypatch.setattr(signals.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert signals._get_json("https://example.test", 1.0) == {"ok": 200}
+    assert calls["count"] == 2
+    assert sleeps == [0.01]
+
+    clock = {"now": 0.0}
+    observed_timeouts: list[float] = []
+
+    def budget_exhausted_get(_url: str, *, timeout: float, headers: dict[str, str]):
+        observed_timeouts.append(timeout)
+        clock["now"] = 1.0
+        return _Response(429)
+
+    monkeypatch.setattr(signals.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(signals.requests, "get", budget_exhausted_get)
+    sleeps.clear()
+    with pytest.raises(signals.requests.HTTPError):
+        signals._get_json("https://example.test", 0.5)
+    assert observed_timeouts == [0.5]
+    assert sleeps == []
+
+
+def test_external_http_retry_delay_and_request_exception_paths(monkeypatch) -> None:
+    class _Headers:
+        def __init__(self, headers: dict[str, str] | None = None) -> None:
+            self.headers = headers or {}
+
+    monkeypatch.setattr(signals.time, "time", lambda: 1_700_000_000.0)
+    assert signals._http_retry_delay_seconds(_Headers(), 0) == pytest.approx(0.25)
+    assert signals._http_retry_delay_seconds(_Headers({"Retry-After": "bad"}), 1) == pytest.approx(0.5)
+    assert signals._http_retry_delay_seconds(_Headers({"Retry-After": "Tue, 14 Nov 2023 22:13:21 GMT"}), 0) == pytest.approx(1.0)
+    assert signals._http_retry_delay_seconds(_Headers({"Retry-After": "Tue, 14 Nov 2023 22:13:21"}), 0) == pytest.approx(1.0)
+
+    sleeps: list[float] = []
+    calls = {"count": 0}
+
+    class _Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+        text = "ok"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+    def flaky_get(_url: str, *, timeout: float, headers: dict[str, str]):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise signals.requests.Timeout("temporary")
+        return _Response()
+
+    monkeypatch.setattr(signals.requests, "get", flaky_get)
+    monkeypatch.setattr(signals.time, "sleep", lambda seconds: sleeps.append(seconds))
+    assert signals._get_json("https://example.test", 1.0) == {"ok": True}
+    assert sleeps == [0.25]
+
+    monkeypatch.setattr(signals.requests, "get", lambda *_args, **_kwargs: (_ for _ in ()).throw(signals.requests.Timeout("down")))
+    with pytest.raises(signals.requests.Timeout):
+        signals._get_json("https://example.test", 1.0)
+
+    clock = {"now": 0.0}
+
+    def sleep_past_deadline(_seconds: float) -> None:
+        clock["now"] = 2.0
+
+    monkeypatch.setattr(signals.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(signals.time, "sleep", sleep_past_deadline)
+    monkeypatch.setattr(signals.requests, "get", lambda *_args, **_kwargs: (_ for _ in ()).throw(signals.requests.Timeout("first")))
+    with pytest.raises(signals.requests.Timeout, match="first"):
+        signals._get_json("https://example.test", 1.0)
+
+    clock["now"] = 0.0
+
+    class _RetryResponse(_Response):
+        status_code = 429
+        headers = {"Retry-After": "0.5"}
+
+    monkeypatch.setattr(signals.requests, "get", lambda *_args, **_kwargs: _RetryResponse())
+    with pytest.raises(signals.requests.Timeout, match="budget exhausted"):
+        signals._get_json("https://example.test", 1.0)
+
+
+def test_external_http_post_retries_status_and_exceptions(monkeypatch) -> None:
+    sleeps: list[float] = []
+    calls = {"count": 0}
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.headers = {"Retry-After": "0.01"} if status_code == 503 else {}
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise signals.requests.HTTPError(f"status {self.status_code}")
+
+        def json(self):
+            return {"ok": self.status_code}
+
+    def flaky_post(_url: str, *, json: dict[str, object], timeout: float, headers: dict[str, str]):
+        calls["count"] += 1
+        return _Response(503 if calls["count"] == 1 else 200)
+
+    monkeypatch.setattr(signals.requests, "post", flaky_post)
+    monkeypatch.setattr(signals.time, "sleep", lambda seconds: sleeps.append(seconds))
+    assert signals._post_json("https://example.test", {"x": 1}, 1.0) == {"ok": 200}
+    assert sleeps == [0.01]
+
+    calls["count"] = 0
+
+    def exception_then_success(_url: str, *, json: dict[str, object], timeout: float, headers: dict[str, str]):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise signals.requests.Timeout("temporary")
+        return _Response(200)
+
+    monkeypatch.setattr(signals.requests, "post", exception_then_success)
+    sleeps.clear()
+    assert signals._post_json("https://example.test", {"x": 1}, 1.0) == {"ok": 200}
+    assert sleeps == [0.25]
+
+    clock = {"now": 0.0}
+    observed_timeouts: list[float] = []
+
+    def budget_exhausted_post(_url: str, *, json: dict[str, object], timeout: float, headers: dict[str, str]):
+        observed_timeouts.append(timeout)
+        clock["now"] = 1.0
+        return _Response(503)
+
+    monkeypatch.setattr(signals.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(signals.requests, "post", budget_exhausted_post)
+    sleeps.clear()
+    with pytest.raises(signals.requests.HTTPError):
+        signals._post_json("https://example.test", {"x": 1}, 0.5)
+    assert observed_timeouts == [0.5]
+    assert sleeps == []
+
+    monkeypatch.setattr(signals.requests, "post", lambda *_args, **_kwargs: (_ for _ in ()).throw(signals.requests.Timeout("down")))
+    with pytest.raises(signals.requests.Timeout):
+        signals._post_json("https://example.test", {"x": 1}, 1.0)
+
+
+def test_component_cache_timestamp_freshness_rejects_invalid_and_future_report_times() -> None:
+    assert signals._bounded_provider_timestamp_ms(0, NOW_MS) == NOW_MS
+    assert signals._bounded_provider_timestamp_ms(NOW_MS + 10 * 60_000, NOW_MS) == 0
+    assert signals._bounded_provider_timestamp_ms(NOW_MS + 60_000, NOW_MS) == NOW_MS
+    zero = signals._component(
+        "zero_time",
+        score=0.1,
+        weight=1.0,
+        value=None,
+        detail="zero",
+        known_at_ms=0,
+    )
+    future_vs_report = signals._component(
+        "future_vs_report",
+        score=0.1,
+        weight=1.0,
+        value=None,
+        detail="future",
+        known_at_ms=NOW_MS + 10 * 60_000,
+    )
+    assert signals._component_cache_timestamp_is_fresh(zero, now_ms=NOW_MS, report_known_at_ms=NOW_MS) is False
+    assert (
+        signals._component_cache_timestamp_is_fresh(
+            future_vs_report,
+            now_ms=NOW_MS + 20 * 60_000,
+            report_known_at_ms=NOW_MS,
+        )
+        is False
+    )
+
+
+def test_market_provider_future_timestamps_are_rejected() -> None:
+    future_seconds = (NOW_MS + 10 * 60_000) // 1000
+    with pytest.raises(ValueError, match="CoinGecko timestamp"):
+        signals._fetch_coingecko_btc(
+            lambda _url, _timeout: {"bitcoin": {"usd": 100, "usd_24h_change": 1, "usd_24h_vol": 1, "last_updated_at": future_seconds}},
+            1.0,
+            NOW_MS,
+        )
+    with pytest.raises(ValueError, match="CoinPaprika timestamp"):
+        signals._fetch_coinpaprika_btc(
+            lambda _url, _timeout: {
+                "last_updated": "2023-11-14T22:23:20Z",
+                "quotes": {"USD": {"price": 100, "volume_24h": 1, "percent_change_1h": 0, "percent_change_24h": 1, "percent_change_7d": 2}},
+            },
+            1.0,
+            NOW_MS,
+        )
+    with pytest.raises(ValueError, match="Binance spot ticker timestamp"):
+        signals._fetch_binance_spot_momentum(
+            lambda _url, _timeout: {
+                "lastPrice": "100",
+                "priceChangePercent": "1",
+                "volume": "1",
+                "quoteVolume": "1",
+                "closeTime": NOW_MS + 10 * 60_000,
+            },
+            1.0,
+            NOW_MS,
+            "BTCUSDC",
+        )
+    with pytest.raises(ValueError, match="GDELT articles contained no usable titles"):
+        signals._fetch_gdelt_news(
+            lambda _url, _timeout: {"articles": [{"title": "Bitcoin future item", "seendate": "20231114T222320Z"}]},
+            1.0,
+            NOW_MS,
+            "cpu",
+        )
+    with pytest.raises(ValueError, match="Hacker News hits contained no usable titles"):
+        signals._fetch_hackernews_bitcoin(
+            lambda _url, _timeout: {"hits": [{"title": "Bitcoin future item", "created_at": "2023-11-14T22:23:20Z"}]},
+            1.0,
+            NOW_MS,
+            "cpu",
+        )
 
 
 def test_external_signal_bad_provider_payloads_and_no_cache_path(tmp_path) -> None:
@@ -744,6 +1278,7 @@ def test_external_signal_bad_provider_payloads_and_no_cache_path(tmp_path) -> No
         cache_path=tmp_path / "fresh.json",
         fetch_json=_good_fetch,
         force_refresh=False,
+        now_ms=NOW_MS,
     )
     assert fresh.fresh_count == 14
     no_cache_text = signals.render_external_signal_report(
@@ -836,6 +1371,38 @@ def test_news_provider_edge_payloads_and_backend_reason_render(tmp_path) -> None
         "cpu",
     )
     assert component.provider == "cryptocompare_btc_news"
+    stale_ms = NOW_MS - 10 * 24 * 3_600_000
+    stale_component, _backend = signals._fetch_cryptocompare_news(
+        lambda _url, _timeout: {
+            "Data": [
+                {
+                    "title": "Bitcoin adoption rally",
+                    "source": "stale",
+                    "published_on": stale_ms // 1000,
+                },
+                {"source": "untitled-now"},
+            ]
+        },
+        1.0,
+        NOW_MS,
+        "cpu",
+    )
+    assert stale_component.known_at_ms == stale_ms
+    with pytest.raises(ValueError, match="no usable titles"):
+        signals._fetch_cryptocompare_news(
+            lambda _url, _timeout: {
+                "Data": [
+                    {
+                        "title": "Bitcoin adoption rally",
+                        "source": "future",
+                        "published_on": (NOW_MS + 3_600_000) // 1000,
+                    }
+                ]
+            },
+            1.0,
+            NOW_MS,
+            "cpu",
+        )
 
     def gdelt_empty_articles(url: str, _timeout: float):
         if "gdeltproject" in url:

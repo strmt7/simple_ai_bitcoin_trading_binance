@@ -30,6 +30,7 @@ class ObjectiveSpec:
     scorer: Callable[[BacktestResult], float]
     min_closed_trades: int = 3
     min_realized_pnl: float | None = None
+    min_edge_vs_buy_hold: float | None = 0.0
     max_drawdown_rejection: float = 1.0  # 1.0 = never reject on drawdown alone
     training: "ObjectiveTraining | None" = None
 
@@ -42,6 +43,8 @@ class ObjectiveSpec:
         if result.closed_trades < max(0, int(self.min_closed_trades)):
             return False
         if self.min_realized_pnl is not None and result.realized_pnl <= self.min_realized_pnl:
+            return False
+        if self.min_edge_vs_buy_hold is not None and result.edge_vs_buy_hold < self.min_edge_vs_buy_hold:
             return False
         if self.max_drawdown_rejection < 1.0 and result.max_drawdown > self.max_drawdown_rejection:
             return False
@@ -302,10 +305,13 @@ def rank_candidates(
         reject_reason: str | None = None
         if not accepted:
             reasons: list[str] = []
+            min_edge_vs_buy_hold = getattr(objective, "min_edge_vs_buy_hold", None)
             if result.closed_trades < objective.min_closed_trades:
                 reasons.append(f"closed_trades<{objective.min_closed_trades}")
             if objective.min_realized_pnl is not None and result.realized_pnl <= objective.min_realized_pnl:
                 reasons.append(f"realized_pnl<={objective.min_realized_pnl}")
+            if min_edge_vs_buy_hold is not None and result.edge_vs_buy_hold < min_edge_vs_buy_hold:
+                reasons.append(f"edge_vs_buy_hold<{min_edge_vs_buy_hold}")
             if objective.max_drawdown_rejection < 1.0 and result.max_drawdown > objective.max_drawdown_rejection:
                 reasons.append(f"max_drawdown>{objective.max_drawdown_rejection}")
             if result.stopped_by_drawdown and objective.max_drawdown_rejection < 0.5:

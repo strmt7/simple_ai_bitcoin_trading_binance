@@ -31,6 +31,23 @@ class _FakeStatic:
         self.value = ""
         self.size = type("Size", (), {"width": 70})()
         self.classes: dict[str, bool] = {}
+        self.scroll_visible_calls = 0
+
+    def update(self, value: str) -> None:
+        self.value = value
+
+    def set_class(self, active: bool, name: str) -> None:
+        self.classes[name] = active
+
+    def scroll_visible(self, *, animate: bool = True) -> None:
+        assert animate is False
+        self.scroll_visible_calls += 1
+
+
+class _FakeStaticNoScroll:
+    def __init__(self) -> None:
+        self.value = ""
+        self.classes: dict[str, bool] = {}
 
     def update(self, value: str) -> None:
         self.value = value
@@ -245,6 +262,9 @@ def test_multi_select_screen_behaviors(monkeypatch) -> None:
     screen.action_page_up()
     screen.action_first()
     screen.action_last()
+    rows["#feature-row-1"] = _FakeStaticNoScroll()
+    screen._set_highlighted_index(1)
+    screen._set_highlighted_index(0)
     screen.action_toggle_highlighted()
     screen.action_toggle_index(0)
     screen.action_toggle_index(99)
@@ -345,7 +365,7 @@ def test_operator_app_methods(monkeypatch) -> None:
 
     asyncio.run(app._execute_action(app.actions_data[0]))
     assert "sync output" in widgets["#log"].lines
-    assert widgets["#status"].value == "Sync complete (1)"
+    assert widgets["#status"].value == "Sync failed (1)"
 
     widgets["#actions"].highlighted = 1
     asyncio.run(app.action_run_selected())
@@ -378,9 +398,9 @@ def test_operator_app_methods(monkeypatch) -> None:
 
     asyncio.run(app.on_option_list_option_selected(_FakeOptionEvent(widgets["#actions"], 0)))
     assert widgets["#actions"].highlighted == 0
-    assert widgets["#status"].value == "Sync complete (1)"
+    assert widgets["#status"].value == "Sync failed (1)"
     asyncio.run(app.on_option_list_option_selected(_FakeOptionEvent(_FakeOptionList("other"), 1)))
-    assert widgets["#status"].value == "Sync complete (1)"
+    assert widgets["#status"].value == "Sync failed (1)"
 
 
 def test_operator_app_global_actions_are_blocked_while_modal_is_open(monkeypatch) -> None:
@@ -1084,7 +1104,7 @@ def test_operator_app_live_keyboard_navigation_keeps_context_visible() -> None:
 
             await pilot.press("enter")
             await pilot.pause()
-            assert str(app.query_one("#status").content) == "Two complete (1)"
+            assert str(app.query_one("#status").content) == "Two failed (1)"
             assert calls[-1:] == ["two"]
 
             await pilot.press("k")
@@ -1234,6 +1254,10 @@ def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
     screen.action_last()
     assert fake_list.highlighted == 2
     assert rows["#menu-row-2"].value == "> 3. Label three"
+    assert rows["#menu-row-2"].scroll_visible_calls > 0
+    rows["#menu-row-2"] = _FakeStaticNoScroll()
+    screen._sync_rows()
+    assert rows["#menu-row-2"].value == "> 3. Label three"
     screen.action_select_index(1)
     screen.action_select_index(99)
     screen._highlighted = 0
@@ -1252,6 +1276,7 @@ def test_menu_screen_dismisses_on_selection_and_buttons(monkeypatch) -> None:
     empty_list = _FakeMenuList()
     monkeypatch.setattr(empty_screen, "query_one", lambda _selector, _cls=None: empty_list)
     monkeypatch.setattr(empty_screen, "dismiss", lambda value: empty_dismissed.append(value))
+    empty_screen._sync_rows()
     empty_screen.action_cursor_down()
     empty_screen.action_select_highlighted()
     assert empty_dismissed == [None]

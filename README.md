@@ -39,7 +39,7 @@ simple-ai-trading objectives # preview Conservative / Default / Risky presets
 If your shell does not expose the console entrypoint:
 
 ```bash
-PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance.cli shell
+PYTHONPATH=src python3 -m simple_ai_bitcoin_trading_binance shell
 ```
 
 On Windows from this checkout, prefer Windows Terminal and the bundled `.cmd`
@@ -51,12 +51,25 @@ cd C:\trader\simple_ai_bitcoin_trading_binance
 .\run-gui.cmd
 ```
 
+The Windows launchers print the interpreter or console script they selected.
+They try `.venv311`, `.venv`, `simple-ai-trading` on `PATH`, then Python module
+execution via local venv Python, `py -3.11`, or a `python` command that is
+Python 3.11 or newer.
+
 If you want to bypass the launcher, call the virtual-environment executable
 directly from the terminal:
 
 ```powershell
 .\.venv311\Scripts\simple-ai-trading.exe shell
 .\.venv311\Scripts\simple-ai-trading.exe menu
+```
+
+On Linux or macOS from this checkout, the matching launchers use the same
+resolution order with POSIX paths:
+
+```bash
+sh ./run-shell.sh
+sh ./run-gui.sh
 ```
 
 `shell` is the robust slash-command REPL and falls back to plain ASCII when a
@@ -326,6 +339,11 @@ BINANCE_SPOT_BASE_URL=https://spot-proxy.local simple-ai-trading connect
 BINANCE_FUTURES_BASE_URL=https://futures-proxy.local simple-ai-trading connect
 ```
 
+The local CLI reads these from the process environment; it does not load
+`.env` files by itself. Export variables in your shell, prefix the command as
+shown above, or let Docker Compose read a local `.env` file and pass the listed
+values through `docker-compose.yml`.
+
 ## Interactive console capabilities
 
 ### Connection Settings
@@ -461,23 +479,28 @@ architecture, CLI, or workflow redesigns.
 
 ```bash
 docker build -t simple-ai-trading:dev .
-docker compose run --rm simple-ai-trading                 # opens /shell
+docker compose run --rm simple-ai-trading                 # opens shell
 docker compose run --rm simple-ai-trading objectives      # one-shot command
 ```
 
 Config and data live in named Docker volumes (`simple-ai-config`,
-`simple-ai-data`).  Secrets are never baked into the image — the `configure`
+`simple-ai-data`).  The image and Compose service both use
+`/home/trader/work` as the working directory, so relative `data/` paths land on
+the data volume mounted at `/home/trader/work/data`. Secrets are never baked
+into the image — the `configure`
 command writes them to a `0600` file under the mounted config volume at
 runtime.
 
 ### Push with a PAT
 
 ```bash
-GITHUB_TOKEN=<github_pat> python3 tools/push_with_pat.py origin feat/my-branch
+python3 tools/push_with_pat.py origin feat/my-branch
 ```
 
 The helper serves the token to `git push` over a short-lived UNIX socket so it
-never appears in `argv`, remote URLs, `~/.git-credentials`, or shell history.
+never appears in `argv`, remote URLs, or `~/.git-credentials`. Enter the token
+at the hidden prompt when the helper asks for it; do not type it into the shell
+command line.
 
 ## Limitations
 

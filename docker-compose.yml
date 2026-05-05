@@ -5,11 +5,16 @@ services:
     # One operator, interactive by default — docker compose run for one-shots.
     stdin_open: true
     tty: true
-    read_only: false
+    read_only: true
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     environment:
       NO_COLOR: "${NO_COLOR:-}"
+      FORCE_COLOR: "${FORCE_COLOR:-}"
       BINANCE_BASE_URL: "${BINANCE_BASE_URL:-}"
       BINANCE_SPOT_BASE_URL: "${BINANCE_SPOT_BASE_URL:-}"
       BINANCE_FUTURES_BASE_URL: "${BINANCE_FUTURES_BASE_URL:-}"
@@ -18,6 +23,7 @@ services:
       - simple-ai-config:/home/trader/.config
       # candle JSON, trained models, backtest reports, autonomous artifacts
       - simple-ai-data:/home/trader/work/data
+    # Match the image WORKDIR so relative data/ paths land on the data volume.
     working_dir: /home/trader/work
     command: ["shell"]
 

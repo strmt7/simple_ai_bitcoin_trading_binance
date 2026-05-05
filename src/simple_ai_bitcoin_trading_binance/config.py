@@ -19,7 +19,7 @@ _STRATEGY_FIELD_NAMES = frozenset(field.name for field in fields(StrategyConfig)
 
 def _read_config_json(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     if not isinstance(payload, dict):

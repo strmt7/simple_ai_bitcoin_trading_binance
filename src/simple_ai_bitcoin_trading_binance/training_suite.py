@@ -19,6 +19,7 @@ spawning subprocesses.
 
 from __future__ import annotations
 
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -268,6 +269,8 @@ def _calibrate_candidate_threshold(
     *,
     market_type: str,
     starting_cash: float,
+    compute_backend: str | None = None,
+    score_batch_size: int = 8192,
 ) -> tuple[float, str, float | None]:
     if not rows:
         return strategy.signal_threshold, "strategy", None
@@ -284,9 +287,17 @@ def _calibrate_candidate_threshold(
         start=0.05,
         end=0.95,
         steps=121,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
     )
     candidate_report = evaluate_classification(list(rows), model, threshold=profit_report.best_threshold)
-    if profit_report.accepted and _threshold_guard(baseline_report, candidate_report):
+    profit_backed = (
+        profit_report.accepted
+        and profit_report.realized_pnl > 0.0
+        and profit_report.closed_trades > 0
+        and profit_report.score > 0.0
+    )
+    if profit_backed and _threshold_guard(baseline_report, candidate_report):
         return float(profit_report.threshold), "profit_backtest", float(profit_report.score)
     classification_report = evaluate_classification(list(rows), model, threshold=classification_threshold)
     if (
@@ -298,20 +309,21 @@ def _calibrate_candidate_threshold(
     return strategy_threshold, "strategy", float(profit_report.baseline_score)
 
 
-def _refine_threshold_on_validation_rows(
+def _refine_threshold_on_selection_rows(
     model: TrainedModel,
     rows: Sequence[ModelRow],
     strategy: StrategyConfig,
     *,
     market_type: str,
     starting_cash: float,
+    compute_backend: str | None = None,
+    score_batch_size: int = 8192,
 ) -> tuple[float, str, float] | None:
-    """Promote a validation-set profit threshold only when it remains directional.
+    """Promote a selection-set profit threshold only when it remains directional.
 
-    Candidate selection already uses the validation split for model ranking; this
-    lets the selected artifact carry the same threshold that produced that
-    validation score instead of freezing a calibration-only threshold that may
-    trade poorly out-of-sample.
+    The final chronological holdout is deliberately excluded from this helper.
+    It can be used to tune the threshold carried into selection, but not to
+    adjust the artifact after final holdout scoring.
     """
 
     if len(rows) < 30:
@@ -332,6 +344,8 @@ def _refine_threshold_on_validation_rows(
                 strategy,
                 starting_cash=starting_cash,
                 market_type=market_type,
+                compute_backend=compute_backend,
+                score_batch_size=score_batch_size,
             )
             if result.realized_pnl <= 0.0 or result.closed_trades <= 0:
                 continue
@@ -352,7 +366,30 @@ def _refine_threshold_on_validation_rows(
         model.decision_threshold = current_threshold
     if best_threshold is None:
         return None
-    return best_threshold, "validation_profit_backtest", best_score
+    return best_threshold, "selection_profit_backtest", best_score
+
+
+def _refine_threshold_on_validation_rows(
+    model: TrainedModel,
+    rows: Sequence[ModelRow],
+    strategy: StrategyConfig,
+    *,
+    market_type: str,
+    starting_cash: float,
+    compute_backend: str | None = None,
+    score_batch_size: int = 8192,
+) -> tuple[float, str, float] | None:
+    """Compatibility wrapper for older internal tests/callers."""
+
+    return _refine_threshold_on_selection_rows(
+        model,
+        rows,
+        strategy,
+        market_type=market_type,
+        starting_cash=starting_cash,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
+    )
 
 
 def _threshold_values(start: float, end: float, steps: int, baseline: float) -> list[float]:
@@ -463,11 +500,13 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
     ensemble_seeds: tuple[int, ...] | None = payload.get("ensemble_seeds")
     compute_backend = str(payload.get("compute_backend") or "cpu")
     batch_size = int(payload.get("batch_size") or 8192)
+    score_batch_size = int(payload.get("score_batch_size") or batch_size)
     include_full_fit_fallback = bool(payload.get("include_full_fit_fallback", True))
 
     objective = get_objective(objective_name)
     training = _default_training(objective)
-    fit_rows, calibration_rows = _calibration_split(rows_train)
+    model_train_rows, selection_rows = _walk_forward_split(rows_train)
+    fit_rows, calibration_rows = _calibration_split(model_train_rows)
     model, report = train_advanced(
         fit_rows,
         feature_cfg,
@@ -501,6 +540,8 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
             strategy,
             market_type=market_type,
             starting_cash=starting_cash,
+            compute_backend=compute_backend,
+            score_batch_size=score_batch_size,
         )
         model.decision_threshold = float(threshold)
         model.threshold_source = threshold_source
@@ -510,29 +551,51 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         model.decision_threshold = float(strategy.signal_threshold)
         model.threshold_source = "strategy"
-    validation_threshold = _refine_threshold_on_validation_rows(
+    selection_threshold = _refine_threshold_on_selection_rows(
         model,
-        rows_eval,
+        selection_rows,
         strategy,
         market_type=market_type,
         starting_cash=starting_cash,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
     )
-    if validation_threshold is not None:
-        threshold, threshold_source, threshold_score = validation_threshold
+    if selection_threshold is not None:
+        threshold, threshold_source, threshold_score = selection_threshold
         model.decision_threshold = float(threshold)
         model.threshold_source = threshold_source
         model.threshold_calibration_score = threshold_score
-        model.threshold_calibration_trades = len(rows_eval)
+        model.threshold_calibration_trades = len(selection_rows)
     _attach_strategy_overrides(model, strategy)
     model.validation_size = len(rows_eval)
-    result = run_backtest(rows_eval, model, strategy, starting_cash=starting_cash, market_type=market_type)
-    validation_score = objective.score(result) if objective.accepts(result) else float("-inf")
+    selection_result = run_backtest(
+        selection_rows,
+        model,
+        strategy,
+        starting_cash=starting_cash,
+        market_type=market_type,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
+    )
+    selection_score = objective.score(selection_result) if objective.accepts(selection_result) else float("-inf")
+    holdout_result = run_backtest(
+        rows_eval,
+        model,
+        strategy,
+        starting_cash=starting_cash,
+        market_type=market_type,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
+    )
+    validation_score = objective.score(holdout_result) if objective.accepts(holdout_result) else float("-inf")
     full_result = run_backtest(
         rows_train + rows_eval,
         model,
         strategy,
         starting_cash=starting_cash,
         market_type=market_type,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
     )
     full_sample_score = objective.score(full_result) if objective.accepts(full_result) else float("-inf")
     score = min(validation_score, full_sample_score)
@@ -540,7 +603,7 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
 
     if calibration_rows and include_full_fit_fallback:
         fallback_model, fallback_report = train_advanced(
-            rows_train,
+            model_train_rows,
             feature_cfg,
             epochs=candidate.epochs,
             learning_rate=candidate.learning_rate,
@@ -552,12 +615,14 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
         )
         fallback_model.decision_threshold = float(strategy.signal_threshold)
         fallback_model.threshold_source = "strategy_full_fit"
-        fallback_threshold = _refine_threshold_on_validation_rows(
+        fallback_threshold = _refine_threshold_on_selection_rows(
             fallback_model,
-            rows_eval,
+            selection_rows,
             strategy,
             market_type=market_type,
             starting_cash=starting_cash,
+            compute_backend=compute_backend,
+            score_batch_size=score_batch_size,
         )
         fallback_threshold_score = None
         if fallback_threshold is not None:
@@ -565,19 +630,35 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
             fallback_model.decision_threshold = float(threshold)
             fallback_model.threshold_source = threshold_source
             fallback_model.threshold_calibration_score = fallback_threshold_score
-            fallback_model.threshold_calibration_trades = len(rows_eval)
+            fallback_model.threshold_calibration_trades = len(selection_rows)
         _attach_strategy_overrides(fallback_model, strategy)
         fallback_model.validation_size = len(rows_eval)
-        fallback_result = run_backtest(
+        fallback_selection_result = run_backtest(
+            selection_rows,
+            fallback_model,
+            strategy,
+            starting_cash=starting_cash,
+            market_type=market_type,
+            compute_backend=compute_backend,
+            score_batch_size=score_batch_size,
+        )
+        fallback_selection_score = (
+            objective.score(fallback_selection_result)
+            if objective.accepts(fallback_selection_result)
+            else float("-inf")
+        )
+        fallback_holdout_result = run_backtest(
             rows_eval,
             fallback_model,
             strategy,
             starting_cash=starting_cash,
             market_type=market_type,
+            compute_backend=compute_backend,
+            score_batch_size=score_batch_size,
         )
         fallback_validation_score = (
-            objective.score(fallback_result)
-            if objective.accepts(fallback_result)
+            objective.score(fallback_holdout_result)
+            if objective.accepts(fallback_holdout_result)
             else float("-inf")
         )
         fallback_full_result = run_backtest(
@@ -586,6 +667,8 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
             strategy,
             starting_cash=starting_cash,
             market_type=market_type,
+            compute_backend=compute_backend,
+            score_batch_size=score_batch_size,
         )
         fallback_full_score = (
             objective.score(fallback_full_result)
@@ -599,6 +682,7 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
             report = fallback_report
             threshold_score = fallback_threshold_score
             selected_calibration_rows = 0
+            selection_score = fallback_selection_score
             validation_score = fallback_validation_score
             full_sample_score = fallback_full_score
 
@@ -614,6 +698,7 @@ def _evaluate_candidate(payload: dict[str, Any]) -> dict[str, Any]:
         "threshold_score": threshold_score,
         "calibration_rows": selected_calibration_rows,
         "validation_rows": len(rows_eval),
+        "selection_score": float(selection_score),
         "validation_score": float(validation_score),
         "full_sample_score": float(full_sample_score),
         "ensemble_refined": bool(ensemble_seeds),
@@ -648,6 +733,7 @@ def train_for_objective(
     max_workers: int | None = None,
     compute_backend: str | None = None,
     batch_size: int = 8192,
+    score_batch_size: int | None = None,
 ) -> ObjectiveOutcome:
     """Run the training suite for one objective, returning the outcome.
 
@@ -666,6 +752,7 @@ def train_for_objective(
     if not candidates:
         raise ValueError("Candidate grid produced zero evaluable entries")
     train_rows, eval_rows = _walk_forward_split(rows)
+    effective_score_batch_size = int(score_batch_size if score_batch_size is not None else batch_size)
 
     if runner is not None:
         results: list[dict[str, Any]] = []
@@ -703,6 +790,7 @@ def train_for_objective(
                 "starting_cash": starting_cash,
                 "compute_backend": compute_backend or "cpu",
                 "batch_size": batch_size,
+                "score_batch_size": effective_score_batch_size,
                 "include_full_fit_fallback": True,
             }
             for candidate in candidates
@@ -735,6 +823,7 @@ def train_for_objective(
                 "starting_cash": starting_cash,
                 "compute_backend": compute_backend or "cpu",
                 "batch_size": batch_size,
+                "score_batch_size": effective_score_batch_size,
                 "include_full_fit_fallback": True,
             })
             local_results.append(local_result)
@@ -754,12 +843,15 @@ def train_for_objective(
                 "ensemble_seeds": _ensemble_seed_pack(int(base_result["candidate"].seed)),
                 "compute_backend": compute_backend or "cpu",
                 "batch_size": batch_size,
+                "score_batch_size": effective_score_batch_size,
                 "include_full_fit_fallback": True,
             })
             if ensemble_result["score"] > best["score"] + 1e-12:
                 best = ensemble_result
 
     rejected = sum(1 for entry in results if entry["score"] == float("-inf"))
+    if not math.isfinite(float(best["score"])):
+        raise ValueError(f"All {objective.name} training candidates were rejected by objective gates")
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / f"model_{objective.name}.json"
     serialize_model(best["model"], model_path)
@@ -826,6 +918,7 @@ def run_training_suite(
     max_workers: int | None = None,
     compute_backend: str | None = None,
     batch_size: int = 8192,
+    score_batch_size: int | None = None,
 ) -> SuiteReport:
     """Train one model per objective and persist a suite summary."""
 
@@ -844,6 +937,8 @@ def run_training_suite(
             extra["compute_backend"] = compute_backend
         if int(batch_size) != 8192:
             extra["batch_size"] = int(batch_size)
+        if score_batch_size is not None:
+            extra["score_batch_size"] = int(score_batch_size)
         outcome = train_for_objective(
             candles, base_strategy, spec,
             output_dir=output_dir,

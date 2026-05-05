@@ -30,7 +30,10 @@ class _EncodingStream:
 def test_supports_color_no_color_env(monkeypatch):
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.setattr(style.os, "name", "posix")
     assert style.supports_color(_FakeStream(tty=True)) is False
+    assert style.supports_ansi_terminal(_FakeStream(tty=True)) is True
 
 
 def test_supports_color_force_color_env(monkeypatch):
@@ -42,8 +45,15 @@ def test_supports_color_force_color_env(monkeypatch):
 def test_supports_color_tty_true(monkeypatch):
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
     monkeypatch.setattr(style.os, "name", "posix")
     assert style.supports_color(_FakeStream(tty=True)) is True
+
+
+def test_supports_ansi_rejects_posix_dumb_terminal(monkeypatch):
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setattr(style.os, "name", "posix")
+    assert style.supports_ansi_terminal(_FakeStream(tty=True)) is False
 
 
 def test_supports_color_tty_false(monkeypatch):

@@ -156,11 +156,11 @@ def build_risk_policy_report(
     checks.append(_check(cash_status, "managed USDC", f"{cash:.2f}", metric=cash, limit=">0"))
     checks.append(
         _check(
-            "ok" if effective_leverage <= 25.0 else "warn",
+            "ok" if effective_leverage <= 25.0 else ("warn" if dry_run or effective_leverage <= 50.0 else "block"),
             "effective leverage",
             f"{effective_leverage:.1f}x",
             metric=effective_leverage,
-            limit=25.0,
+            limit="<=50 hard",
         )
     )
     risk_per_trade = _finite(strategy.risk_per_trade)
@@ -176,20 +176,20 @@ def build_risk_policy_report(
     max_position = _finite(strategy.max_position_pct)
     checks.append(
         _check(
-            "block" if max_position <= 0.0 else ("ok" if max_position <= 0.50 else "warn"),
+            "block" if max_position <= 0.0 else ("ok" if max_position <= 0.50 else ("warn" if dry_run or max_position <= 0.75 else "block")),
             "max position",
             f"{max_position:.2%}",
             metric=max_position,
-            limit=0.50,
+            limit="<=75% hard",
         )
     )
     checks.append(
         _check(
-            "ok" if notional_cap_pct <= 0.50 else "warn",
+            "ok" if notional_cap_pct <= 0.50 else ("warn" if dry_run or notional_cap_pct <= 0.75 else "block"),
             "entry notional cap",
             f"{notional_cap_pct:.2%} of equity",
             metric=notional_cap_pct,
-            limit=0.50,
+            limit="<=75% hard",
         )
     )
     stop_loss = _finite(strategy.stop_loss_pct)
@@ -234,11 +234,11 @@ def build_risk_policy_report(
     else:
         checks.append(
             _check(
-                "ok" if drawdown_limit <= 0.50 else "warn",
+                "ok" if drawdown_limit <= 0.35 else ("warn" if dry_run or drawdown_limit <= 0.50 else "block"),
                 "drawdown stop",
                 f"{drawdown_limit:.2%}",
                 metric=drawdown_limit,
-                limit=0.50,
+                limit="<=50% hard",
             )
         )
     slippage_bps = _finite(strategy.slippage_bps)

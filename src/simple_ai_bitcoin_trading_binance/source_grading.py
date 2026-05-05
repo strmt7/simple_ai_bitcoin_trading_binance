@@ -25,8 +25,11 @@ _AI_GRADING_RECOVERABLE_ERRORS = (
     TypeError,
     ValueError,
 )
-_AI_GRADE_BATCH_SIZE = 12
+_AI_GRADE_BATCH_SIZE = 4
 _AI_SINGLE_FILL_LIMIT = 24
+_AI_GRADE_MAX_BATCHES = 6
+_AI_GRADE_ROLLUP_LIMIT = _AI_GRADE_BATCH_SIZE * _AI_GRADE_MAX_BATCHES
+_AI_DISABLED_MODEL_NAMES = {"", "0", "false", "none", "off", "disabled"}
 
 
 @dataclass(frozen=True)
@@ -60,20 +63,44 @@ def _clamp_int(value: object, low: int, high: int, default: int) -> int:
     return max(low, min(high, parsed))
 
 
+def _ollama_grading_requested(*, enabled: bool, model: str, timeout_seconds: float) -> tuple[bool, str]:
+    if not enabled:
+        return False, "disabled"
+    if str(model or "").strip().lower() in _AI_DISABLED_MODEL_NAMES:
+        return False, "disabled"
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+        return False, "skipped"
+    return True, "enabled"
+
+
 def _heuristic_grade(rollup: Mapping[str, object]) -> tuple[int, str]:
     samples = max(0, int(float(rollup.get("sample_count") or 0)))
     avg_confidence = max(0.0, min(1.0, float(rollup.get("avg_confidence") or 0.0)))
     avg_abs_score = max(0.0, min(1.0, float(rollup.get("avg_abs_score") or 0.0)))
     raw_records = max(0, int(float(rollup.get("raw_records") or 0)))
     component_records = max(0, int(float(rollup.get("component_records") or 0)))
+    outcome_records = max(0, int(float(rollup.get("outcome_records") or 0)))
+    directional_accuracy_raw = rollup.get("directional_accuracy")
+    try:
+        directional_accuracy = (
+            None
+            if directional_accuracy_raw is None
+            else max(0.0, min(1.0, float(directional_accuracy_raw)))
+        )
+    except (TypeError, ValueError, OverflowError):
+        directional_accuracy = None
     sample_bonus = min(3.0, math.log(samples + 1.0) * 1.15)
     evidence_bonus = 1.0 if raw_records and component_records else (0.4 if raw_records or component_records else 0.0)
-    grade = round(1.5 + sample_bonus + avg_confidence * 3.0 + avg_abs_score * 2.0 + evidence_bonus)
+    outcome_bonus = 0.0 if directional_accuracy is None else (directional_accuracy - 0.5) * min(4.0, 1.0 + math.log(outcome_records + 1.0))
+    grade = round(1.5 + sample_bonus + avg_confidence * 3.0 + avg_abs_score * 2.0 + evidence_bonus + outcome_bonus)
     bounded = max(0, min(10, int(grade)))
     reason = (
         f"samples={samples} confidence={avg_confidence:.2f} "
-        f"actionability={avg_abs_score:.2f} raw={raw_records}"
+        f"actionability={avg_abs_score:.2f} raw={raw_records} "
+        f"outcomes={outcome_records}"
     )
+    if directional_accuracy is not None:
+        reason = f"{reason} directional_accuracy={directional_accuracy:.2f}"
     return bounded, reason
 
 
@@ -83,7 +110,8 @@ def _grade_prompt(rollups: list[dict[str, object]]) -> str:
             f"{row['source']}|{row['horizon']}|s={row['sample_count']}|"
             f"score={float(row['avg_score']):+.2f}|abs={float(row['avg_abs_score']):.2f}|"
             f"conf={float(row['avg_confidence']):.2f}|raw={row['raw_records']}|"
-            f"comp={row['component_records']}"
+            f"comp={row['component_records']}|out={row.get('outcome_records', 0)}|"
+            f"hit={row.get('directional_accuracy')}"
         )
         for row in rollups[:120]
     ]
@@ -102,7 +130,8 @@ def _single_grade_prompt(row: Mapping[str, object]) -> str:
         f"{row['source']}|{row['horizon']}|s={row['sample_count']}|"
         f"score={float(row['avg_score']):+.2f}|abs={float(row['avg_abs_score']):.2f}|"
         f"conf={float(row['avg_confidence']):.2f}|raw={row['raw_records']}|"
-        f"comp={row['component_records']}"
+        f"comp={row['component_records']}|out={row.get('outcome_records', 0)}|"
+        f"hit={row.get('directional_accuracy')}"
     )
 
 
@@ -124,7 +153,46 @@ def _json_mapping_from_text(text: str) -> Mapping[str, object]:
     return parsed
 
 
-def _ollama_chat_request(model: str, prompt: str, *, num_ctx: int, num_predict: int) -> dict[str, object]:
+def _grade_response_schema(rollups: list[dict[str, object]]) -> dict[str, object]:
+    keys = [f"{row['source']}|{row['horizon']}" for row in rollups]
+    return {
+        "type": "object",
+        "properties": {
+            "grades": {
+                "type": "object",
+                "properties": {
+                    key: {"type": "integer", "minimum": 0, "maximum": 10}
+                    for key in keys
+                },
+                "required": keys,
+                "additionalProperties": False,
+            }
+        },
+        "required": ["grades"],
+        "additionalProperties": False,
+    }
+
+
+def _single_grade_response_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "grade": {"type": "integer", "minimum": 0, "maximum": 10},
+            "reason": {"type": "string"},
+        },
+        "required": ["grade", "reason"],
+        "additionalProperties": False,
+    }
+
+
+def _ollama_chat_request(
+    model: str,
+    prompt: str,
+    *,
+    num_ctx: int,
+    num_predict: int,
+    response_format: object = "json",
+) -> dict[str, object]:
     return {
         "model": model,
         "messages": [
@@ -135,7 +203,7 @@ def _ollama_chat_request(model: str, prompt: str, *, num_ctx: int, num_predict: 
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "format": "json",
+        "format": response_format,
         "think": False,
         "keep_alive": "30m",
         "options": {"temperature": 0, "num_ctx": num_ctx, "num_predict": num_predict},
@@ -154,7 +222,13 @@ def _ai_grade_batch(
     endpoint = f"{str(base_url or DEFAULT_OLLAMA_URL).rstrip('/')}/api/chat"
     payload = post_json(
         endpoint,
-        _ollama_chat_request(model, _grade_prompt(rollups), num_ctx=4096, num_predict=1536),
+        _ollama_chat_request(
+            model,
+            _grade_prompt(rollups),
+            num_ctx=1024,
+            num_predict=128,
+            response_format=_grade_response_schema(rollups),
+        ),
         timeout_seconds,
     )
     latency_ms = int((time.perf_counter() - started) * 1000)
@@ -177,9 +251,17 @@ def _ai_grade_batch(
         return output, latency_ms
     output: dict[tuple[str, str], tuple[int, str]] = {}
     if isinstance(raw_grades, Mapping):
-        for key, grade_value in raw_grades.items():
+        grade_items = list(raw_grades.items())
+        positional_recovery = len(grade_items) == len(rollups)
+        for index, (key, grade_value) in enumerate(grade_items):
             source, sep, horizon = str(key).partition("|")
             if not source or not sep:
+                if not positional_recovery:
+                    continue
+                rollup = rollups[index]
+                source = str(rollup["source"])
+                horizon = str(rollup["horizon"] or "medium")
+                output[(source, horizon)] = (_clamp_int(grade_value, 0, 10, 5), "AI grade (positional recovery)")
                 continue
             output[(source, horizon or "medium")] = (_clamp_int(grade_value, 0, 10, 5), "AI grade")
         return output, latency_ms
@@ -218,7 +300,13 @@ def _ai_grade_single(
     endpoint = f"{str(base_url or DEFAULT_OLLAMA_URL).rstrip('/')}/api/chat"
     payload = post_json(
         endpoint,
-        _ollama_chat_request(model, _single_grade_prompt(rollup), num_ctx=1024, num_predict=128),
+        _ollama_chat_request(
+            model,
+            _single_grade_prompt(rollup),
+            num_ctx=512,
+            num_predict=64,
+            response_format=_single_grade_response_schema(),
+        ),
         timeout_seconds,
     )
     latency_ms = int((time.perf_counter() - started) * 1000)
@@ -246,33 +334,63 @@ def _ai_grades(
     base_url: str,
     timeout_seconds: float,
     post_json: PostJson,
+    max_batches: int | None = None,
+    max_single_fills: int = _AI_SINGLE_FILL_LIMIT,
+    max_total_seconds: float | None = None,
 ) -> tuple[dict[tuple[str, str], tuple[int, str]], int]:
     output: dict[tuple[str, str], tuple[int, str]] = {}
     total_latency_ms = 0
     batch_size = _AI_GRADE_BATCH_SIZE
     single_fills = 0
+    batches_used = 0
+    batch_limit = None if max_batches is None else max(0, int(max_batches))
+    single_fill_limit = max(0, int(max_single_fills))
+    per_call_timeout = max(0.1, float(timeout_seconds))
+    total_budget = per_call_timeout if max_total_seconds is None else max(0.1, float(max_total_seconds))
+    deadline = time.monotonic() + total_budget
+
+    def remaining_call_timeout() -> float | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return None
+        return max(0.1, min(per_call_timeout, remaining))
+
     for start in range(0, len(rollups), batch_size):
-        batch_output, latency_ms = _ai_grade_batch(
-            rollups[start:start + batch_size],
-            model=model,
-            base_url=base_url,
-            timeout_seconds=timeout_seconds,
-            post_json=post_json,
-        )
+        if batch_limit is not None and batches_used >= batch_limit:
+            break
+        call_timeout = remaining_call_timeout()
+        if call_timeout is None:
+            break
+        try:
+            batch_output, latency_ms = _ai_grade_batch(
+                rollups[start:start + batch_size],
+                model=model,
+                base_url=base_url,
+                timeout_seconds=call_timeout,
+                post_json=post_json,
+            )
+        except _AI_GRADING_RECOVERABLE_ERRORS:
+            if output:
+                break
+            raise
+        batches_used += 1
         output.update(batch_output)
         total_latency_ms += latency_ms
         for rollup in rollups[start:start + batch_size]:
             key = (str(rollup["source"]), str(rollup["horizon"] or "medium"))
             if key in output:
                 continue
-            if single_fills >= _AI_SINGLE_FILL_LIMIT:
+            if single_fills >= single_fill_limit:
                 continue
+            call_timeout = remaining_call_timeout()
+            if call_timeout is None:
+                break
             try:
                 single_key, single_output, single_latency_ms = _ai_grade_single(
                     rollup,
                     model=model,
                     base_url=base_url,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=call_timeout,
                     post_json=post_json,
                 )
             except _AI_GRADING_RECOVERABLE_ERRORS:
@@ -292,6 +410,9 @@ def grade_sources(
     ollama_url: str = DEFAULT_OLLAMA_URL,
     ollama_timeout_seconds: float = 15.0,
     post_json: PostJson = _post_json,
+    ai_rollup_limit: int = _AI_GRADE_ROLLUP_LIMIT,
+    ai_max_batches: int | None = _AI_GRADE_MAX_BATCHES,
+    ai_max_single_fills: int = _AI_SINGLE_FILL_LIMIT,
     now_ms: int | None = None,
 ) -> SourceGradeRun:
     now = _now_ms() if now_ms is None else int(now_ms)
@@ -316,16 +437,40 @@ def grade_sources(
                 grades=[],
             )
         ai_output: dict[tuple[str, str], tuple[int, str]] = {}
-        if ollama_enabled:
-            try:
-                ai_output, ai_latency_ms = _ai_grades(
-                    rollups,
-                    model=model,
-                    base_url=ollama_url,
-                    timeout_seconds=ollama_timeout_seconds,
-                    post_json=post_json,
+        requested, disabled_status = _ollama_grading_requested(
+            enabled=bool(ollama_enabled),
+            model=model,
+            timeout_seconds=float(ollama_timeout_seconds),
+        )
+        if not requested:
+            ai_status = disabled_status
+            if disabled_status == "skipped":
+                warnings.append("ollama grading skipped: non-positive timeout budget")
+        else:
+            max_ai_rollups = max(0, int(ai_rollup_limit))
+            ai_rollups = rollups[:max_ai_rollups]
+            if len(ai_rollups) < len(rollups):
+                warnings.append(
+                    f"ollama grading limited to {len(ai_rollups)} of {len(rollups)} source horizons; heuristic filled the rest"
                 )
-                ai_status = "ok"
+            if not ai_rollups:
+                ai_status = "skipped"
+                warnings.append("ollama grading skipped: source horizon budget is zero")
+            else:
+                ai_status = "error"
+            try:
+                if ai_rollups:
+                    ai_output, ai_latency_ms = _ai_grades(
+                        ai_rollups,
+                        model=model,
+                        base_url=ollama_url,
+                        timeout_seconds=float(ollama_timeout_seconds),
+                        post_json=post_json,
+                        max_batches=ai_max_batches,
+                        max_single_fills=ai_max_single_fills,
+                        max_total_seconds=float(ollama_timeout_seconds),
+                    )
+                    ai_status = "ok"
             except _AI_GRADING_RECOVERABLE_ERRORS as exc:
                 ai_status = "error"
                 warnings.append(f"ollama grading unavailable: {exc}")

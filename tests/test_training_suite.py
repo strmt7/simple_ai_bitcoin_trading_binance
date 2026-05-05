@@ -31,7 +31,7 @@ from simple_ai_bitcoin_trading_binance.training_suite import (
     _calibrate_candidate_threshold,
     _evaluate_candidate,
     _local_refinement_candidates,
-    _refine_threshold_on_validation_rows,
+    _refine_threshold_on_selection_rows,
     _strategy_for_candidate,
     _threshold_guard,
     _threshold_values,
@@ -220,19 +220,22 @@ def test_calibrate_candidate_threshold_accepts_profit_threshold(monkeypatch: pyt
         SimpleNamespace(accuracy=0.60, f1=0.50, precision=0.45),
         SimpleNamespace(accuracy=0.63, f1=0.46, precision=0.44),
     ]
+    observed_calibration_kwargs: dict[str, object] = {}
 
-    monkeypatch.setattr(training_suite, "calibrate_threshold", lambda *a, **k: 0.41)
-    monkeypatch.setattr(training_suite, "evaluate_classification", lambda *a, **k: reports.pop(0))
-    monkeypatch.setattr(
-        training_suite,
-        "calibrate_threshold_for_backtest",
-        lambda *a, **k: SimpleNamespace(
+    def fake_profit_calibration(*a, **k):
+        observed_calibration_kwargs.update(k)
+        return SimpleNamespace(
             accepted=True,
             threshold=0.72,
             best_threshold=0.72,
             score=4.25,
-        ),
-    )
+            realized_pnl=4.25,
+            closed_trades=3,
+        )
+
+    monkeypatch.setattr(training_suite, "calibrate_threshold", lambda *a, **k: 0.41)
+    monkeypatch.setattr(training_suite, "evaluate_classification", lambda *a, **k: reports.pop(0))
+    monkeypatch.setattr(training_suite, "calibrate_threshold_for_backtest", fake_profit_calibration)
 
     threshold, source, score = _calibrate_candidate_threshold(
         _fake_trained_model(2),
@@ -240,11 +243,15 @@ def test_calibrate_candidate_threshold_accepts_profit_threshold(monkeypatch: pyt
         StrategyConfig(signal_threshold=0.60),
         market_type="spot",
         starting_cash=1000.0,
+        compute_backend="directml",
+        score_batch_size=64,
     )
 
     assert threshold == pytest.approx(0.72)
     assert source == "profit_backtest"
     assert score == pytest.approx(4.25)
+    assert observed_calibration_kwargs["compute_backend"] == "directml"
+    assert observed_calibration_kwargs["score_batch_size"] == 64
 
 
 def test_calibrate_candidate_threshold_rejects_weak_profit_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,6 +272,8 @@ def test_calibrate_candidate_threshold_rejects_weak_profit_threshold(monkeypatch
             best_threshold=0.81,
             score=1.5,
             baseline_score=-0.5,
+            realized_pnl=1.5,
+            closed_trades=2,
         ),
     )
 
@@ -279,6 +288,41 @@ def test_calibrate_candidate_threshold_rejects_weak_profit_threshold(monkeypatch
     assert threshold == pytest.approx(0.60)
     assert source == "strategy"
     assert score == pytest.approx(-0.5)
+
+
+def test_calibrate_candidate_threshold_rejects_unprofitable_profit_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    reports = [
+        SimpleNamespace(accuracy=0.60, f1=0.50, precision=0.45),
+        SimpleNamespace(accuracy=0.63, f1=0.46, precision=0.44),
+        SimpleNamespace(accuracy=0.63, f1=0.46, precision=0.44),
+    ]
+    monkeypatch.setattr(training_suite, "calibrate_threshold", lambda *a, **k: 0.43)
+    monkeypatch.setattr(training_suite, "evaluate_classification", lambda *a, **k: reports.pop(0))
+    monkeypatch.setattr(
+        training_suite,
+        "calibrate_threshold_for_backtest",
+        lambda *a, **k: SimpleNamespace(
+            accepted=True,
+            threshold=0.81,
+            best_threshold=0.81,
+            score=-50.0,
+            baseline_score=-100.0,
+            realized_pnl=0.0,
+            closed_trades=0,
+        ),
+    )
+
+    threshold, source, score = _calibrate_candidate_threshold(
+        _fake_trained_model(2),
+        _rows(12),
+        StrategyConfig(signal_threshold=0.60),
+        market_type="spot",
+        starting_cash=1000.0,
+    )
+
+    assert threshold == pytest.approx(0.60)
+    assert source == "strategy"
+    assert score == pytest.approx(-100.0)
 
 
 def test_calibrate_candidate_threshold_accepts_safe_classification_threshold(
@@ -301,6 +345,8 @@ def test_calibrate_candidate_threshold_accepts_safe_classification_threshold(
             best_threshold=0.43,
             score=0.2,
             baseline_score=0.2,
+            realized_pnl=0.0,
+            closed_trades=0,
         ),
     )
 
@@ -317,9 +363,11 @@ def test_calibrate_candidate_threshold_accepts_safe_classification_threshold(
     assert score == pytest.approx(0.2)
 
 
-def test_refine_threshold_on_validation_rows_promotes_positive_profit(
+def test_refine_threshold_on_selection_rows_promotes_positive_profit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    observed: list[tuple[str | None, int]] = []
+
     def fake_evaluate(*_args, **kwargs):
         threshold = float(kwargs.get("threshold", 0.5))
         if threshold <= 0.05:
@@ -327,6 +375,7 @@ def test_refine_threshold_on_validation_rows_promotes_positive_profit(
         return SimpleNamespace(accuracy=0.40, f1=0.20, precision=0.20, true_positive=1, false_negative=3)
 
     def fake_run_backtest(_rows, model, *_args, **_kwargs):
+        observed.append((_kwargs.get("compute_backend"), _kwargs.get("score_batch_size")))
         if float(model.decision_threshold or 0.0) <= 0.05:
             return SimpleNamespace(realized_pnl=1.75, closed_trades=3, max_drawdown=0.01)
         return SimpleNamespace(realized_pnl=-0.05, closed_trades=2, max_drawdown=0.02)
@@ -334,22 +383,26 @@ def test_refine_threshold_on_validation_rows_promotes_positive_profit(
     monkeypatch.setattr(training_suite, "evaluate_classification", fake_evaluate)
     monkeypatch.setattr(training_suite, "run_backtest", fake_run_backtest)
 
-    refined = _refine_threshold_on_validation_rows(
+    refined = _refine_threshold_on_selection_rows(
         _fake_trained_model(2),
         _rows(40),
         StrategyConfig(signal_threshold=0.60),
         market_type="spot",
         starting_cash=1000.0,
+        compute_backend="directml",
+        score_batch_size=64,
     )
 
     assert refined is not None
     threshold, source, score = refined
     assert threshold == pytest.approx(0.05)
-    assert source == "validation_profit_backtest"
+    assert source == "selection_profit_backtest"
     assert score == pytest.approx(1.75)
+    assert observed
+    assert all(item == ("directml", 64) for item in observed)
 
 
-def test_refine_threshold_on_validation_rows_rejects_losing_profit(
+def test_refine_threshold_on_selection_rows_rejects_losing_profit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -358,7 +411,7 @@ def test_refine_threshold_on_validation_rows_rejects_losing_profit(
         lambda *_a, **_k: SimpleNamespace(realized_pnl=-0.01, closed_trades=2, max_drawdown=0.01),
     )
 
-    refined = _refine_threshold_on_validation_rows(
+    refined = _refine_threshold_on_selection_rows(
         _fake_trained_model(2),
         _rows(40),
         StrategyConfig(signal_threshold=0.60),
@@ -367,6 +420,32 @@ def test_refine_threshold_on_validation_rows_rejects_losing_profit(
     )
 
     assert refined is None
+
+
+def test_refine_threshold_validation_wrapper_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_refine(*_args, **kwargs):
+        observed.update(kwargs)
+        return 0.5, "selection_profit_backtest", 1.0
+
+    monkeypatch.setattr(training_suite, "_refine_threshold_on_selection_rows", fake_refine)
+
+    refined = training_suite._refine_threshold_on_validation_rows(
+        _fake_trained_model(2),
+        _rows(40),
+        StrategyConfig(signal_threshold=0.60),
+        market_type="spot",
+        starting_cash=1000.0,
+        compute_backend="directml",
+        score_batch_size=12,
+    )
+
+    assert refined == (0.5, "selection_profit_backtest", 1.0)
+    assert observed["compute_backend"] == "directml"
+    assert observed["score_batch_size"] == 12
 
 
 # ----- _walk_forward_split --------------------------------------------------
@@ -561,6 +640,8 @@ def test_evaluate_candidate_selects_full_fit_when_calibration_regresses(
         calls["backtest"] += 1
         if calls["backtest"] == 1:
             return _make_result(ending_cash=1000.0, realized_pnl=0.0, win_rate=0.2)
+        if calls["backtest"] in {2, 3}:
+            return _make_result(ending_cash=1010.0, realized_pnl=10.0, win_rate=0.4)
         return _make_result(ending_cash=1075.0, realized_pnl=75.0, win_rate=0.8)
 
     monkeypatch.setattr(training_suite, "train_advanced", fake_train_advanced)
@@ -598,7 +679,7 @@ def test_evaluate_candidate_selects_full_fit_when_calibration_regresses(
     })
 
     assert calls["train"] == 2
-    assert calls["backtest"] == 4
+    assert calls["backtest"] == 6
     assert result["threshold"] == pytest.approx(0.64)
     assert result["threshold_source"] == "strategy_full_fit"
     assert result["threshold_score"] is None
@@ -606,6 +687,81 @@ def test_evaluate_candidate_selects_full_fit_when_calibration_regresses(
     assert result["validation_score"] > 0.0
     assert result["full_sample_score"] > 0.0
     assert result["model"].strategy_overrides["signal_threshold"] == pytest.approx(0.64)
+
+
+def test_evaluate_candidate_keeps_final_holdout_out_of_threshold_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threshold_rows: list[list[int]] = []
+    backtest_calls: list[tuple[list[int], str | None, int | None]] = []
+
+    def fake_train_advanced(rows, cfg, **kwargs):
+        return _fake_trained_model(2), SimpleNamespace(row_count=len(rows), positive_rate=0.5)
+
+    def fake_refine(model, rows, strategy, **kwargs):
+        del model, strategy, kwargs
+        threshold_rows.append([row.timestamp for row in rows])
+        return None
+
+    def fake_run_backtest(rows, _model, _strategy, **kwargs):
+        timestamps = [row.timestamp for row in rows]
+        backtest_calls.append((
+            timestamps,
+            kwargs.get("compute_backend"),
+            kwargs.get("score_batch_size"),
+        ))
+        if timestamps and min(timestamps) >= 1_000:
+            return _make_result(realized_pnl=-10.0, closed_trades=5)
+        return _make_result(realized_pnl=50.0, closed_trades=5)
+
+    monkeypatch.setattr(training_suite, "train_advanced", fake_train_advanced)
+    monkeypatch.setattr(
+        training_suite,
+        "calibrate_probability_temperature",
+        lambda *a, **k: SimpleNamespace(status="fail"),
+    )
+    monkeypatch.setattr(
+        training_suite,
+        "_calibrate_candidate_threshold",
+        lambda *a, **k: (0.64, "classification_f1", 1.0),
+    )
+    monkeypatch.setattr(training_suite, "_refine_threshold_on_selection_rows", fake_refine)
+    monkeypatch.setattr(training_suite, "run_backtest", fake_run_backtest)
+
+    candidate = CandidateParams(
+        epochs=80,
+        learning_rate=0.01,
+        l2_penalty=0.001,
+        signal_threshold=0.64,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.03,
+        risk_per_trade=0.01,
+        seed=11,
+    )
+    result = _evaluate_candidate({
+        "candidate": candidate,
+        "rows_train": _rows(80),
+        "rows_eval": [
+            ModelRow(timestamp=1_000 + i, close=1.0, features=(0.1, 0.2), label=i % 2)
+            for i in range(12)
+        ],
+        "feature_cfg": default_config_for("default", ()),
+        "base_strategy": StrategyConfig(),
+        "objective": "default",
+        "market_type": "spot",
+        "starting_cash": 1000.0,
+        "compute_backend": "directml",
+        "batch_size": 16,
+        "score_batch_size": 32,
+        "include_full_fit_fallback": False,
+    })
+
+    assert threshold_rows
+    assert max(threshold_rows[0]) < 1_000
+    assert result["score"] == float("-inf")
+    assert result["validation_score"] == float("-inf")
+    assert backtest_calls
+    assert all(call[1:] == ("directml", 32) for call in backtest_calls)
 
 
 def test_evaluate_candidate_can_skip_full_fit_fallback(
@@ -688,6 +844,27 @@ def test_train_for_objective_happy_with_fake_runner(tmp_path: Path) -> None:
     assert outcome.rejected_candidates >= 1
     assert outcome.validation_rows >= 0
     assert outcome.validation_score is not None
+
+
+def test_train_for_objective_rejects_all_rejected_candidates(tmp_path: Path) -> None:
+    candles = _synthetic_candles(n=200)
+    strategy = StrategyConfig()
+    objective = get_objective("default")
+
+    def runner(_obj, candidate, rows, base, feat_cfg, market, cash):
+        return float("-inf"), base, _fake_trained_model(feat_cfg.polynomial_top_features), 42, 0.5
+
+    with pytest.raises(ValueError, match="All default training candidates were rejected"):
+        train_for_objective(
+            candles,
+            strategy,
+            objective,
+            output_dir=tmp_path,
+            market_type="spot",
+            starting_cash=1000.0,
+            runner=runner,
+        )
+    assert not (tmp_path / f"model_{objective.name}.json").exists()
 
 
 def test_train_for_objective_insufficient_candles(tmp_path: Path) -> None:
@@ -785,7 +962,19 @@ def test_train_for_objective_gpu_backend_forces_sequential_workers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    objective = get_objective("default")
+    default_objective = get_objective("default")
+    objective = ObjectiveSpec(
+        name="default",
+        label="Smoke",
+        summary="Lenient smoke objective",
+        long_description="Lenient real-runner smoke objective for tiny synthetic datasets.",
+        scorer=lambda result: 1.0 + result.realized_pnl / max(1.0, result.starting_cash),
+        min_closed_trades=0,
+        min_realized_pnl=None,
+        min_edge_vs_buy_hold=None,
+        max_drawdown_rejection=1.0,
+        training=default_objective.training,
+    )
     candidate = CandidateParams(
         epochs=2,
         learning_rate=0.05,
@@ -798,10 +987,10 @@ def test_train_for_objective_gpu_backend_forces_sequential_workers(
     )
     monkeypatch.setattr(training_suite, "_candidate_grid", lambda _training: [candidate])
     monkeypatch.setattr(training_suite, "_local_refinement_candidates", lambda _candidate: [])
-    observed: list[tuple[str, int]] = []
+    observed: list[tuple[str, int, int]] = []
 
     def fake_evaluate(payload):
-        observed.append((payload["compute_backend"], payload["batch_size"]))
+        observed.append((payload["compute_backend"], payload["batch_size"], payload["score_batch_size"]))
         return {
             "score": 1.0,
             "candidate": payload["candidate"],
@@ -830,10 +1019,11 @@ def test_train_for_objective_gpu_backend_forces_sequential_workers(
         max_workers=4,
         compute_backend="directml",
         batch_size=64,
+        score_batch_size=32,
     )
     assert outcome.training_backend_kind == "cpu"
     assert observed
-    assert all(item == ("directml", 64) for item in observed)
+    assert all(item == ("directml", 64, 32) for item in observed)
 
 
 def test_train_for_objective_rejects_weaker_seed_ensemble(
@@ -1142,9 +1332,11 @@ def test_run_training_suite_forwards_optional_gpu_args(
         output_dir=tmp_path,
         compute_backend="directml",
         batch_size=64,
+        score_batch_size=32,
     )
     assert observed[0]["compute_backend"] == "directml"
     assert observed[0]["batch_size"] == 64
+    assert observed[0]["score_batch_size"] == 32
 
 
 # ----- describe_candidate_grid + preview_candidates ------------------------
@@ -1195,7 +1387,19 @@ def test_train_for_objective_real_runner_small_dataset(tmp_path: Path) -> None:
     """
 
     candles = _synthetic_candles(n=260)
-    objective = get_objective("default")
+    default_objective = get_objective("default")
+    objective = ObjectiveSpec(
+        name="smoke",
+        label="Smoke",
+        summary="Lenient smoke objective",
+        long_description="Lenient real-runner smoke objective for tiny synthetic datasets.",
+        scorer=lambda result: 1.0 + result.realized_pnl / max(1.0, result.starting_cash),
+        min_closed_trades=0,
+        min_realized_pnl=None,
+        min_edge_vs_buy_hold=None,
+        max_drawdown_rejection=1.0,
+        training=default_objective.training,
+    )
 
     single_candidate = CandidateParams(
         epochs=2,
@@ -1209,7 +1413,9 @@ def test_train_for_objective_real_runner_small_dataset(tmp_path: Path) -> None:
 
     # Swap in a tiny grid (monkeypatch via direct assignment on the module).
     original = training_suite._candidate_grid
+    original_get_objective = training_suite.get_objective
     training_suite._candidate_grid = lambda _t: [single_candidate]
+    training_suite.get_objective = lambda _name: objective
     try:
         outcome = train_for_objective(
             candles, StrategyConfig(), objective,
@@ -1219,6 +1425,7 @@ def test_train_for_objective_real_runner_small_dataset(tmp_path: Path) -> None:
         )
     finally:
         training_suite._candidate_grid = original
+        training_suite.get_objective = original_get_objective
 
     assert (tmp_path / f"model_{objective.name}.json").exists()
     assert outcome.feature_dim > 0

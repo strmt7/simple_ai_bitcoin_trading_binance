@@ -31,10 +31,13 @@ import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 RunCommand = Callable[..., "subprocess.CompletedProcess[str]"]
 TokenReader = Callable[[str], str]
+_ALLOWED_GITHUB_OWNER = "strmt7"
+_ALLOWED_GITHUB_REPO = "simple_ai_bitcoin_trading_binance"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -81,6 +84,48 @@ def _read_token(env: Mapping[str, str], env_name: str, reader: TokenReader) -> s
     if not token:
         raise SystemExit(f"{env_name} is required")
     return token
+
+
+def _remote_url_from_argument(
+    remote: str,
+    *,
+    git_bin: str,
+    env: Mapping[str, str],
+    runner: RunCommand,
+) -> str:
+    if "://" in remote or remote.startswith("git@"):
+        return remote
+    result = runner(
+        [git_bin, "remote", "get-url", remote],
+        env=dict(env),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if int(getattr(result, "returncode", 1)) != 0:
+        raise SystemExit(f"unable to resolve git remote {remote!r}")
+    return str(getattr(result, "stdout", "")).strip()
+
+
+def _github_owner_repo(remote_url: str) -> tuple[str, str] | None:
+    if remote_url.startswith("git@github.com:"):
+        return None
+    parsed = urlparse(remote_url)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}:
+        return None
+    parts = parsed.path.removesuffix(".git").strip("/").split("/")
+    if len(parts) != 2:
+        return None
+    return parts[0].lower(), parts[1].lower()
+
+
+def _validate_allowed_remote(remote_url: str) -> None:
+    owner_repo = _github_owner_repo(remote_url)
+    if owner_repo != (_ALLOWED_GITHUB_OWNER, _ALLOWED_GITHUB_REPO):
+        raise SystemExit(
+            "refusing to serve a GitHub PAT to an unexpected remote; "
+            f"expected github.com/{_ALLOWED_GITHUB_OWNER}/{_ALLOWED_GITHUB_REPO}"
+        )
 
 
 def _write_askpass(path: Path) -> None:
@@ -161,11 +206,13 @@ def run_push(
     _validate_git_argument("refspec", args.refspec)
     _validate_git_argument("username", args.username)
 
-    base_env = dict(os.environ if env is None else env)
-    token = _read_token(base_env, args.token_env, token_reader)
     git_bin = shutil.which("git")
     if git_bin is None:
         raise SystemExit("git is required")
+    base_env = dict(os.environ if env is None else env)
+    remote_url = _remote_url_from_argument(args.remote, git_bin=git_bin, env=base_env, runner=runner)
+    _validate_allowed_remote(remote_url)
+    token = _read_token(base_env, args.token_env, token_reader)
 
     temp_root = Path(tempfile.mkdtemp(prefix="git-pat-askpass-"))
     temp_root.chmod(stat.S_IRWXU)
@@ -177,6 +224,7 @@ def run_push(
         _write_askpass(askpass_path)
         stop_server, server_thread = _serve_credential_once(socket_path, token)
         push_env = base_env.copy()
+        push_env.pop(args.token_env, None)
         push_env.update({
             "GIT_ASKPASS": str(askpass_path),
             "GIT_PAT_SOCKET": str(socket_path),

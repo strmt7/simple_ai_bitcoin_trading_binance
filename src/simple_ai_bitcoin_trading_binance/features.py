@@ -330,6 +330,35 @@ def make_rows(
     return rows
 
 
+def make_inference_rows(
+    candles: Sequence[Candle],
+    short_window: int,
+    long_window: int,
+    *,
+    enabled_features: Sequence[str] | None = None,
+) -> list[ModelRow]:
+    if short_window <= 0 or long_window <= 0:
+        raise ValueError("short_window and long_window must be positive")
+    if long_window < short_window:
+        raise ValueError("long_window must be greater than or equal to short_window")
+
+    selected_indices = _feature_indices(enabled_features)
+    cache = _build_feature_cache(candles)
+    rows: list[ModelRow] = []
+    min_window = max(long_window, short_window, 2, 2 * long_window)
+    if len(cache.candles) < min_window:
+        return rows
+
+    for i in range(long_window, len(cache.candles)):
+        full_features = _build_full_features(cache, i, short_window, long_window)
+        if full_features is None:
+            continue
+        features = tuple(full_features[index] for index in selected_indices)
+        rows.append(ModelRow(timestamp=cache.candles[i].close_time, close=cache.closes[i], features=features, label=0))
+
+    return rows
+
+
 def make_rows_legacy(candles: Sequence[Candle], short_window: int, long_window: int,
                      lookahead: int = 1) -> list[ModelRow]:
     """Compatibility helper for existing integrations expecting 5-feature rows."""

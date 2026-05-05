@@ -17,6 +17,9 @@ Design goals:
 
 from __future__ import annotations
 
+import importlib
+import os
+import re
 import shlex
 import sys
 import time
@@ -52,6 +55,32 @@ from .style import (
 )
 
 CliRunner = Callable[[list[str]], int]
+
+
+def _split_command_line(line: str) -> list[str]:
+    if os.name != "nt":
+        return shlex.split(line)
+    if len(re.findall(r'(?<!\\)"', line)) % 2:
+        raise ValueError("No closing quotation")
+    try:
+        import ctypes
+
+        argc = ctypes.c_int()
+        command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+        command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+        command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        local_free = ctypes.windll.kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        argv = command_line_to_argv(line, ctypes.byref(argc))
+        if not argv:
+            raise ValueError("unable to parse Windows command line")
+        try:
+            return [argv[index] for index in range(argc.value)]
+        finally:
+            local_free(argv)
+    except AttributeError:
+        return shlex.split(line, posix=False)
 
 
 @dataclass(frozen=True)
@@ -171,7 +200,7 @@ class Shell:
         if not line:
             return 0
         try:
-            tokens = shlex.split(line)
+            tokens = _split_command_line(line)
         except ValueError as err:
             self.println(bad(f"parse error: {err}",
                              enabled=self.state.color_enabled, palette=self.palette))
@@ -183,7 +212,7 @@ class Shell:
             head = "/help"
         slash = head.startswith("/")
         name = head.lstrip("/")
-        if slash and name in self.commands:
+        if name in self.commands and (slash or head in self.commands):
             try:
                 return int(self.commands[name].run(self, rest))
             except SystemExit:
@@ -228,6 +257,8 @@ class Shell:
                 return int(self.state.last_exit)
             if line.strip():
                 self.state.history.append(line)
+            else:
+                continue
             try:
                 self.state.last_exit = self.dispatch(line)
             except SystemExit as exit_err:
@@ -388,7 +419,7 @@ def _cmd_auto(shell: Shell, args: list[str]) -> int:
                               enabled=shell.state.color_enabled, palette=shell.palette))
             return 2
         control.write(STATE_RUNNING, note=f"started via shell objective={objective}")
-        shell.println(ok(f"autonomous: RUNNING (objective={objective})",
+        shell.println(ok(f"autonomous control: RUNNING requested (objective={objective}); launch the autonomous worker to execute",
                          enabled=shell.state.color_enabled, palette=shell.palette))
         return 0
     if action == "pause":
@@ -398,7 +429,7 @@ def _cmd_auto(shell: Shell, args: list[str]) -> int:
         return 0
     if action == "resume":
         control.write(STATE_RUNNING, note="resumed via shell")
-        shell.println(ok("autonomous: RUNNING",
+        shell.println(ok("autonomous control: RUNNING requested",
                          enabled=shell.state.color_enabled, palette=shell.palette))
         return 0
     if action == "stop":
@@ -455,11 +486,28 @@ def _default_commands() -> list[SlashCommand]:
     ]
 
 
+def _install_readline_completion(shell: Shell) -> bool:
+    completer = getattr(shell, "complete", None)
+    if not callable(completer):
+        return False
+    try:
+        readline = importlib.import_module("readline")
+    except ImportError:
+        return False
+    try:
+        readline.set_completer(completer)
+        readline.parse_and_bind("tab: complete")
+    except (AttributeError, OSError):
+        return False
+    return True
+
+
 def run_shell(argv: list[str] | None = None) -> int:
     """Entry point used by the CLI subcommand."""
 
     del argv  # reserved for future flags like --no-color; currently ignored.
     shell = Shell()
+    _install_readline_completion(shell)
     return int(shell.run())
 
 

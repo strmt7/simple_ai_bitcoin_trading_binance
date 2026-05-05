@@ -86,6 +86,21 @@ def test_min_realized_pnl_gate():
     assert "realized_pnl<=0.0" in ranked[0]["reject_reason"]
 
 
+def test_positive_pnl_negative_buy_hold_edge_is_rejected():
+    r = _result(
+        realized_pnl=25.0,
+        buy_hold_pnl=80.0,
+        edge_vs_buy_hold=-55.0,
+        closed_trades=10,
+    )
+
+    assert obj.DEFAULT.accepts(r) is False
+    ranked = obj.rank_candidates([({"id": "underperformer"}, r)], obj.DEFAULT)
+    assert ranked[0]["accepted"] is False
+    assert ranked[0]["score"] == float("-inf")
+    assert "edge_vs_buy_hold<0.0" in ranked[0]["reject_reason"]
+
+
 def test_safe_and_return_ratio_non_finite():
     assert obj._safe(float("nan")) == 0.0
     assert obj._safe(1.2) == pytest.approx(1.2)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -130,8 +131,8 @@ def test_fallthrough_cli_runner(tmp_path):
         return 7
 
     shell, _recorder, _ctrl, _pos = _make_shell(tmp_path, cli_runner=runner)
-    assert shell.dispatch("status --foo bar") == 7
-    assert calls == [["status", "--foo", "bar"]]
+    assert shell.dispatch("fetch --foo bar") == 7
+    assert calls == [["fetch", "--foo", "bar"]]
 
 
 def test_fallthrough_cli_systemexit(tmp_path):
@@ -139,7 +140,7 @@ def test_fallthrough_cli_systemexit(tmp_path):
         raise SystemExit(5)
 
     shell, _recorder, _ctrl, _pos = _make_shell(tmp_path, cli_runner=runner)
-    assert shell.dispatch("status") == 5
+    assert shell.dispatch("fetch") == 5
 
 
 def test_fallthrough_cli_systemexit_none(tmp_path):
@@ -147,7 +148,7 @@ def test_fallthrough_cli_systemexit_none(tmp_path):
         raise SystemExit(None)
 
     shell, _recorder, _ctrl, _pos = _make_shell(tmp_path, cli_runner=runner)
-    assert shell.dispatch("status") == 0
+    assert shell.dispatch("fetch") == 0
 
 
 def test_fallthrough_cli_raises(tmp_path):
@@ -155,7 +156,7 @@ def test_fallthrough_cli_raises(tmp_path):
         raise RuntimeError("cli boom")
 
     shell, recorder, _ctrl, _pos = _make_shell(tmp_path, cli_runner=runner)
-    assert shell.dispatch("status") == 1
+    assert shell.dispatch("fetch") == 1
     assert any("cli boom" in line for line in recorder.lines)
 
 
@@ -352,6 +353,59 @@ def test_complete_matches_and_past_end(tmp_path):
     assert shell.complete("/h", -1) is None
 
 
+def test_bare_completed_shell_command_dispatches_builtin(tmp_path):
+    shell, recorder, _ctrl, _pos = _make_shell(tmp_path)
+    assert shell.complete("statu", 0) == "status"
+    assert shell.dispatch("status") == 0
+    assert any("shell" in line for line in recorder.lines)
+
+
+def test_windows_unquoted_paths_are_preserved(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0
+
+    shell, _recorder, _ctrl, _pos = _make_shell(tmp_path, cli_runner=runner)
+    monkeypatch.setattr(shell_mod.os, "name", "nt", raising=False)
+    assert shell.dispatch(r"backtest --input C:\trader\data\history.json") == 0
+    assert calls == [["backtest", "--input", r"C:\trader\data\history.json"]]
+
+
+def test_split_command_line_platform_branches(monkeypatch):
+    monkeypatch.setattr(shell_mod.os, "name", "posix", raising=False)
+    assert shell_mod._split_command_line("status --json") == ["status", "--json"]
+
+    import ctypes
+
+    monkeypatch.setattr(shell_mod.os, "name", "nt", raising=False)
+    monkeypatch.delattr(ctypes, "windll", raising=False)
+    assert shell_mod._split_command_line(r"backtest --input C:\data\history.json") == [
+        "backtest",
+        "--input",
+        r"C:\data\history.json",
+    ]
+
+    def command_line_to_argv(_line, _argc):
+        return None
+
+    def local_free(_argv):
+        return None
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(
+            shell32=SimpleNamespace(CommandLineToArgvW=command_line_to_argv),
+            kernel32=SimpleNamespace(LocalFree=local_free),
+        ),
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="unable to parse"):
+        shell_mod._split_command_line("status")
+
+
 def test_run_eof_returns_last_exit(tmp_path):
     shell, _recorder, _ctrl, _pos = _make_shell(tmp_path)
     shell.state.last_exit = 3
@@ -378,7 +432,8 @@ def test_run_keyboard_interrupt_continues(tmp_path):
         raise EOFError
 
     shell, recorder, _ctrl, _pos = _make_shell(tmp_path, reader=reader)
-    shell.run()
+    shell.state.last_exit = 9
+    assert shell.run() == 9
     assert any("^C" in line for line in recorder.lines)
 
 
@@ -398,6 +453,35 @@ def test_println_uses_writer(tmp_path):
     shell.print("bye")
     assert "hi" in recorder.lines
     assert "bye" in recorder.lines
+
+
+def test_install_readline_completion_registers_tab_binding(tmp_path, monkeypatch):
+    shell, _recorder, _ctrl, _pos = _make_shell(tmp_path)
+    calls: dict[str, object] = {}
+
+    class _Readline:
+        def set_completer(self, completer):
+            calls["completer"] = completer
+
+        def parse_and_bind(self, binding):
+            calls["binding"] = binding
+
+    monkeypatch.setattr(shell_mod.importlib, "import_module", lambda name: _Readline())
+    assert shell_mod._install_readline_completion(shell) is True
+    assert calls == {"completer": shell.complete, "binding": "tab: complete"}
+
+
+def test_install_readline_completion_handles_missing_or_incomplete_readline(tmp_path, monkeypatch):
+    shell, _recorder, _ctrl, _pos = _make_shell(tmp_path)
+
+    def missing(_name):
+        raise ImportError("missing")
+
+    monkeypatch.setattr(shell_mod.importlib, "import_module", missing)
+    assert shell_mod._install_readline_completion(shell) is False
+
+    monkeypatch.setattr(shell_mod.importlib, "import_module", lambda _name: object())
+    assert shell_mod._install_readline_completion(shell) is False
 
 
 def test_run_shell_entrypoint_constructs_shell(monkeypatch):

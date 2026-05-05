@@ -62,9 +62,12 @@ def _probe_torch_directml() -> tuple[Any | None, str]:
 
 def _try_cuda() -> BackendInfo | None:
     torch, err = _probe_torch()
+    _ = err
     if torch is None:
         return None
     try:
+        if getattr(torch.version, "hip", None):
+            return None
         if not torch.cuda.is_available():
             return None
         device_count = torch.cuda.device_count()
@@ -93,7 +96,9 @@ def _try_rocm() -> BackendInfo | None:
             return None
         if not torch.cuda.is_available():
             return None
-        name = torch.cuda.get_device_name(0) if torch.cuda.device_count() else "AMD ROCm"
+        if torch.cuda.device_count() <= 0:
+            return None
+        name = torch.cuda.get_device_name(0)
     except Exception:  # pragma: no cover
         return None
     return BackendInfo(
@@ -193,10 +198,16 @@ def resolve_backend(requested: str | None) -> BackendInfo:
         return _cpu("mps", reason="MPS unavailable (torch missing or not Apple Silicon)")
 
     if name == "auto":
-        for probe in (_try_cuda, _try_rocm, _try_directml, _try_mps):
+        for probe in (_try_rocm, _try_cuda, _try_directml, _try_mps):
             info = probe()
             if info is not None:
-                return info
+                return BackendInfo(
+                    requested="auto",
+                    kind=info.kind,
+                    device=info.device,
+                    vendor=info.vendor,
+                    reason="",
+                )
         return _cpu("auto", reason="No GPU backend available; running on CPU")
 
     return _cpu(name, reason=f"Unknown backend {requested!r}; defaulting to CPU")

@@ -48,7 +48,7 @@ def test_risk_policy_blocks_mainnet_live_missing_credentials_and_zero_cash(tmp_p
     assert any(check.label == "execution environment" and "demo endpoint" in check.detail for check in demo.checks)
 
 
-def test_risk_policy_warns_on_aggressive_but_possible_settings(tmp_path) -> None:
+def test_risk_policy_blocks_extreme_capital_loss_settings(tmp_path) -> None:
     model_path = tmp_path / "model.json"
     model_path.write_text("{}", encoding="utf-8")
     report = build_risk_policy_report(
@@ -65,10 +65,13 @@ def test_risk_policy_warns_on_aggressive_but_possible_settings(tmp_path) -> None
         model_path=model_path,
     )
 
-    assert report.allowed is True
+    assert report.allowed is False
     assert report.leverage == 80.0
-    assert report.warning_count >= 6
-    assert any(check.label == "effective leverage" and check.status == "warn" for check in report.checks)
+    assert report.warning_count >= 3
+    assert report.block_count >= 3
+    assert any(check.label == "effective leverage" and check.status == "block" for check in report.checks)
+    assert any(check.label == "max position" and check.status == "block" for check in report.checks)
+    assert any(check.label == "drawdown stop" and check.status == "block" for check in report.checks)
 
     disabled_drawdown = build_risk_policy_report(
         RuntimeConfig(),

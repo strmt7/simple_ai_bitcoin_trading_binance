@@ -83,13 +83,9 @@ def supports_unicode(stream=None, sample: str = "▸❯┌─┐│└┘├┤"
     return True
 
 
-def supports_color(stream=None) -> bool:
-    """Return True when the given stream accepts ANSI escape sequences."""
+def supports_ansi_terminal(stream=None) -> bool:
+    """Return True when the given stream can run an ANSI/VT terminal UI."""
 
-    if os.environ.get("NO_COLOR", "").strip():
-        return False
-    if os.environ.get("FORCE_COLOR", "").strip():
-        return True
     target = stream if stream is not None else sys.stdout
     isatty = getattr(target, "isatty", None)
     if isatty is None:
@@ -101,7 +97,19 @@ def supports_color(stream=None) -> bool:
         return False
     if os.name == "nt":
         return _enable_windows_virtual_terminal(target)
+    if os.environ.get("TERM", "").strip().lower() == "dumb":
+        return False
     return True
+
+
+def supports_color(stream=None) -> bool:
+    """Return True when the given stream accepts ANSI color styling."""
+
+    if os.environ.get("NO_COLOR", "").strip():
+        return False
+    if os.environ.get("FORCE_COLOR", "").strip():
+        return True
+    return supports_ansi_terminal(stream)
 
 
 @dataclass(frozen=True)

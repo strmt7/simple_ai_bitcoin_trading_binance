@@ -94,6 +94,7 @@ def _fill_price(price: float, side_sign: int, slippage_bps: float) -> float:
 
 def _normalize_market_direction(signal_score: float, threshold: float, market_type: str) -> int:
     if market_type == "futures":
+        threshold = max(0.5, float(threshold))
         if signal_score >= threshold:
             return 1
         if signal_score <= (1.0 - threshold):
@@ -278,12 +279,17 @@ def calibrate_threshold_for_backtest(
     end: float = 0.95,
     steps: int = 31,
     min_score_delta: float = 0.0,
+    compute_backend: str | None = None,
+    score_batch_size: int = 8192,
 ) -> ThresholdBacktestCalibration:
     baseline_threshold = _clamp_threshold(
         _finite_float(baseline_threshold, model_decision_threshold(model, cfg.signal_threshold))
         if baseline_threshold is not None
         else model_decision_threshold(model, cfg.signal_threshold)
     )
+    if market_type == "futures":
+        baseline_threshold = max(0.5, baseline_threshold)
+        start = max(0.5, float(start))
     baseline_model = replace(model, decision_threshold=baseline_threshold)
     baseline_result = run_backtest(
         rows,
@@ -291,6 +297,8 @@ def calibrate_threshold_for_backtest(
         cfg,
         starting_cash=starting_cash,
         market_type=market_type,
+        compute_backend=compute_backend,
+        score_batch_size=score_batch_size,
     )
     baseline_score = risk_adjusted_backtest_score(baseline_result, starting_cash=starting_cash)
     best_threshold = baseline_threshold
@@ -300,7 +308,15 @@ def calibrate_threshold_for_backtest(
 
     for threshold in thresholds:
         candidate_model = replace(model, decision_threshold=threshold)
-        result = run_backtest(rows, candidate_model, cfg, starting_cash=starting_cash, market_type=market_type)
+        result = run_backtest(
+            rows,
+            candidate_model,
+            cfg,
+            starting_cash=starting_cash,
+            market_type=market_type,
+            compute_backend=compute_backend,
+            score_batch_size=score_batch_size,
+        )
         score = risk_adjusted_backtest_score(result, starting_cash=starting_cash)
         if (
             score > best_score + 1e-12
@@ -313,7 +329,11 @@ def calibrate_threshold_for_backtest(
             best_score = score
             best_result = result
 
-    accepted = best_score > baseline_score + max(0.0, _finite_float(min_score_delta, 0.0))
+    has_profit_backed_result = best_result.closed_trades > 0 and best_result.realized_pnl > 0.0
+    accepted = (
+        has_profit_backed_result
+        and best_score > baseline_score + max(0.0, _finite_float(min_score_delta, 0.0))
+    )
     selected_threshold = best_threshold if accepted else baseline_threshold
     selected_score = best_score if accepted else baseline_score
     selected_result = best_result if accepted else baseline_result
@@ -384,6 +404,10 @@ def run_backtest(
     qty = 0.0
     entry_price = 0.0
     margin_used = 0.0
+    pending_signal = 0
+    last_close_timestamp: int | None = None
+    cooldown_ms = max(0, int(cfg.cooldown_minutes)) * 60 * 1000
+    final_mark_price = rows[-1].close
 
     fee_rate = _bps_to_rate(cfg.taker_fee_bps)
     leverage = 1.0 if market_type == "spot" else cfg.leverage
@@ -407,14 +431,23 @@ def run_backtest(
     )
 
     for row, raw_score in zip(rows, probabilities, strict=True):
+        execution_signal = pending_signal
         score = confidence_adjusted_probability(raw_score, cfg.confidence_beta)
-        signal = _normalize_market_direction(score, decision_threshold, market_type)
+        pending_signal = _normalize_market_direction(score, decision_threshold, market_type)
         price = row.close
+        final_mark_price = price
         day = _safe_day(row.timestamp)
         if day not in daily_trade_count:
             daily_trade_count[day] = 0
         trade_cap_reached = max_daily is not None and daily_trade_count[day] >= max_daily
-        if position_side == 0 and signal != 0:
+        cooldown_active = (
+            last_close_timestamp is not None
+            and cooldown_ms > 0
+            and row.timestamp - last_close_timestamp < cooldown_ms
+        )
+        if position_side == 0 and execution_signal != 0:
+            if cooldown_active:
+                continue
             if trade_cap_reached:
                 cap_hits += 1
                 continue
@@ -434,7 +467,7 @@ def run_backtest(
                 cap_hits += 1
                 continue
 
-            side_sign = 1 if signal > 0 else -1
+            side_sign = 1 if execution_signal > 0 else -1
             entry = _fill_price(price, side_sign, cfg.slippage_bps)
             if entry <= 0:
                 continue
@@ -460,8 +493,8 @@ def run_backtest(
             should_close = (
                 current_pnl_pct >= cfg.take_profit_pct
                 or current_pnl_pct <= -cfg.stop_loss_pct
-                or signal == 0
-                or signal == (-position_side)
+                or execution_signal == 0
+                or execution_signal == (-position_side)
             )
 
             if should_close:
@@ -485,9 +518,7 @@ def run_backtest(
                 qty = 0.0
                 entry_price = 0.0
                 margin_used = 0.0
-
-        if trade_cap_reached and position_side == 0:
-            continue
+                last_close_timestamp = row.timestamp
 
         # mark-to-market drawdown control with unrealized exposure
         if position_side != 0:
@@ -496,12 +527,9 @@ def run_backtest(
         else:
             equity = cash
 
-        if equity < 0:
-            equity = cash
-
         if equity > equity_peak:
             equity_peak = equity
-        dd = (equity_peak - equity) / equity_peak if equity_peak else 0.0
+        dd = 1.0 if equity <= 0.0 and equity_peak > 0.0 else ((equity_peak - equity) / equity_peak if equity_peak else 0.0)
         if dd > max_drawdown:
             max_drawdown = dd
 
@@ -513,7 +541,7 @@ def run_backtest(
     if position_side != 0:
         final_delta, final_realized, final_fee = _close_position(
             position_side=position_side,
-            price=rows[-1].close,
+            price=final_mark_price,
             entry_price=entry_price,
             qty=qty,
             notional=notional,
@@ -530,6 +558,11 @@ def run_backtest(
         qty = 0.0
         entry_price = 0.0
         margin_used = 0.0
+        if cash > equity_peak:
+            equity_peak = cash
+        final_dd = 1.0 if cash <= 0.0 and equity_peak > 0.0 else ((equity_peak - cash) / equity_peak if equity_peak else 0.0)
+        if final_dd > max_drawdown:
+            max_drawdown = final_dd
 
     realized_pnl = cash - starting_cash
     win_rate = wins / closed_trades if closed_trades else 0.0

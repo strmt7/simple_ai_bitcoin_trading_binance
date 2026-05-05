@@ -106,6 +106,18 @@ def test_load_runtime_ignores_invalid_json_payload(tmp_path: Path, monkeypatch) 
     assert loaded == RuntimeConfig()
 
 
+def test_load_runtime_accepts_utf8_bom_json_written_by_windows_tools(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = config_paths()["runtime"]
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_bytes(b'\xef\xbb\xbf{"api_key":"persisted","api_secret":"persisted-secret"}')
+
+    loaded = load_runtime()
+
+    assert loaded.api_key == "persisted"
+    assert loaded.api_secret == "persisted-secret"
+
+
 def test_load_runtime_supports_payload_overrides(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     loaded = load_runtime({"api_key": "x", "api_secret": "y", "max_rate_calls_per_minute": 5})

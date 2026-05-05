@@ -10,7 +10,7 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
@@ -36,6 +36,7 @@ _JITTER_RANDOM = random.SystemRandom()
 COINGECKO_SIMPLE_PRICE_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
     "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
+    "&include_last_updated_at=true"
 )
 COINPAPRIKA_BTC_TICKER_URL = "https://api.coinpaprika.com/v1/tickers/btc-bitcoin"
 COINLORE_BTC_TICKER_URL = "https://api.coinlore.net/api/ticker/?id=90"
@@ -56,7 +57,30 @@ GDELT_BITCOIN_NEWS_URL = (
 HACKER_NEWS_BITCOIN_URL = "https://hn.algolia.com/api/v1/search?query=bitcoin&tags=story&hitsPerPage=10"
 DEFAULT_OLLAMA_NEWS_MODEL = "gemma4:e4b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+_OLLAMA_NEWS_MAX_ITEMS = 6
+_OLLAMA_NEWS_MAX_TEXT_CHARS = 140
+_OLLAMA_NEWS_NUM_CTX = 512
+_OLLAMA_NEWS_NUM_PREDICT = 48
+_OLLAMA_NEWS_JSON_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number"},
+        "horizon": {"type": "string", "enum": ["short", "medium", "long"]},
+        "reaction_required": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["score", "horizon", "reaction_required", "reason"],
+    "additionalProperties": False,
+}
 _RSS_SAME_HOST_GAP_SECONDS = 0.12
+_MAX_FUTURE_TIMESTAMP_SKEW_MS = 5 * 60_000
+_CACHE_COMPONENT_MAX_AGE_MS_BY_HORIZON = {
+    "short": 7 * 24 * 3_600_000,
+    "medium": 30 * 24 * 3_600_000,
+    "long": 365 * 24 * 3_600_000,
+}
+_HTTP_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+_HTTP_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -170,7 +194,14 @@ class ProviderFetchResult:
     component: ExternalSignalComponent
     backend: BackendInfo | None = None
     news_texts: tuple[str, ...] = ()
+    news_known_at_ms: tuple[int, ...] = ()
     raw_payload: object | None = None
+
+
+class _RSSFeedPayloadError(ValueError):
+    def __init__(self, message: str, raw_xml: str) -> None:
+        super().__init__(message)
+        self.raw_xml = raw_xml
 
 
 @dataclass(frozen=True)
@@ -229,6 +260,9 @@ _NEWS_TRIGGERS: tuple[NewsTrigger, ...] = (
     NewsTrigger("hack", -1.0, 9.0, 0.92, "security", "short"),
     NewsTrigger("exploit", -1.0, 9.0, 0.92, "security", "short"),
     NewsTrigger("exchange exploit", -1.0, 9.5, 0.95, "security", "short"),
+    NewsTrigger("exchange breach", -1.0, 9.5, 0.95, "security", "short"),
+    NewsTrigger("security breach", -1.0, 9.0, 0.92, "security", "short"),
+    NewsTrigger("data breach", -0.9, 8.5, 0.86, "security", "short"),
     NewsTrigger("bankruptcy", -1.0, 9.0, 0.90, "counterparty", "short"),
     NewsTrigger("liquidation", -0.9, 7.5, 0.82, "market", "short"),
     NewsTrigger("selloff", -0.9, 7.0, 0.78, "market", "short"),
@@ -276,6 +310,7 @@ _POSITIVE_NEWS_TERMS = (
 _NEGATIVE_NEWS_TERMS = (
     "ban",
     "bankruptcy",
+    "breach",
     "crackdown",
     "exploit",
     "fraud",
@@ -289,6 +324,7 @@ _SHORT_TERM_TERMS = (
     "approval",
     "ban",
     "bankruptcy",
+    "breach",
     "breaking",
     "crackdown",
     "etf inflow",
@@ -379,6 +415,42 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if not math.isfinite(parsed):
         return default
     return parsed
+
+
+def _timestamp_is_future(timestamp_ms: int, now_ms: int) -> bool:
+    return int(timestamp_ms) > int(now_ms) + _MAX_FUTURE_TIMESTAMP_SKEW_MS
+
+
+def _bounded_provider_timestamp_ms(timestamp_ms: int, now_ms: int) -> int:
+    timestamp = int(timestamp_ms)
+    if timestamp <= 0:
+        return int(now_ms)
+    if _timestamp_is_future(timestamp, now_ms):
+        return 0
+    if timestamp > int(now_ms):
+        return int(now_ms)
+    return timestamp
+
+
+def _cache_component_max_age_ms(horizon: str) -> int:
+    return _CACHE_COMPONENT_MAX_AGE_MS_BY_HORIZON.get(
+        str(horizon or "medium"),
+        _CACHE_COMPONENT_MAX_AGE_MS_BY_HORIZON["medium"],
+    )
+
+
+def _component_cache_timestamp_is_fresh(
+    component: ExternalSignalComponent,
+    *,
+    now_ms: int,
+    report_known_at_ms: int,
+) -> bool:
+    known_at = int(component.known_at_ms)
+    if known_at <= 0 or _timestamp_is_future(known_at, now_ms):
+        return False
+    if known_at > int(report_known_at_ms) + _MAX_FUTURE_TIMESTAMP_SKEW_MS:
+        return False
+    return int(report_known_at_ms) - known_at <= _cache_component_max_age_ms(component.horizon)
 
 
 @lru_cache(maxsize=256)
@@ -634,7 +706,7 @@ def _extract_feed_items(xml_text: str, *, now_ms: int, limit: int = 4) -> list[d
         title = _strip_markup(_child_text(entry, "title"))
         summary = _strip_markup(_child_text(entry, "description", "summary", "content", "encoded"))
         published = _child_text(entry, "pubDate", "published", "updated", "date")
-        known_at = _parse_feed_datetime_ms(published, now_ms)
+        known_at = _bounded_provider_timestamp_ms(_parse_feed_datetime_ms(published, now_ms), now_ms)
         link = _child_text(entry, "link")
         if not link:
             for child in list(entry):
@@ -661,9 +733,101 @@ def _provider_news_payload(component: ExternalSignalComponent, items: list[dict[
         "weight": component.weight,
         "horizon": component.horizon,
         "urgency": component.urgency,
+        "known_at_ms": component.known_at_ms,
         "detail": component.detail,
         "items": items,
     }
+
+
+_PROVIDER_HORIZONS = {
+    "alternative_fear_greed": "long",
+    "coingecko_bitcoin": "medium",
+    "coinpaprika_bitcoin": "medium",
+    "coinlore_bitcoin": "medium",
+    "blockchain_network_stats": "long",
+    "kraken_btcusd_momentum": "medium",
+    "coinbase_btcusd_momentum": "medium",
+    "bitstamp_btcusd_momentum": "medium",
+    "binance_spot_momentum": "short",
+    "binance_futures_positioning": "short",
+    "mempool_fee_pressure": "short",
+    "cryptocompare_btc_news": "short",
+    "gdelt_bitcoin_news": "short",
+    "hackernews_bitcoin_attention": "short",
+}
+
+
+def _provider_horizon(provider: str) -> str:
+    return _PROVIDER_HORIZONS.get(str(provider or ""), "medium")
+
+
+def _structured_news_items_from_payload(
+    provider: str,
+    payload: object,
+    *,
+    limit: int,
+    now_ms: int,
+) -> list[tuple[str, int]]:
+    if not isinstance(payload, Mapping):
+        return []
+    provider_name = str(provider)
+    items: object
+    if provider_name == "cryptocompare_btc_news":
+        items = payload.get("Data")
+    elif provider_name == "gdelt_bitcoin_news":
+        items = payload.get("articles")
+    elif provider_name == "hackernews_bitcoin_attention":
+        items = payload.get("hits")
+    else:
+        return []
+    if not isinstance(items, list):
+        return []
+    news_items: list[tuple[str, int]] = []
+    for item in items[: max(0, int(limit))]:
+        if not isinstance(item, Mapping):
+            continue
+        title = str(item.get("title") or item.get("story_title") or "").strip()
+        if not title:
+            continue
+        body = str(item.get("body") or item.get("summary") or item.get("tags") or "").strip()
+        source = str(item.get("source") or item.get("domain") or "").strip()
+        known_at = now_ms
+        if provider_name == "cryptocompare_btc_news":
+            known_at = _bounded_provider_timestamp_ms(_parse_epoch_ms(item.get("published_on"), now_ms), now_ms)
+        elif provider_name == "gdelt_bitcoin_news":
+            known_at = _bounded_provider_timestamp_ms(_parse_gdelt_seen_ms(item.get("seendate"), now_ms), now_ms)
+        else:
+            created_at = str(item.get("created_at") or "")
+            if created_at.endswith("Z"):
+                try:
+                    known_at = _bounded_provider_timestamp_ms(
+                        int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000),
+                        now_ms,
+                    )
+                except ValueError:
+                    known_at = now_ms
+        parts = [provider_name, title]
+        if body:
+            parts.append(body)
+        if source:
+            parts.append(f"source={source}")
+        news_items.append((
+            ": ".join(parts[:2]) + (" " + " ".join(parts[2:]) if len(parts) > 2 else ""),
+            known_at if known_at > 0 else now_ms,
+        ))
+    return news_items
+
+
+def _structured_news_texts_from_payload(provider: str, payload: object, *, limit: int) -> list[str]:
+    return [
+        text
+        for text, _known_at in _structured_news_items_from_payload(
+            provider,
+            payload,
+            limit=limit,
+            now_ms=_now_ms(),
+        )
+    ]
 
 
 def _provider_name_for_url(url: str) -> str:
@@ -699,38 +863,102 @@ def _provider_name_for_url(url: str) -> str:
     return lower.split("//", 1)[-1].split("/", 1)[0].replace(".", "_")
 
 
-def _get_json(url: str, timeout: float) -> object:
+def _http_retry_delay_seconds(response: object, attempt: int) -> float:
+    fallback = min(5.0, 0.25 * max(1, int(attempt) + 1))
+    headers = getattr(response, "headers", {})
+    retry_after = headers.get("Retry-After") if isinstance(headers, Mapping) else None
+    if retry_after is None:
+        return fallback
+    try:
+        return min(5.0, max(0.0, float(retry_after)))
+    except (TypeError, ValueError):
+        try:
+            parsed = parsedate_to_datetime(str(retry_after))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return min(5.0, max(0.0, parsed.timestamp() - time.time()))
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+
+
+def _get_response(url: str, timeout: float) -> requests.Response:
     request_timeout = max(0.1, float(timeout))
-    response = requests.get(
-        url,
-        timeout=request_timeout,
-        headers={"User-Agent": "simple-ai-btcusdc-cli/0.1"},
-    )
-    response.raise_for_status()
+    deadline = time.monotonic() + request_timeout
+    last_error: requests.RequestException | None = None
+    for attempt in range(_HTTP_MAX_ATTEMPTS):
+        remaining_timeout = deadline - time.monotonic()
+        if attempt > 0 and remaining_timeout <= 0.0:
+            if last_error is not None:
+                raise last_error
+            raise requests.Timeout(f"HTTP request budget exhausted for {url}")
+        try:
+            response = requests.get(
+                url,
+                timeout=max(0.1, min(request_timeout, remaining_timeout)),
+                headers={"User-Agent": "simple-ai-btcusdc-cli/0.1"},
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code in _HTTP_RETRY_STATUS_CODES and attempt < _HTTP_MAX_ATTEMPTS - 1:
+                remaining_budget = deadline - time.monotonic()
+                if remaining_budget <= 0.0:
+                    response.raise_for_status()
+                time.sleep(min(_http_retry_delay_seconds(response, attempt), remaining_budget))
+                continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            remaining_budget = deadline - time.monotonic()
+            if attempt >= _HTTP_MAX_ATTEMPTS - 1:
+                raise
+            if remaining_budget <= 0.0:
+                raise
+            time.sleep(min(2.0, 0.25 * (attempt + 1), remaining_budget))
+    if last_error is not None:  # pragma: no cover - loop always returns or raises
+        raise last_error
+    raise RuntimeError("HTTP request failed without a response")  # pragma: no cover
+
+
+def _get_json(url: str, timeout: float) -> object:
+    response = _get_response(url, timeout)
     return response.json()
 
 
 def _get_text(url: str, timeout: float) -> str:
-    request_timeout = max(0.1, float(timeout))
-    response = requests.get(
-        url,
-        timeout=request_timeout,
-        headers={"User-Agent": "simple-ai-btcusdc-cli/0.1"},
-    )
-    response.raise_for_status()
-    return response.text
+    return _get_response(url, timeout).text
 
 
 def _post_json(url: str, payload: Mapping[str, object], timeout: float) -> object:
     request_timeout = max(0.1, float(timeout))
-    response = requests.post(
-        url,
-        json=dict(payload),
-        timeout=request_timeout,
-        headers={"User-Agent": "simple-ai-btcusdc-cli/0.1"},
-    )
-    response.raise_for_status()
-    return response.json()
+    deadline = time.monotonic() + request_timeout
+    last_error: requests.RequestException | None = None
+    for attempt in range(_HTTP_MAX_ATTEMPTS):
+        remaining_timeout = max(0.1, deadline - time.monotonic())
+        try:
+            response = requests.post(
+                url,
+                json=dict(payload),
+                timeout=remaining_timeout,
+                headers={"User-Agent": "simple-ai-btcusdc-cli/0.1"},
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code in _HTTP_RETRY_STATUS_CODES and attempt < _HTTP_MAX_ATTEMPTS - 1:
+                remaining_budget = deadline - time.monotonic()
+                if remaining_budget <= 0.0:
+                    response.raise_for_status()
+                time.sleep(min(_http_retry_delay_seconds(response, attempt), remaining_budget))
+                continue
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            remaining_budget = deadline - time.monotonic()
+            if attempt >= _HTTP_MAX_ATTEMPTS - 1 or remaining_budget <= 0.0:
+                raise
+            time.sleep(min(5.0, 0.25 * (attempt + 1), remaining_budget))
+    if last_error is not None:  # pragma: no cover - loop always returns or raises
+        raise last_error
+    raise RuntimeError("HTTP POST failed without a response")  # pragma: no cover
 
 
 def _component(
@@ -783,7 +1011,10 @@ def _fetch_alternative_fng(fetch_json: FetchJson, timeout: float, now_ms: int) -
     latest = data[0]
     value = _safe_float(latest.get("value"), 50.0)
     classification = str(latest.get("value_classification") or "unknown")
-    timestamp = int(_safe_float(latest.get("timestamp"), now_ms / 1000.0) * 1000)
+    timestamp = _bounded_provider_timestamp_ms(
+        int(_safe_float(latest.get("timestamp"), now_ms / 1000.0) * 1000),
+        now_ms,
+    )
     score = _clamp((50.0 - value) / 50.0, -1.0, 1.0)
     return _component(
         "alternative_fear_greed",
@@ -806,13 +1037,19 @@ def _fetch_coingecko_btc(fetch_json: FetchJson, timeout: float, now_ms: int) -> 
     price = _safe_float(bitcoin.get("usd"), 0.0)
     volume = _safe_float(bitcoin.get("usd_24h_vol"), 0.0)
     score = _clamp(change / 6.0, -1.0, 1.0)
+    known_at = _bounded_provider_timestamp_ms(
+        int(_safe_float(bitcoin.get("last_updated_at"), now_ms / 1000.0) * 1000),
+        now_ms,
+    )
+    if known_at <= 0:
+        raise ValueError("CoinGecko timestamp is in the future")
     return _component(
         "coingecko_bitcoin",
         score=score,
         weight=0.70,
         value=change,
         detail=f"24h_change={change:+.2f}% price={price:.2f} volume={volume:.0f}",
-        known_at_ms=now_ms,
+        known_at_ms=known_at,
         source_symbol="bitcoin",
         horizon="medium",
         urgency=min(1.0, abs(score) * 0.35),
@@ -833,6 +1070,12 @@ def _fetch_coinpaprika_btc(fetch_json: FetchJson, timeout: float, now_ms: int) -
     change_24h = _safe_float(usd.get("percent_change_24h"), 0.0)
     change_7d = _safe_float(usd.get("percent_change_7d"), 0.0)
     score = _clamp((change_24h / 6.0) * 0.75 + (change_1h / 2.0) * 0.25, -1.0, 1.0)
+    known_at = _bounded_provider_timestamp_ms(
+        _parse_feed_datetime_ms(payload.get("last_updated"), now_ms),
+        now_ms,
+    )
+    if known_at <= 0:
+        raise ValueError("CoinPaprika timestamp is in the future")
     return _component(
         "coinpaprika_bitcoin",
         score=score,
@@ -842,7 +1085,7 @@ def _fetch_coinpaprika_btc(fetch_json: FetchJson, timeout: float, now_ms: int) -
             f"1h={change_1h:+.2f}% 24h={change_24h:+.2f}% "
             f"7d={change_7d:+.2f}% price={price:.2f} volume={volume:.0f}"
         ),
-        known_at_ms=now_ms,
+        known_at_ms=known_at,
         source_symbol="btc-bitcoin",
         horizon="medium",
         urgency=min(1.0, abs(score) * 0.35),
@@ -1017,6 +1260,9 @@ def _fetch_binance_spot_momentum(
             base_volume = _safe_float(payload.get("volume"), 0.0)
             quote_volume = _safe_float(payload.get("quoteVolume"), 0.0)
             score = _clamp(change / 6.0, -1.0, 1.0)
+            known_at = _bounded_provider_timestamp_ms(int(_safe_float(payload.get("closeTime"), now_ms)), now_ms)
+            if known_at <= 0:
+                raise ValueError("Binance spot ticker timestamp is in the future")
             return _component(
                 "binance_spot_momentum",
                 score=score,
@@ -1026,7 +1272,7 @@ def _fetch_binance_spot_momentum(
                     f"24h_change={change:+.2f}% last={last:.2f} "
                     f"base_volume={base_volume:.3f} quote_volume={quote_volume:.0f}"
                 ),
-                known_at_ms=now_ms,
+                known_at_ms=known_at,
                 source_symbol=candidate,
                 horizon="short",
                 urgency=min(1.0, abs(score) * 0.45),
@@ -1055,7 +1301,7 @@ def _fetch_binance_derivatives(
             open_interest = _safe_float(interest.get("openInterest"), 0.0)
             basis = ((mark - index) / index) if index > 0 else 0.0
             score = _clamp((-funding / 0.0015) + (basis / 0.004), -1.0, 1.0)
-            known_at = int(_safe_float(premium.get("time"), now_ms))
+            known_at = _bounded_provider_timestamp_ms(int(_safe_float(premium.get("time"), now_ms)), now_ms)
             return _component(
                 "binance_futures_positioning",
                 score=score,
@@ -1109,7 +1355,7 @@ def _fetch_cryptocompare_news(
     if not isinstance(data, list) or not data:
         raise ValueError("missing CryptoCompare news data")
     weighted_texts: list[tuple[str, float, int]] = []
-    newest_ms = now_ms
+    newest_ms = 0
     domains: list[str] = []
     for entry in data[:12]:
         if not isinstance(entry, Mapping):
@@ -1120,11 +1366,13 @@ def _fetch_cryptocompare_news(
         source = str(entry.get("source") or "")
         if title:
             weight = 1.0 + min(2.0, len(title) / 120.0)
-            published_ms = _parse_epoch_ms(entry.get("published_on"), now_ms)
+            published_ms = _bounded_provider_timestamp_ms(_parse_epoch_ms(entry.get("published_on"), now_ms), now_ms)
+            if published_ms <= 0:
+                continue
             weighted_texts.append((f"{title} {body} {tags}", weight, published_ms))
+            newest_ms = max(newest_ms, published_ms)
         if source and source not in domains:
             domains.append(source)
-        newest_ms = max(newest_ms, _parse_epoch_ms(entry.get("published_on"), now_ms))
     if not weighted_texts:
         raise ValueError("CryptoCompare news contained no usable titles")
     ages = [max(0, now_ms - known_at) for _text, _weight, known_at in weighted_texts]
@@ -1146,7 +1394,7 @@ def _fetch_cryptocompare_news(
             f"articles={len(scored)} sources={','.join(domains[:3]) or 'unknown'} "
             f"importance={dominant.importance}/10 category={dominant.category}"
         ),
-        known_at_ms=newest_ms,
+        known_at_ms=newest_ms or now_ms,
         source_symbol="BTC",
         horizon=dominant.horizon,
         urgency=dominant.urgency,
@@ -1166,7 +1414,7 @@ def _fetch_gdelt_news(
     if not isinstance(articles, list) or not articles:
         raise ValueError("missing GDELT articles")
     weighted_texts: list[tuple[str, float, int]] = []
-    newest_ms = now_ms
+    newest_ms = 0
     domains: list[str] = []
     for entry in articles[:12]:
         if not isinstance(entry, Mapping):
@@ -1174,11 +1422,13 @@ def _fetch_gdelt_news(
         title = str(entry.get("title") or "")
         domain = str(entry.get("domain") or "")
         if title:
-            seen_ms = _parse_gdelt_seen_ms(entry.get("seendate"), now_ms)
+            seen_ms = _bounded_provider_timestamp_ms(_parse_gdelt_seen_ms(entry.get("seendate"), now_ms), now_ms)
+            if seen_ms <= 0:
+                continue
             weighted_texts.append((title, 1.0, seen_ms))
+            newest_ms = max(newest_ms, seen_ms)
         if domain and domain not in domains:
             domains.append(domain)
-        newest_ms = max(newest_ms, _parse_gdelt_seen_ms(entry.get("seendate"), now_ms))
     if not weighted_texts:
         raise ValueError("GDELT articles contained no usable titles")
     ages = [max(0, now_ms - known_at) for _text, _weight, known_at in weighted_texts]
@@ -1200,7 +1450,7 @@ def _fetch_gdelt_news(
             f"articles={len(scored)} domains={','.join(domains[:3]) or 'unknown'} "
             f"importance={dominant.importance}/10 category={dominant.category}"
         ),
-        known_at_ms=newest_ms,
+        known_at_ms=newest_ms or now_ms,
         source_symbol="BTC",
         horizon=dominant.horizon,
         urgency=dominant.urgency,
@@ -1220,7 +1470,7 @@ def _fetch_hackernews_bitcoin(
     if not isinstance(hits, list) or not hits:
         raise ValueError("missing Hacker News hits")
     weighted_texts: list[tuple[str, float, int]] = []
-    newest_ms = now_ms
+    newest_ms = 0
     for entry in hits[:10]:
         if not isinstance(entry, Mapping):
             continue
@@ -1230,9 +1480,14 @@ def _fetch_hackernews_bitcoin(
         if title:
             weight = 1.0 + min(3.0, points / 100.0)
         created_at = str(entry.get("created_at") or "")
-        if created_at.endswith("Z"):
+        if title and created_at.endswith("Z"):
             try:
-                known_at = int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000)
+                known_at = _bounded_provider_timestamp_ms(
+                    int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000),
+                    now_ms,
+                )
+                if known_at <= 0:
+                    continue
                 newest_ms = max(newest_ms, known_at)
             except ValueError:
                 pass
@@ -1256,7 +1511,7 @@ def _fetch_hackernews_bitcoin(
         weight=0.25,
         value=float(len(scored)),
         detail=f"stories={len(scored)} importance={dominant.importance}/10 category={dominant.category}",
-        known_at_ms=newest_ms,
+        known_at_ms=newest_ms or now_ms,
         source_symbol="BTC",
         horizon=dominant.horizon,
         urgency=dominant.urgency,
@@ -1276,9 +1531,12 @@ def _fetch_rss_news_feed(
     if provider_jitter_seconds > 0.0:
         time.sleep(_JITTER_RANDOM.uniform(0.0, float(provider_jitter_seconds)))
     xml_text = fetch_text(provider.url, timeout)
-    items = _extract_feed_items(xml_text, now_ms=now_ms, limit=items_per_provider)
+    try:
+        items = _extract_feed_items(xml_text, now_ms=now_ms, limit=items_per_provider)
+    except Exception as exc:
+        raise _RSSFeedPayloadError(f"feed parse failed: {exc}", str(xml_text)) from exc
     if not items:
-        raise ValueError("feed contained no usable items")
+        raise _RSSFeedPayloadError("feed contained no usable items", str(xml_text))
     weighted_texts: list[tuple[str, float, int]] = []
     newest_ms = 0
     for item in items:
@@ -1312,6 +1570,7 @@ def _fetch_rss_news_feed(
         component=component,
         backend=backend,
         news_texts=tuple(text for text, _weight, _known_at in weighted_texts),
+        news_known_at_ms=tuple(known_at for _text, _weight, known_at in weighted_texts),
         raw_payload={
             **_provider_news_payload(component, items),
             "url": provider.url,
@@ -1342,6 +1601,8 @@ def _fetch_rss_news_feeds(
     same_host_gap = max(_RSS_SAME_HOST_GAP_SECONDS, min(1.0, max(0.0, float(provider_jitter_seconds))))
 
     def fetch_with_host_pacing(provider: NewsFeedProvider) -> ProviderFetchResult:
+        if provider_jitter_seconds > 0.0:
+            time.sleep(_JITTER_RANDOM.uniform(0.0, float(provider_jitter_seconds)))
         host = urlparse(provider.url).netloc.lower()
         if host:
             with host_lock:
@@ -1358,7 +1619,7 @@ def _fetch_rss_news_feeds(
             now_ms,
             compute_backend,
             items_per_provider=items_per_provider,
-            provider_jitter_seconds=provider_jitter_seconds,
+            provider_jitter_seconds=0.0,
         )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1371,10 +1632,17 @@ def _fetch_rss_news_feeds(
             try:
                 results.append(future.result())
             except Exception as exc:
+                error_payload: dict[str, object] = {
+                    "provider": provider.provider,
+                    "url": provider.url,
+                    "error": str(exc)[:240],
+                }
+                if isinstance(exc, _RSSFeedPayloadError):
+                    error_payload["raw_xml"] = exc.raw_xml[:1_000_000]
                 results.append(
                     ProviderFetchResult(
                         component=_error_component(provider.provider, exc, known_at_ms=now_ms, horizon=provider.horizon),
-                        raw_payload={"provider": provider.provider, "url": provider.url, "error": str(exc)[:240]},
+                        raw_payload=error_payload,
                     )
                 )
     order = {provider.provider: index for index, provider in enumerate(providers)}
@@ -1424,32 +1692,53 @@ def _ollama_response_text(payload: Mapping[str, object]) -> str:
     return str(payload.get("response") or "")
 
 
-def _ollama_priority(text: str) -> float:
+def _ollama_priority(text: str, *, age_ms: int = 0) -> float:
     normalized = f" {text.lower()} "
-    positive, negative = _keyword_counts(text)
+    positive, negative = _keyword_counts(text, age_ms=age_ms)
     short_hits = sum(1 for term in _SHORT_TERM_TERMS if term in normalized)
     btc_focus = int(" bitcoin " in normalized or " btc" in normalized)
-    return float(short_hits * 10 + (positive + negative) * 3 + btc_focus) + min(len(text), 180) / 1000.0
+    recency = 0.25 + _recency_factor(age_ms) * 0.75
+    return (float(short_hits * 10 + (positive + negative) * 3 + btc_focus) * recency) + min(len(text), 180) / 1000.0
 
 
-def _bounded_ollama_news_texts(news_texts: list[str], *, limit: int = 12) -> list[str]:
-    cleaned: list[str] = []
+def _bounded_ollama_news_items(
+    news_texts: list[str],
+    *,
+    news_known_at_ms: list[int] | None = None,
+    now_ms: int | None = None,
+    limit: int = _OLLAMA_NEWS_MAX_ITEMS,
+) -> list[tuple[str, int]]:
+    now = _now_ms() if now_ms is None else int(now_ms)
+    known_values = list(news_known_at_ms or [])
+    cleaned: list[tuple[str, int]] = []
     seen: set[str] = set()
-    for text in news_texts:
-        item = " ".join(str(text).split())[:180]
+    for index, text in enumerate(news_texts):
+        item = " ".join(str(text).split())[:_OLLAMA_NEWS_MAX_TEXT_CHARS]
         key = item.lower()
         if item and key not in seen:
-            cleaned.append(item)
+            raw_known_at = known_values[index] if index < len(known_values) else now
+            known_at = _bounded_provider_timestamp_ms(int(_safe_float(raw_known_at, now)), now)
+            cleaned.append((item, known_at if known_at > 0 else now))
             seen.add(key)
-    return sorted(cleaned, key=_ollama_priority, reverse=True)[:limit]
+    return sorted(
+        cleaned,
+        key=lambda item: _ollama_priority(item[0], age_ms=max(0, now - item[1])),
+        reverse=True,
+    )[:limit]
+
+
+def _bounded_ollama_news_texts(news_texts: list[str], *, limit: int = _OLLAMA_NEWS_MAX_ITEMS) -> list[str]:
+    return [text for text, _known_at in _bounded_ollama_news_items(news_texts, limit=limit)]
 
 
 def _ollama_prompt(news_texts: list[str]) -> str:
     bounded = _bounded_ollama_news_texts(news_texts)
     joined = "\n".join(f"- {text}" for text in bounded)
     return (
-        "Classify BTCUSDC news impact. Return only this JSON shape: "
-        '{"score":-1..1,"horizon":"short|medium|long","reaction_required":true|false,"reason":"<=12 words"}.\n'
+        "Score public BTCUSDC market headlines. -1 bearish, +1 bullish. "
+        "Hacks, exploits, breaches, bans, and ETF denials are bearish. "
+        "ETF approvals, inflows, and adoption are bullish. "
+        "Use short horizon for breaking/emergency items needing a minutes response. JSON only.\n"
         f"{joined}"
     )
 
@@ -1457,6 +1746,7 @@ def _ollama_prompt(news_texts: list[str]) -> str:
 def _evaluate_news_with_ollama(
     news_texts: list[str],
     *,
+    news_known_at_ms: list[int] | None = None,
     model: str = DEFAULT_OLLAMA_NEWS_MODEL,
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout_seconds: float = 3.0,
@@ -1466,31 +1756,45 @@ def _evaluate_news_with_ollama(
     now = _now_ms() if now_ms is None else int(now_ms)
     if not news_texts:
         raise ValueError("no news texts available for Ollama evaluation")
-    selected_news_texts = _bounded_ollama_news_texts(news_texts)
-    if not selected_news_texts:
+    selected_news_items = _bounded_ollama_news_items(
+        news_texts,
+        news_known_at_ms=news_known_at_ms,
+        now_ms=now,
+    )
+    if not selected_news_items:
         raise ValueError("no usable news texts available for Ollama evaluation")
+    selected_news_texts = [text for text, _known_at in selected_news_items]
+    selected_known_at_ms = [known_at for _text, known_at in selected_news_items]
+    selected_ages_ms = [max(0, now - known_at) for known_at in selected_known_at_ms]
+    newest_selected_ms = max(selected_known_at_ms, default=now)
+    classifications = [
+        _classify_news_text(text, age_ms=age_ms)
+        for text, age_ms in zip(selected_news_texts, selected_ages_ms, strict=True)
+    ]
+    dominant = _dominant_news_classification(classifications)
+    heuristic_score = _average_sentiment(
+        [(item.score, max(1.0, float(item.importance))) for item in classifications]
+    )
     started = time.perf_counter()
     endpoint = f"{str(base_url or DEFAULT_OLLAMA_URL).rstrip('/')}/api/chat"
+    prompt = _ollama_prompt(selected_news_texts)
     request = {
         "model": str(model or DEFAULT_OLLAMA_NEWS_MODEL),
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a strict low-latency crypto news classifier. "
-                    "Return compact JSON only."
-                ),
+                "content": "Public market-news sentiment classifier. Return only the requested JSON fields.",
             },
-            {"role": "user", "content": _ollama_prompt(selected_news_texts)},
+            {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "format": "json",
+        "format": _OLLAMA_NEWS_JSON_SCHEMA,
         "think": False,
         "keep_alive": "30m",
         "options": {
             "temperature": 0,
-            "num_ctx": 1024,
-            "num_predict": 64,
+            "num_ctx": _OLLAMA_NEWS_NUM_CTX,
+            "num_predict": _OLLAMA_NEWS_NUM_PREDICT,
         },
     }
     payload = post_json(endpoint, request, timeout_seconds)
@@ -1498,29 +1802,55 @@ def _evaluate_news_with_ollama(
     if not isinstance(payload, Mapping):
         raise ValueError("unexpected Ollama payload")
     response_text = _ollama_response_text(payload)
-    parsed = _json_mapping_from_text(response_text)
-    score = _clamp(_safe_float(parsed.get("score"), 0.0), -1.0, 1.0)
-    horizon = _normalize_horizon(parsed.get("horizon"))
+    parse_error = ""
+    try:
+        parsed = _json_mapping_from_text(response_text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        parsed = {}
+        parse_error = str(exc)[:180]
+    score = _clamp(_safe_float(parsed.get("score"), heuristic_score), -1.0, 1.0)
+    horizon = _normalize_horizon(parsed.get("horizon") or dominant.horizon)
     reaction = _coerce_ai_reaction(parsed.get("reaction_required"), score, horizon)
-    reason = " ".join(str(parsed.get("reason") or "news impact evaluated").split())[:180]
+    guarded = False
+    if dominant.importance >= 8 and abs(dominant.score) >= 0.75 and (score == 0.0 or score * dominant.score < 0.0):
+        score = dominant.score
+        horizon = dominant.horizon
+        reaction = dominant.urgency >= 0.75 or (horizon == "short" and abs(score) >= 0.60)
+        guarded = True
+    reason = " ".join(str(parsed.get("reason") or "").split())[:180]
+    if parse_error:
+        reason = f"schema_guarded {dominant.category}"
+        guarded = True
+    elif guarded:
+        reason = f"guarded {dominant.category} signal"
+    elif not reason:
+        reason = "news impact evaluated"
     component = _component(
         "ollama_news_ai",
         score=score,
         weight=0.70,
         value=float(len(selected_news_texts)),
         detail=f"model={model} latency_ms={latency_ms} reason={reason}",
-        known_at_ms=now,
+        known_at_ms=newest_selected_ms,
         source_symbol="BTCUSDC",
         horizon=horizon,
         urgency=1.0 if reaction else min(0.75, abs(score) * 0.75),
     )
+    evaluation_status = "warn" if guarded else "ok"
     return OllamaNewsEvaluation(
         component=component,
-        status="ok",
+        status=evaluation_status,
         model=str(model or DEFAULT_OLLAMA_NEWS_MODEL),
         latency_ms=latency_ms,
         reason=reason,
         raw_payload={
+            "provider": "ollama_news_ai",
+            "horizon": horizon,
+            "known_at_ms": newest_selected_ms,
+            "score": score,
+            "urgency": component.urgency,
+            "latency_ms": latency_ms,
+            "status": evaluation_status,
             "request": {
                 "model": request["model"],
                 "format": request["format"],
@@ -1528,6 +1858,12 @@ def _evaluate_news_with_ollama(
                 "options": request["options"],
                 "news_count": len(news_texts),
                 "prompt_news_count": len(selected_news_texts),
+                "selected_news_texts": list(selected_news_texts),
+                "selected_known_at_ms": list(selected_known_at_ms),
+                "selected_ages_ms": list(selected_ages_ms),
+                "prompt": prompt,
+                "parse_error": parse_error,
+                "schema_guarded": guarded,
             },
             "response": payload,
             "parsed": dict(parsed),
@@ -1572,6 +1908,13 @@ def _grade_weight_multiplier(grade: object) -> float:
     return _clamp(1.0 + (bounded - 5) * 0.05, 1.0, 1.25)
 
 
+def _telemetry_only_grade_weight_multiplier(grade: object) -> float:
+    bounded = int(_clamp(_safe_float(grade, 5.0), 0.0, 10.0))
+    if bounded <= 5:
+        return _clamp(0.70 + bounded * 0.06, 0.70, 1.0)
+    return _clamp(1.0 + (bounded - 5) * 0.03, 1.0, 1.15)
+
+
 def _source_grade_for_component(
     component: ExternalSignalComponent,
     source_grades: Mapping[tuple[str, str], object],
@@ -1584,6 +1927,19 @@ def _source_grade_for_component(
         if grade is not None:
             return grade
     return None
+
+
+def _source_grade_has_outcome_evidence(source_grade: object) -> bool:
+    evidence = getattr(source_grade, "evidence", {})
+    if not isinstance(evidence, Mapping):
+        return False
+    if _safe_float(evidence.get("outcome_records"), 0.0) > 0.0:
+        return True
+    if evidence.get("directional_accuracy") is not None:
+        return True
+    if evidence.get("hit_rate") is not None:
+        return True
+    return False
 
 
 def _apply_source_grade_weights(
@@ -1599,11 +1955,18 @@ def _apply_source_grade_weights(
             adjusted.append(component)
             continue
         grade_value = int(_clamp(_safe_float(getattr(source_grade, "grade", 5), 5.0), 0.0, 10.0))
-        multiplier = _grade_weight_multiplier(grade_value)
+        has_outcome_evidence = _source_grade_has_outcome_evidence(source_grade)
+        multiplier = (
+            _grade_weight_multiplier(grade_value)
+            if has_outcome_evidence
+            else _telemetry_only_grade_weight_multiplier(grade_value)
+        )
         model = str(getattr(source_grade, "model", "") or "")
         grade_note = f"source_grade={grade_value}/10 multiplier={multiplier:.2f}"
         if model:
             grade_note = f"{grade_note} grade_model={model}"
+        if not has_outcome_evidence:
+            grade_note = f"{grade_note} telemetry_only_bounded_no_outcomes"
         payload = component.asdict()
         payload.update(
             {
@@ -1616,6 +1979,20 @@ def _apply_source_grade_weights(
         )
         adjusted.append(ExternalSignalComponent(**payload))
     return adjusted
+
+
+def _base_component_for_regrading(component: ExternalSignalComponent) -> ExternalSignalComponent:
+    previous_multiplier = _safe_float(component.source_grade_weight_multiplier, 1.0)
+    payload = component.asdict()
+    if previous_multiplier > 0.0:
+        payload["weight"] = component.weight / previous_multiplier
+    payload["source_grade"] = None
+    payload["source_grade_model"] = ""
+    payload["source_grade_weight_multiplier"] = 1.0
+    detail = str(component.detail or "")
+    marker = " source_grade="
+    payload["detail"] = detail.split(marker, 1)[0] if marker in detail else detail
+    return ExternalSignalComponent(**payload)
 
 
 def report_from_payload(payload: Mapping[str, object]) -> ExternalSignalReport | None:
@@ -1676,15 +2053,38 @@ def load_external_signal_cache(
     report = report_from_payload(payload)
     if report is None:
         return None
-    age_seconds = max(0.0, (now_ms - report.known_at_ms) / 1000.0)
+    if report.known_at_ms <= 0 or report.known_at_ms > now_ms:
+        return None
+    age_seconds = (now_ms - report.known_at_ms) / 1000.0
     if age_seconds > max(0, int(ttl_seconds)):
         return None
     if report.reaction_required and age_seconds > max(1, int(short_reaction_refresh_seconds)):
+        return None
+    usable_components = [
+        component
+        for component in report.components
+        if component.status == "ok" and component.weight > 0.0
+    ]
+    if any(component.known_at_ms > now_ms for component in usable_components):
+        return None
+    fresh_components = [
+        component
+        for component in usable_components
+        if _component_cache_timestamp_is_fresh(
+            component,
+            now_ms=now_ms,
+            report_known_at_ms=report.known_at_ms,
+        )
+    ]
+    stale_count = len(usable_components) - len(fresh_components)
+    if usable_components and not fresh_components:
         return None
     return ExternalSignalReport(
         **{
             **report.asdict(),
             "status": "cached",
+            "fresh_count": len(fresh_components),
+            "stale_count": max(0, int(report.stale_count)) + stale_count,
             "components": [
                 ExternalSignalComponent(**{**component.asdict(), "cached": True})
                 for component in report.components
@@ -1708,13 +2108,21 @@ def _combine_components(
     news_ai_reason: str = "",
     extra_warnings: list[str] | None = None,
 ) -> ExternalSignalReport:
-    usable = [component for component in components if component.status == "ok" and component.weight > 0.0]
+    ok_components = [component for component in components if component.status == "ok" and component.weight > 0.0]
+    usable = [
+        component
+        for component in ok_components
+        if _component_cache_timestamp_is_fresh(component, now_ms=now_ms, report_known_at_ms=now_ms)
+    ]
+    stale_count = len(ok_components) - len(usable)
     warnings = [
         f"{component.provider}: {component.error}"
         for component in components
         if component.status == "error" and component.error
     ]
     warnings.extend(extra_warnings or [])
+    if stale_count:
+        warnings.append(f"{stale_count} stale external signal component(s) ignored")
     total_weight = sum(component.weight for component in usable)
     raw_score = sum(component.score * component.weight for component in usable) / total_weight if total_weight else 0.0
     horizon_scores: dict[str, float] = {}
@@ -1760,7 +2168,7 @@ def _combine_components(
         risk_multiplier=float(risk_multiplier),
         provider_count=len(components),
         fresh_count=len(usable),
-        stale_count=0,
+        stale_count=stale_count,
         known_at_ms=now_ms,
         cache_path=str(cache_path),
         warnings=warnings,
@@ -1810,6 +2218,36 @@ def collect_external_signals(
 ) -> ExternalSignalReport:
     now = _now_ms() if now_ms is None else int(now_ms)
     cache = Path(cache_path)
+    source_grade_warnings: list[str] = []
+
+    def apply_source_grades(components_to_grade: list[ExternalSignalComponent]) -> list[ExternalSignalComponent]:
+        if telemetry_path is None:
+            return components_to_grade
+        try:
+            from .telemetry_store import TradingTelemetryStore
+
+            max_age_hours = _safe_float(source_grade_max_age_hours, 168.0)
+            max_age_ms = None if max_age_hours <= 0.0 else int(max_age_hours * 3_600_000)
+            with TradingTelemetryStore(telemetry_path) as store:
+                return _apply_source_grade_weights(
+                    components_to_grade,
+                    store.latest_source_grades(max_age_ms=max_age_ms, now_ms=now),
+                )
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:  # pragma: no cover - telemetry must never block trading signals
+            source_grade_warnings.append(f"source grade weighting unavailable: {exc.__class__.__name__}")
+            return components_to_grade
+
+    def record_report_telemetry(report_to_record: ExternalSignalReport, raw_records_to_record: list[object]) -> None:
+        if telemetry_path is None:
+            return
+        try:
+            from .telemetry_store import TradingTelemetryStore
+
+            with TradingTelemetryStore(telemetry_path) as store:
+                store.record_signal_report(report_to_record, raw_payloads=raw_records_to_record)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:  # pragma: no cover - telemetry must never block trading signals
+            _LOGGER.debug("external signal telemetry recording skipped: %s", exc)
+
     if not force_refresh:
         cached = load_external_signal_cache(
             cache,
@@ -1818,7 +2256,32 @@ def collect_external_signals(
             short_reaction_refresh_seconds=short_reaction_refresh_seconds,
         )
         if cached is not None:
-            return cached
+            if telemetry_path is None:
+                return cached
+            graded_components = apply_source_grades([_base_component_for_regrading(component) for component in cached.components])
+            cached_report = _combine_components(
+                graded_components,
+                max_adjustment=max_adjustment,
+                min_providers=min_providers,
+                now_ms=now,
+                cache_path=cache,
+                news_backend=BackendInfo(
+                    requested=cached.news_backend_requested,
+                    kind=cached.news_backend_kind,
+                    device=cached.news_backend_device,
+                    vendor="cached",
+                    reason=cached.news_backend_reason,
+                ),
+                news_ai_enabled=cached.news_ai_enabled,
+                news_ai_status=cached.news_ai_status,
+                news_ai_model=cached.news_ai_model,
+                news_ai_latency_ms=cached.news_ai_latency_ms,
+                news_ai_reason=cached.news_ai_reason,
+                extra_warnings=[*cached.warnings, *source_grade_warnings],
+            )
+            cached_report = replace(cached_report, status="cached")
+            record_report_telemetry(cached_report, [{"provider": "external_signal_cache", "known_at_ms": now, "payload": cached.asdict()}])
+            return cached_report
 
     news_backend = resolve_backend(compute_backend or "cpu")
     raw_records: list[object] = []
@@ -1826,8 +2289,15 @@ def collect_external_signals(
 
     def record_fetch_json(url: str, timeout: float) -> object:
         payload = fetch_json(url, timeout)
+        provider = _provider_name_for_url(url)
         with raw_records_lock:
-            raw_records.append({"provider": _provider_name_for_url(url), "url": url, "payload": payload})
+            raw_records.append({
+                "provider": provider,
+                "horizon": _provider_horizon(provider),
+                "known_at_ms": now,
+                "url": url,
+                "payload": payload,
+            })
         return payload
 
     fetchers = [
@@ -1848,14 +2318,22 @@ def collect_external_signals(
     ]
     components: list[ExternalSignalComponent] = []
     news_texts: list[str] = []
+    news_known_at_ms: list[int] = []
     structured_results: list[tuple[int, ExternalSignalComponent, BackendInfo | None]] = []
     structured_workers = min(
         len(fetchers),
         max(1, min(16, int(news_provider_parallelism))),
     )
+    structured_jitter_seconds = max(0.0, float(news_provider_jitter_seconds))
+
+    def run_structured_fetcher(fetcher: Callable[[], object]) -> object:
+        if structured_jitter_seconds > 0.0:
+            time.sleep(_JITTER_RANDOM.uniform(0.0, structured_jitter_seconds))
+        return fetcher()
+
     with ThreadPoolExecutor(max_workers=structured_workers) as executor:
         future_map = {
-            executor.submit(fetcher): (index, provider, horizon)
+            executor.submit(run_structured_fetcher, fetcher): (index, provider, horizon)
             for index, (provider, horizon, fetcher) in enumerate(fetchers)
         }
         for future in as_completed(future_map):
@@ -1874,12 +2352,18 @@ def collect_external_signals(
         if backend is not None:
             news_backend = backend
 
-    for component in components:
-        if component.status == "error":
+    for raw_record in list(raw_records):
+        if not isinstance(raw_record, Mapping):  # pragma: no cover - defensive guard for future callers
             continue
-        if component.provider in {"cryptocompare_btc_news", "gdelt_bitcoin_news", "hackernews_bitcoin_attention"}:
-            continue
-        news_texts.append(f"{component.provider}: {component.detail}")
+        provider = str(raw_record.get("provider") or "")
+        structured_news_items = _structured_news_items_from_payload(
+            provider,
+            raw_record.get("payload"),
+            limit=max(1, min(10, int(news_items_per_provider))),
+            now_ms=now,
+        )
+        news_texts.extend(text for text, _known_at in structured_news_items)
+        news_known_at_ms.extend(known_at for _text, known_at in structured_news_items)
 
     effective_fetch_text = fetch_text
     if effective_fetch_text is None and fetch_json is _get_json:  # pragma: no cover - real CLI default path
@@ -1900,6 +2384,9 @@ def collect_external_signals(
             if result.backend is not None:
                 news_backend = result.backend
             news_texts.extend(result.news_texts)
+            result_known_at = list(result.news_known_at_ms)
+            result_known_at.extend([result.component.known_at_ms] * max(0, len(result.news_texts) - len(result_known_at)))
+            news_known_at_ms.extend(result_known_at[: len(result.news_texts)])
             if result.raw_payload is not None:
                 raw_records.append(result.raw_payload)
 
@@ -1910,6 +2397,7 @@ def collect_external_signals(
         try:
             evaluation = _evaluate_news_with_ollama(
                 news_texts,
+                news_known_at_ms=news_known_at_ms,
                 model=ollama_model,
                 base_url=ollama_url,
                 timeout_seconds=ollama_timeout_seconds,
@@ -1926,21 +2414,21 @@ def collect_external_signals(
             components.append(_error_component("ollama_news_ai", exc, known_at_ms=now, horizon="short"))
             news_ai_status = "error"
             news_ai_reason = str(exc)[:180]
+            raw_records.append(
+                {
+                    "provider": "ollama_news_ai",
+                    "horizon": "short",
+                    "known_at_ms": now,
+                    "model": str(ollama_model or DEFAULT_OLLAMA_NEWS_MODEL),
+                    "endpoint": f"{str(ollama_url or DEFAULT_OLLAMA_URL).rstrip('/')}/api/chat",
+                    "status": "error",
+                    "error": news_ai_reason,
+                    "selected_news_texts": _bounded_ollama_news_texts(news_texts),
+                    "news_count": len(news_texts),
+                }
+            )
 
-    source_grade_warnings: list[str] = []
-    if telemetry_path is not None:
-        try:
-            from .telemetry_store import TradingTelemetryStore
-
-            max_age_hours = _safe_float(source_grade_max_age_hours, 168.0)
-            max_age_ms = None if max_age_hours <= 0.0 else int(max_age_hours * 3_600_000)
-            with TradingTelemetryStore(telemetry_path) as store:
-                components = _apply_source_grade_weights(
-                    components,
-                    store.latest_source_grades(max_age_ms=max_age_ms, now_ms=now),
-                )
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:  # pragma: no cover - telemetry must never block trading signals
-            source_grade_warnings.append(f"source grade weighting unavailable: {exc.__class__.__name__}")
+    components = apply_source_grades(components)
 
     report = _combine_components(
         components,
@@ -1956,16 +2444,18 @@ def collect_external_signals(
         news_ai_reason=news_ai_reason,
         extra_warnings=source_grade_warnings,
     )
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(cache, report.asdict(), indent=2, sort_keys=True)
-    if telemetry_path is not None:
-        try:
-            from .telemetry_store import TradingTelemetryStore
-
-            with TradingTelemetryStore(telemetry_path) as store:
-                store.record_signal_report(report, raw_payloads=raw_records)
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:  # pragma: no cover - telemetry must never block trading signals
-            _LOGGER.debug("external signal telemetry recording skipped: %s", exc)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(cache, report.asdict(), indent=2, sort_keys=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        warning = f"external signal cache write unavailable: {exc.__class__.__name__}"
+        _LOGGER.debug("%s", warning)
+        report = replace(
+            report,
+            status="warn" if report.status == "ok" else report.status,
+            warnings=[*report.warnings, warning],
+        )
+    record_report_telemetry(report, raw_records)
     return report
 
 

@@ -26,16 +26,19 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1
 
 RUN groupadd --system --gid 10001 trader \
-    && useradd --system --uid 10001 --gid trader --home-dir /home/trader --create-home trader
+    && useradd --system --uid 10001 --gid trader --home-dir /home/trader --create-home trader \
+    && mkdir -p /home/trader/.config /home/trader/work/data \
+    && chown -R trader:trader /home/trader/.config /home/trader/work
 
 COPY --from=builder /opt/venv /opt/venv
 
 USER trader
-WORKDIR /home/trader
+WORKDIR /home/trader/work
 
 # Config + data are mounted by the operator (or docker-compose). The package
 # itself ships no runtime state; it persists runtime + strategy JSON under
-# ``~/.config/simple_ai_bitcoin_trading_binance`` inside the container.
+# ``~/.config/simple_ai_bitcoin_trading_binance`` and relative data files under
+# ``/home/trader/work/data`` inside the container.
 VOLUME ["/home/trader/.config", "/home/trader/work/data"]
 
 # Default to the interactive shell so ``docker run -it image`` feels natural.

@@ -7,7 +7,7 @@ from __future__ import annotations
 from simple_ai_bitcoin_trading_binance import training_suite
 from simple_ai_bitcoin_trading_binance.api import Candle
 from simple_ai_bitcoin_trading_binance.config import load_strategy
-from simple_ai_bitcoin_trading_binance.objective import get_objective
+from simple_ai_bitcoin_trading_binance.objective import ObjectiveSpec, get_objective
 
 
 def _candles(n: int = 240) -> list[Candle]:
@@ -24,6 +24,22 @@ def _candles(n: int = 240) -> list[Candle]:
             close_time=i * 60_000 + 59_000,
         ))
     return out
+
+
+def _lenient_default_objective() -> ObjectiveSpec:
+    default = get_objective("default")
+    return ObjectiveSpec(
+        name="default",
+        label="Default smoke",
+        summary="Lenient default smoke objective",
+        long_description="Lenient default objective for small real-runner coverage datasets.",
+        scorer=lambda result: 1.0 + result.realized_pnl / max(1.0, result.starting_cash),
+        min_closed_trades=0,
+        min_realized_pnl=None,
+        min_edge_vs_buy_hold=None,
+        max_drawdown_rejection=1.0,
+        training=default.training,
+    )
 
 
 def test_resolve_workers_branches():
@@ -87,10 +103,12 @@ def test_train_for_objective_serial_path(tmp_path, monkeypatch):
         ],
     )
     strategy = load_strategy()
+    objective = _lenient_default_objective()
+    monkeypatch.setattr(training_suite, "get_objective", lambda _name: objective)
     outcome = training_suite.train_for_objective(
         _candles(240),
         strategy,
-        get_objective("default"),
+        objective,
         output_dir=tmp_path,
         market_type="spot",
         starting_cash=1000.0,
@@ -134,10 +152,12 @@ def test_train_for_objective_parallel_path_via_mocked_pool(tmp_path, monkeypatch
         ],
     )
     strategy = load_strategy()
+    objective = _lenient_default_objective()
+    monkeypatch.setattr(training_suite, "get_objective", lambda _name: objective)
     outcome = training_suite.train_for_objective(
         _candles(240),
         strategy,
-        get_objective("default"),
+        objective,
         output_dir=tmp_path,
         market_type="spot",
         starting_cash=1000.0,

@@ -258,6 +258,11 @@ class MenuScreen(ModalScreen[str | None]):
             row = self.query_one(f"#menu-row-{index}", Static)
             row.update(self._menu_row_text(index))
             row.set_class(index == self._highlighted, "menu-row-highlighted")
+        if self.options:
+            row = self.query_one(f"#menu-row-{self._highlighted}", Static)
+            scroll_visible = getattr(row, "scroll_visible", None)
+            if callable(scroll_visible):
+                scroll_visible(animate=False)
 
     def _highlighted_index(self) -> int:
         return _bounded_index(self._highlighted, len(self.options))
@@ -432,6 +437,9 @@ class MultiSelectScreen(ModalScreen[list[str] | None]):
             return
         self._highlighted = max(0, min(index, len(self.options) - 1))
         self._sync_rows()
+        highlighted_row = self.query_one(f"#feature-row-{self._highlighted}", Static)
+        if hasattr(highlighted_row, "scroll_visible"):
+            highlighted_row.scroll_visible(animate=False)
         self._focus_feature_list()
 
     def action_cursor_down(self) -> None:
@@ -1135,7 +1143,10 @@ class OperatorApp(App[int]):
             self.append_log(output)
         self.refresh_action_availability()
         self.refresh_preview()
-        self.set_status(f"{action.title} complete ({result})")
+        if isinstance(result, int) and result != 0:
+            self.set_status(f"{action.title} failed ({result})")
+        else:
+            self.set_status(f"{action.title} complete ({result})")
 
     def _execute_action_in_background(self, action: TUIAction) -> None:
         if self._action_task is not None and not self._action_task.done():

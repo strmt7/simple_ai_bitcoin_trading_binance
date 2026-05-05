@@ -12,7 +12,9 @@ from simple_ai_bitcoin_trading_binance.api import (
     BinanceAPIError,
     BinanceClient,
     SymbolConstraints,
+    classify_base_url,
     _default_base_url,
+    ensure_non_mainnet_base_url,
     _extract_retry_after,
 )
 
@@ -53,6 +55,30 @@ def test_default_base_url_honors_host_overrides(monkeypatch) -> None:
     monkeypatch.setenv("BINANCE_FUTURES_BASE_URL", "https://futures.example")
     assert _default_base_url(True, "spot") == ("https://spot.example", "api")
     assert _default_base_url(True, "futures") == ("https://futures.example", "fapi")
+
+
+def test_client_blocks_unsafe_non_mainnet_base_url_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("BINANCE_BASE_URL", "https://api.binance.com")
+    with pytest.raises(BinanceAPIError, match="unsafe Binance base URL"):
+        BinanceClient("k", "s", testnet=True)
+
+    monkeypatch.setenv("BINANCE_BASE_URL", "https://proxy.local")
+    with pytest.raises(BinanceAPIError, match="unsafe Binance base URL"):
+        BinanceClient("k", "s", testnet=True)
+
+    monkeypatch.setenv("BINANCE_BASE_URL", "https://api.binance.com")
+    client = BinanceClient("k", "s", testnet=False)
+    assert client.base_url == "https://api.binance.com"
+
+
+def test_base_url_classification_and_non_mainnet_guard() -> None:
+    assert classify_base_url("https://testnet.binance.vision/api/v3") == "testnet"
+    assert classify_base_url("https://demo-fapi.binance.com/fapi/v1") == "demo"
+    assert classify_base_url("https://fapi.binance.com/fapi/v1") == "live"
+    assert classify_base_url("https://example.invalid") == "custom"
+    ensure_non_mainnet_base_url("https://testnet.binancefuture.com", testnet=True, demo=False)
+    with pytest.raises(BinanceAPIError):
+        ensure_non_mainnet_base_url("https://example.invalid", testnet=True, demo=False)
 
 
 def test_client_rejects_unknown_market_type() -> None:
@@ -685,6 +711,31 @@ def test_place_order_spot_live_uses_spot_endpoint(monkeypatch) -> None:
     payload = client.place_order("BTCUSDC", "BUY", 0.25, dry_run=False, leverage=1.0)
     assert payload == {"ok": True}
     assert calls == [("POST", "/api/v3/order", {"symbol": "BTCUSDC", "side": "BUY", "type": "MARKET", "quantity": "0.25000000"}, True)]
+
+
+def test_place_order_refuses_mainnet_even_if_called_directly() -> None:
+    client = BinanceClient(api_key="k", api_secret="s", market_type="spot", testnet=False)
+    with pytest.raises(BinanceAPIError, match="disabled for mainnet/custom"):
+        client.place_order("BTCUSDC", "BUY", 0.25, dry_run=False)
+
+
+def test_signed_account_reads_refuse_mainnet_even_if_called_directly() -> None:
+    client = BinanceClient(api_key="k", api_secret="s", market_type="spot", testnet=False)
+    with pytest.raises(BinanceAPIError, match="Signed Binance calls are disabled"):
+        client.get_account()
+
+
+def test_place_order_rejects_unsafe_direct_inputs() -> None:
+    client = BinanceClient(api_key="k", api_secret="s", market_type="spot")
+    for symbol, side, quantity, message in (
+        ("ETHUSDC", "BUY", 0.25, "BTCUSDC only"),
+        ("BTCUSDC", "HOLD", 0.25, "BUY or SELL"),
+        ("BTCUSDC", "BUY", 0.0, "positive finite"),
+        ("BTCUSDC", "BUY", float("nan"), "positive finite"),
+        ("BTCUSDC", "BUY", object(), "positive finite"),
+    ):
+        with pytest.raises(BinanceAPIError, match=message):
+            client.place_order(symbol, side, quantity, dry_run=True)
 
 
 def test_place_order_futures_reduce_only_requests_result(monkeypatch) -> None:

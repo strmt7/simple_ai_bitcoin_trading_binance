@@ -4,6 +4,10 @@ __pycache__/
 data/
 .env
 .env.local
+.env.*
+!.env.example
+.tmp/
+.pytest-tmp/
 .coverage
 .coverage.*
 .venv/
@@ -13,6 +17,9 @@ coverage.xml
 htmlcov/
 .pytest_cache/
 src/*.egg-info/
+build/
+dist/
+*_raw_payloads/
 .mypy_cache/
 .ruff_cache/
 

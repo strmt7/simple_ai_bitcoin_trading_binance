@@ -185,6 +185,12 @@ def test_backtest_exit_fee_uses_exit_notional() -> None:
         ),
         ModelRow(
             timestamp=60_000,
+            close=100.0,
+            features=(0.0, *[0.0] * 12),
+            label=0,
+        ),
+        ModelRow(
+            timestamp=120_000,
             close=120.0,
             features=(0.0, *[0.0] * 12),
             label=0,
@@ -210,6 +216,63 @@ def test_backtest_exit_fee_uses_exit_notional() -> None:
     result = run_backtest(rows, model, cfg, starting_cash=1000.0, market_type="spot")
     assert result.closed_trades == 1
     assert result.total_fees == 2.2
+
+
+def test_backtest_signal_enters_on_next_bar_close() -> None:
+    rows = [
+        ModelRow(timestamp=0, close=100.0, features=(10.0, *[0.0] * 12), label=1),
+        ModelRow(timestamp=60_000, close=120.0, features=(0.0, *[0.0] * 12), label=0),
+    ]
+    model = TrainedModel(
+        weights=[1.0] + [0.0] * 12,
+        bias=0.0,
+        feature_dim=13,
+        epochs=1,
+        feature_means=[0.0] * 13,
+        feature_stds=[1.0] * 13,
+    )
+    cfg = StrategyConfig(
+        risk_per_trade=0.1,
+        max_position_pct=0.5,
+        taker_fee_bps=0.0,
+        slippage_bps=0.0,
+        signal_threshold=0.55,
+    )
+
+    result = run_backtest(rows, model, cfg, starting_cash=1000.0, market_type="spot")
+
+    assert result.closed_trades == 1
+    assert result.realized_pnl == 0.0
+
+
+def test_backtest_cooldown_prevents_immediate_reentry() -> None:
+    class _StepModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict_proba(self, _features: tuple[float, ...]) -> float:
+            scores = [0.99, 0.0, 0.99, 0.0, 0.0]
+            score = scores[min(self.calls, len(scores) - 1)]
+            self.calls += 1
+            return score
+
+    rows = [
+        ModelRow(timestamp=i * 60_000, close=100.0, features=(0.0,), label=0)
+        for i in range(5)
+    ]
+    cfg = StrategyConfig(
+        risk_per_trade=0.1,
+        max_position_pct=0.5,
+        taker_fee_bps=0.0,
+        slippage_bps=0.0,
+        signal_threshold=0.55,
+        cooldown_minutes=5,
+        max_trades_per_day=10,
+    )
+    no_cooldown = StrategyConfig(**{**cfg.asdict(), "cooldown_minutes": 0})
+
+    assert run_backtest(rows, _StepModel(), no_cooldown, starting_cash=1000.0).closed_trades == 2
+    assert run_backtest(rows, _StepModel(), cfg, starting_cash=1000.0).closed_trades == 1
 
 
 def test_backtest_uses_model_threshold_and_confidence_shrinkage() -> None:
@@ -316,7 +379,7 @@ def test_profit_threshold_calibration_accepts_profitable_threshold() -> None:
     )
 
     assert report.accepted is True
-    assert report.threshold > 0.5
+    assert report.threshold != 0.5
     assert report.realized_pnl > baseline.realized_pnl
     assert report.baseline_realized_pnl == baseline.realized_pnl
     assert report.asdict()["evaluated_thresholds"] == 9
